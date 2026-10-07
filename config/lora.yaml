@@ -1,0 +1,149 @@
+# LORA Master Configuration (Phase 0 Baseline)
+models_dir: 'C:\Models'
+
+voice:
+  mode: auto                      # quality | fast | auto
+  wake:
+    engine: openwakeword
+    model: models/voice/hey_lora.onnx
+    threshold: 0.65
+    consecutive: 2
+    vad_gate: true
+    speaker_verifier:
+      enabled: true
+      model: models/voice/user_verifier.onnx
+      threshold: 0.70
+  hotkey: "ctrl+alt+space"
+  vad: silero
+  stt:
+    engine: faster-whisper
+    model: distil-small.en
+    device: cpu
+    compute: int8
+    beam: 1
+    vad_filter: true
+    initial_prompt: "LORA, arXiv, RAG, Ollama, Python, VS Code, GitHub, Hugging Face, Granite, Gemma, Spark"
+  stt_fallback: [moonshine, parakeet-sherpa-onnx]
+  tts_quality:
+    engine: qwen3-tts
+    model_path: "C:\\Models\\Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    tokenizer_path: "C:\\Models\\Qwen3-TTS-Tokenizer-12Hz"
+    speaker: Vivian
+    dtype: bfloat16
+    attn: sdpa
+  tts_fast:
+    engine: piper
+    voice: en_US-lessac-medium
+
+decision:                         # Laya decision model
+  checkpoint: models/laya-lora-ft
+  base_fallback: convaiinnovations/laya
+  device: cpu
+  tau: 0.70
+  risky_threshold: 0.30
+  calibration_file: config/laya_calibration.json
+
+gateway:
+  desktop_bind: "127.0.0.1:8765"
+  mobile_bind: "192.168.50.10:8765"    # router-side IP only, NEVER 0.0.0.0
+  auth:
+    desktop_token_env: LORA_DESKTOP_TOKEN
+    mobile_token_env: LORA_MOBILE_TOKEN
+    rate_limit_failed_attempts: 5      # max 5 failed auth/min -> 15 min ban
+  max_concurrent_llm_jobs: 1
+  mobile:
+    max_tier: 0                        # strictly Tier 0 (read-only research/Q&A)
+    max_run_mode: "standard"           # quick | standard (no deep/outerloop)
+    allow_uploads: false
+    allow_local_files: false
+
+models:                           # Model role assignments
+  planner:
+    name: "gemma4:e4b"
+    think: false
+    num_ctx: 6144
+  controller:
+    name: "granite4.2:8b"
+    think: false
+    num_ctx: 4096
+  writer:
+    name: "spark-x25-4b-q4"
+    family: spark
+    think: false
+    temperature: 0.3
+    num_ctx: 8192                      # 8k context cap for writer
+    fallback: ["ornith-1.5:9b"]
+  reader:
+    name: "spark-x25-4b-q4"
+    family: spark
+    think: false
+    temperature: 0.2
+    num_ctx: 32768                     # 32k context for long-doc map-reduce
+  verifier:
+    name: "granite4.2:8b"
+    think: false
+    num_ctx: 6144
+    temperature: 0.0
+  supervisor:
+    name: "granite4.2:8b"
+    think: low
+    num_ctx: 6144
+    temperature: 0.0
+  optimizer:
+    name: "gemma4:e4b"
+    think: false
+    num_ctx: 6144
+  ollama_env:
+    OLLAMA_MAX_LOADED_MODELS: 1
+    base_url: "http://127.0.0.1:11434"
+
+grounding:
+  nli_fast: vectara-hhem-2.1-open
+  nli_secondary: minicheck
+  embedder: bge-small
+  reranker: bge-reranker-base
+
+research:
+  max_sources: 12
+  evidence_cards: 10
+  min_entailment: 0.80
+  copy_overlap_max_ngram: 8
+  query_mode_min_similarity: 0.35
+
+outerloop:
+  max_iters: 5
+  epsilon: auto
+  wallclock_minutes: 20
+  faithfulness_floor: 0.85
+
+safety:
+  max_actions_per_task: 40
+  dry_run_over: 3
+  killswitch: "ctrl+alt+shift+esc"
+  allowed_roots:
+    - "C:\\Thought\\Projects\\LORA"
+    - "C:\\Users"
+  safe_extensions:
+    - ".pdf"
+    - ".md"
+    - ".txt"
+    - ".csv"
+    - ".docx"
+    - ".png"
+    - ".jpg"
+    - ".jpeg"
+    - ".json"
+    - ".yaml"
+    - ".yml"
+  blocked_extensions:
+    - ".exe"
+    - ".bat"
+    - ".cmd"
+    - ".ps1"
+    - ".lnk"
+    - ".js"
+    - ".vbs"
+    - ".reg"
+    - ".docm"
+    - ".xlsm"
+    - ".pptm"

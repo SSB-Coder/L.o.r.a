@@ -1,0 +1,67 @@
+# LORA Security and Capability Policy
+version: "1.2"
+
+# Policy evaluation order:
+# 1. Hard-deny rules evaluated FIRST and are NON-OVERRIDABLE.
+# 2. Allow/Ask rules evaluated with last-match-wins within non-denied space.
+
+deny_rules:
+  # Any tool attempting deletion or filesystem destruction
+  - tool_match: "*delete*"
+    reason: "Deletion is permanently forbidden by system policy"
+  - tool_match: "*remove*"
+    reason: "Removal operations are permanently forbidden"
+  - tool_match: "*unlink*"
+    reason: "Unlink operations are permanently forbidden"
+  - tool_match: "*rmdir*"
+    reason: "Directory removal operations are permanently forbidden"
+  
+  # Blocked execution & dangerous scripts
+  - path_extensions:
+      - ".exe"
+      - ".bat"
+      - ".cmd"
+      - ".ps1"
+      - ".lnk"
+      - ".js"
+      - ".vbs"
+      - ".reg"
+      - ".docm"
+      - ".xlsm"
+      - ".pptm"
+    reason: "Executable and script file execution is strictly forbidden"
+
+  # Origin-based hard denies: mobile origin cannot drive desktop UI or access local files
+  - origin: "mobile"
+    tiers: [1, 2, 3]
+    reason: "Mobile requests are restricted to Tier 0 research tools only"
+  - origin: "mobile"
+    tools:
+      - "list_dir"
+      - "read_file"
+      - "search_files"
+      - "open_app"
+      - "open_path"
+    reason: "Mobile requests cannot access local filesystem or launch apps"
+
+allow_rules:
+  - origin: "desktop"
+    tiers: [0]
+    action: "allow"
+  - origin: "mobile"
+    tiers: [0]
+    tools:
+      - "web_search"
+      - "fetch_page"
+      - "pdf_fetch"
+      - "knowledge_query"
+      - "notebook_query"
+      - "rewrite_depth"
+    action: "allow"
+
+typing_domain_allowlist:
+  - "google.com"
+  - "duckduckgo.com"
+  - "chat.deepseek.com"
+  - "claude.ai"
+  - "chatgpt.com"

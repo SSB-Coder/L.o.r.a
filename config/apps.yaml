@@ -1,0 +1,17 @@
+# LORA Allowlisted Desktop Applications
+allowed_applications:
+  - name: "vscode"
+    executable: "code"
+    display_name: "Visual Studio Code"
+  - name: "notepad"
+    executable: "notepad"
+    display_name: "Notepad"
+  - name: "calculator"
+    executable: "calc"
+    display_name: "Calculator"
+  - name: "browser"
+    executable: "chrome"
+    display_name: "Google Chrome"
+  - name: "terminal"
+    executable: "wt"
+    display_name: "Windows Terminal"
