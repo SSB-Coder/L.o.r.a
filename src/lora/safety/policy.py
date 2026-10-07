@@ -38,6 +38,7 @@ class PolicyResult(BaseModel):
     verdict: PolicyVerdict
     reason: str
     rule_matched: str | None = None
+    canonical_path: Path | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -446,6 +447,7 @@ class PolicyEngine:
             verdict=PolicyVerdict.ALLOW,
             reason="Path validated successfully within allowed roots",
             rule_matched="path_allowed",
+            canonical_path=resolved,
         )
 
     def check_typing_domain(self, domain_or_url: str) -> PolicyResult:

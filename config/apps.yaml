@@ -1,17 +1,77 @@
-# LORA Allowlisted Desktop Applications
-allowed_applications:
-  - name: "vscode"
-    executable: "code"
-    display_name: "Visual Studio Code"
-  - name: "notepad"
-    executable: "notepad"
-    display_name: "Notepad"
-  - name: "calculator"
-    executable: "calc"
-    display_name: "Calculator"
-  - name: "browser"
-    executable: "chrome"
-    display_name: "Google Chrome"
-  - name: "terminal"
-    executable: "wt"
-    display_name: "Windows Terminal"
+# L.O.R.A Desktop Applications and Web Apps Allowlist
+version: "1.0"
+
+# Desktop Applications: maps user-friendly names to executable names or paths.
+# Strictly excludes shells (cmd, powershell, wt, bash), installers, and administrative tools.
+applications:
+  vscode:
+    name: "Visual Studio Code"
+    command: "code"
+    aliases: ["code", "vs code", "visual studio code"]
+  notepad:
+    name: "Notepad"
+    command: "notepad.exe"
+    aliases: ["text editor", "notes"]
+  calculator:
+    name: "Calculator"
+    command: "calc.exe"
+    aliases: ["calc"]
+  edge:
+    name: "Microsoft Edge"
+    command: "msedge.exe"
+    aliases: ["msedge", "browser"]
+  chrome:
+    name: "Google Chrome"
+    command: "chrome.exe"
+    aliases: ["google chrome"]
+  spotify:
+    name: "Spotify"
+    command: "spotify.exe"
+    aliases: ["music"]
+  paint:
+    name: "Paint"
+    command: "mspaint.exe"
+    aliases: ["mspaint"]
+  explorer:
+    name: "File Explorer"
+    command: "explorer.exe"
+    aliases: ["files", "file manager"]
+
+# Web App Shortcuts: maps friendly web service names to URLs opened in default browser.
+web_apps:
+  chatgpt:
+    name: "ChatGPT"
+    url: "https://chatgpt.com"
+    aliases: ["chat gpt", "openai"]
+  claude:
+    name: "Claude"
+    url: "https://claude.ai"
+    aliases: ["anthropic", "claude ai"]
+  deepseek:
+    name: "DeepSeek"
+    url: "https://chat.deepseek.com"
+    aliases: ["deep seek"]
+  wikipedia:
+    name: "Wikipedia"
+    url: "https://en.wikipedia.org"
+    search_template: "https://en.wikipedia.org/wiki/Special:Search?search={query}"
+    aliases: ["wiki"]
+  arxiv:
+    name: "arXiv"
+    url: "https://arxiv.org"
+    search_template: "https://arxiv.org/search/?query={query}&searchtype=all"
+    aliases: ["ar xive", "papers"]
+  github:
+    name: "GitHub"
+    url: "https://github.com"
+    aliases: ["git hub"]
+  youtube:
+    name: "YouTube"
+    url: "https://www.youtube.com"
+    search_template: "https://www.youtube.com/results?search_query={query}"
+    aliases: ["you tube"]
+  google:
+    name: "Google Search"
+    url: "https://www.google.com"
+    search_template: "https://www.google.com/search?q={query}"
+    aliases: ["google search"]
