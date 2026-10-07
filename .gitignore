@@ -50,3 +50,6 @@ outputs/
 .env.local
 *.pem
 *.key
+
+# Reference codebases (manual clones for architectural inspiration)
+references/

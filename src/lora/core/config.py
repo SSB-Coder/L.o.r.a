@@ -186,7 +186,8 @@ class ModelsConfig(BaseModel):
 class GroundingConfig(BaseModel):
     nli_fast: str = "vectara-hhem-2.1-open"
     nli_secondary: str = "minicheck"
-    embedder: str = "bge-small"
+    embedder: str = "C:\\Models\\embeddinggemma-2"
+    vector_store: str = "faiss"
     reranker: str = "bge-reranker-base"
 
 

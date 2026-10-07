@@ -100,7 +100,8 @@ models:                           # Model role assignments
 grounding:
   nli_fast: vectara-hhem-2.1-open
   nli_secondary: minicheck
-  embedder: bge-small
+  embedder: "C:\\Models\\embeddinggemma-2"  # sentence-transformers on CPU (fallback: bge-small)
+  vector_store: faiss                       # faiss-cpu session-bound index (optional sqlite-vec)
   reranker: bge-reranker-base
 
 research:

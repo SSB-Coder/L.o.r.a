@@ -1,9 +1,13 @@
 # L.O.R.A — Layer Oriented Research Assistant
-### Master Implementation Plan (v1.2)
+### Master Implementation Plan (v1.3)
 
 > A voice-controlled, local-first, agentic research and desktop-assistant system. It listens (STT), speaks (TTS), operates the computer within a hard safety envelope (no deletion, ever), browses and reads the open knowledge web, and returns **verified, source-grounded, rewritten** explanations. A supervisor layer checks every important step, and a bounded **Outer Loop** self-improves prompts per research task with automatic rollback.
 
 ---
+
+### Changelog (v1.3)
+- **Session RAG & Local Embeddings**: Designated `C:\Models\embeddinggemma-2` (0.7B/740M params, 1.48 GB safetensors) running on CPU via `sentence-transformers` as the primary local embedding engine; paired with `faiss-cpu` for lightweight, session-bound ephemeral vector databases (fast in-process RAG over user PDFs/documents, flushed cleanly on session teardown or persisted per notebook).
+- **Open-Source Architectural References & Licensing**: Integrated architectural reference patterns from open-source projects (AnythingLLM for doc parsing/chunking, Open Notebook for notebook synthesis, Hermes Agent for tool-calling loops, OpenCode for subprocess safety, OpenClaw for session dispatch); stored in `.gitignore`'d `references/` for manual inspection; formalized third-party attribution in `THIRD_PARTY_NOTICES.md`.
 
 ### Changelog (v1.2)
 - **Scope Shift**: Refocused LORA as primarily an Assistant + Research agent with bounded app/file launch and browser/chatbot typing; removed general OS control; reworded G2 ("no delete-capable tool exists and no known bypass; backups are the safety net").
@@ -98,9 +102,10 @@ LORA is primarily an **ASSISTANT + RESEARCH AGENT**. It is not a general OS-cont
 | `hf.co/empero-ai/Qwythos-9B-v2-GGUF` | Qwen3.5 lineage (community fine-tune) | 6.7 GB / 8.95B | 1M nominal | tools, thinking, vision | Partial offload, ~8–12 tok/s (est.) |
 | `gemma4:26b` | Google Gemma 4 MoE (Q4_K_M) | 18 GB / 25.2B total (~3.8B active) | 262k | vision, tools, thinking | **EXCLUDED from runtime:** 18 GB file cannot run on 16 GB host RAM without heavy OS paging/thrashing; not viable on this machine. |
 | *Laya* (decision model, in-process PyTorch) | Convai Laya | ~0.4B encoder | 512–8192 | classifier only | Trivial; lives on CPU alongside anything |
+| *Embeddinggemma-2 (740M)* | Google Gemma (sentence-transformers) | 1.48 GB safetensors / 0.74B | 8192 | embeddings, semantic search | **Verified present in `C:\Models\embeddinggemma-2`**. Runs 100% on CPU via `sentence-transformers`; consumes ~1.5 GB RAM; leaves 6 GB VRAM free. Primary local embedding model for session RAG. |
 | *Qwen3-TTS 12Hz 1.7B-CustomVoice + Tokenizer* | Qwen | 3.83 GB + 682 MB safetensors | — | TTS | **Verified present in `C:\Models\`** (modified 2026-09-22). Quality voice on GPU (run in a separate worker process). 1.7B-Base (voice cloning) & 0.6B not downloaded. |
 
-*Inventory confirmed via `ollama list`: gemma4:e4b (6.6 GB), granite4.2:8b (5.3 GB), ornith-1.5:9b (6.6 GB), hf.co/empero-ai/Qwythos-9B-v2-GGUF (6.7 GB), Spark-X2.5-4B (8.2 GB), gemma4:26b (18 GB - excluded).*
+*Inventory confirmed via `ollama list`: gemma4:e4b (6.6 GB), granite4.2:8b (5.3 GB), ornith-1.5:9b (6.6 GB), hf.co/empero-ai/Qwythos-9B-v2-GGUF (6.7 GB), Spark-X2.5-4B (8.2 GB), gemma4:26b (18 GB - excluded). Local external models verified in `C:\Models`: Qwen3-TTS (1.7B-CustomVoice + Tokenizer) and embeddinggemma-2 (740M).*
 
 ### 2.2 Consequences that shape the design
 1. **Only one LLM is resident at a time** (`OLLAMA_MAX_LOADED_MODELS=1`). Swaps cost seconds → **role-batched, swap-aware scheduling**. Evaluate in Phase 1: flash attention, KV-cache quantization, and whether `OLLAMA_MAX_LOADED_MODELS=2` is viable for small model pairs.
@@ -224,6 +229,9 @@ flowchart TD
 - **Voice-butler ("personal AI butler") architecture.**
   - Pipeline: wake word → VAD → STT → LLM → **sentence-streamed TTS** (speak sentence 1 while sentence 2 is generated).
   - Barge-in, short acknowledgements, spoken status ("searching… found 6 sources"), a HUD showing `idle / listening / thinking / acting / speaking`, voice confirmation for risky actions, minimal personality.
+
+**Open-Source Reference Strategy & Third-Party Licensing:**
+The project maintains a local `references/` directory (ignored by git) containing manual reference checkouts of inspiring open-source codebases (Open Notebook, AnythingLLM, OpenCode, Hermes Agent, OpenClaw) for manual pattern analysis, parsing/chunking pipelines, and agent loop ergonomics. Any algorithms, prompt templates, or extraction routines adapted directly into LORA must adhere to their permissive open-source licenses (MIT or Apache-2.0) and be explicitly documented and attributed in [`THIRD_PARTY_NOTICES.md`](file:///c:/Thought/Projects/LORA/THIRD_PARTY_NOTICES.md).
 
 ---
 
@@ -470,7 +478,7 @@ flowchart LR
 **Key design decisions**
 1. **Evidence cards, not raw pages.** The writer never sees whole pages; it sees ≤ 8–12 *evidence cards* (`claim_text`, `supporting_quote`, `source_id`, `page/section`, `tier`). This keeps context small and forces grounding.
 2. **Map-reduce for long docs/PDFs:** per-section summaries (map) → merged outline (reduce), preserving section pointers for citations.
-3. **Hybrid retrieval:** BM25 (SQLite FTS5) + dense vectors (`bge-small` or `nomic-embed-text` via ONNX/CPU only; embeddings never run in Ollama to prevent VRAM contention) fused by reciprocal rank fusion; then **cross-encoder rerank** (`bge-reranker-base`, ONNX/CPU) capped to the top 20–30 candidate chunks to keep latency predictable on 16 GB RAM. Similarity floor → if nothing passes, LORA says *"I couldn't find reliable sources for that"* (abstention is a feature).
+3. **Hybrid retrieval & Session RAG:** BM25 (SQLite FTS5) + dense vectors via **`embeddinggemma-2` (0.7B/740M, `C:\Models\embeddinggemma-2`, CPU via `sentence-transformers`)**; indexed via **`faiss-cpu`** for sub-millisecond in-process vector search (embeddings never run in Ollama to prevent VRAM contention; `bge-small` ONNX as fallback). Dense and sparse scores are fused via reciprocal rank fusion; then **cross-encoder rerank** (`bge-reranker-base`, ONNX/CPU) capped to the top 20–30 candidate chunks keeps latency predictable on 16 GB RAM. Similarity floor → if nothing passes, LORA says *"I couldn't find reliable sources for that"* (abstention is a feature).
 4. **Own-words guarantee (not a copy):** the writer prompt requires paraphrase; a post-check computes longest verbatim overlap against sources; > threshold → rewrite pass. Short direct quotes are allowed only when wrapped as quotes and cited.
 5. **Depth control ("make it more detailed / simpler") — transformations over the SAME evidence:**
    | Mode | Behavior |
@@ -482,7 +490,7 @@ flowchart LR
    | `expert` | Technical vocabulary, methodology, limitations, open questions |
    Changing depth **re-uses the cached notebook** (no re-browsing) and re-runs only write + verify. If the user asks for more detail than the evidence supports, LORA fetches more sources (a new retrieval round) rather than padding.
 6. **Citation format:** `[S3 p.4]` inline, end list with title, author, date, URL, tier, retrieval timestamp. Spoken answers read source *names*, not URLs.
-7. **Notebook persistence:** each topic is a named notebook; follow-up questions ("what about the second paper?") query the same store. Users can add local files/folders as sources by voice ("add my Downloads/paper.pdf to this notebook").
+7. **Notebook persistence & Ephemeral Session RAG:** Users can supply local files or PDFs for ad-hoc research ("here is a paper, explain it"). The system ingests and indexes them in a session-bound `faiss-cpu` vector store (`data/sessions/<id>/faiss.index`). If the interaction is an ad-hoc session, the ephemeral vector DB is cleanly purged on session exit to save space. If the user commands LORA to save it to a persistent notebook ("add this to my ML notebook"), the index and chunks persist in `data/notebooks/<id>/` alongside SQLite metadata for future follow-up queries.
 8. **Conflicting sources:** a *contradiction detector* (NLI between evidence cards of different sources) surfaces disagreements: "Source A says X; Source B says Y" instead of silently picking.
 9. **Freshness:** each card stores source date; time-sensitive questions penalize old sources.
 
@@ -903,7 +911,7 @@ All inference local. Only search/API queries leave the machine (optionally route
 |-------|------|----------|
 | Main DB | **SQLite** (WAL) | sessions, tasks, plans, actions, audit log, notebooks, sources, documents, chunks, evidence cards, claims, verdicts, genomes, runs, scores |
 | Full-text | SQLite **FTS5** | chunk text |
-| Vectors | **sqlite-vec** (or LanceDB if scale demands) | chunk embeddings |
+| Vectors | **faiss-cpu** (session-bound ephemeral index or persisted per notebook) + optional **sqlite-vec** | chunk embeddings generated by `embeddinggemma-2` |
 | HTTP cache | SQLite/disk | responses keyed by URL+ETag, TTL per source |
 | Prompt registry | JSON files + SQLite lineage | genomes (hash-addressed) |
 | Memory | Markdown files + index | curated preferences/facts |
@@ -919,7 +927,7 @@ Key tables (abridged): `notebooks(id,title,origin,visibility,created)`, `sources
 |---------|--------|
 | Language | **Python 3.11+** (asyncio core) |
 | Models runtime | **Ollama** (HTTP API, structured outputs) + local PyTorch for Laya and Qwen-TTS |
-| Local Model Storage | `models_dir: C:\Models` (holds Qwen3-TTS 1.7B-CustomVoice and Tokenizer) |
+| Local Model Storage | `models_dir: C:\Models` (holds Qwen3-TTS 1.7B-CustomVoice, Tokenizer, and `embeddinggemma-2` 740M) |
 | Gateway API | **FastAPI** + **Uvicorn** + **WebSockets** (dual listener: localhost & isolated router LAN) |
 | Mobile Frontend | Lightweight **Preact / TypeScript web app + home-screen shortcut** (served statically by FastAPI gateway) |
 | Orchestration | Own typed state machine (Pydantic v2) — optionally LangGraph |
@@ -927,9 +935,9 @@ Key tables (abridged): `notebooks(id,title,origin,visibility,created)`, `sources
 | Extraction | `trafilatura`, `PyMuPDF`, `pytesseract`/`rapidocr` for OCR |
 | Desktop control | `pywinauto` (UIA read-only window ops), `pywin32`; OS-level `pynput`/`pyautogui` input injection is **deferred** |
 | Audio | `sounddevice`, `faster-whisper` (CPU INT8), `piper-tts` (CPU), `silero-vad`, `openwakeword`, `qwen-tts` (GPU worker process); pause-and-listen / headset AEC |
-| NLI/Embed/Rerank | `onnxruntime` + `bge-small` embeddings + `bge-reranker-base` cross-encoder (CPU-only) |
+| NLI/Embed/Rerank | `sentence-transformers` + **`embeddinggemma-2`** (0.7B in `C:\Models`, CPU) for embeddings; **`faiss-cpu`** for session/notebook vector DB; `onnxruntime` + `bge-reranker-base` cross-encoder (CPU-only) + HHEM-2.1 |
 | Search | **SearXNG** (local Docker) + API connectors via `httpx` |
-| Storage | SQLite + FTS5 + sqlite-vec |
+| Storage | SQLite + FTS5 + **faiss-cpu** (+ optional `sqlite-vec`) |
 | UI | Tray + small HUD (PySide6/Qt), CLI via `typer`/`rich` |
 | Config | YAML + Pydantic validation |
 | Tests | `pytest`, `pytest-asyncio`, `hypothesis`, `pytest-cov` (≥ 80%) |
@@ -981,6 +989,8 @@ LORA/
 │  └─ storage/      (db.py, migrations/, cache.py)
 ├─ prompts/         (default genome: <role>.system.md, <role>.user.md)
 ├─ skills/          (voice-triggered routines, human-readable)
+├─ references/      # git-ignored directory for manual reference clones (AnythingLLM, OpenNotebook, etc.)
+├─ THIRD_PARTY_NOTICES.md # license attributions for adapted patterns
 ├─ tests/           (unit/, integration/, e2e/, redteam/, evals/)
 └─ evals/           (benchmark tasks, gold key-points, adversarial sets)
 ```
@@ -1069,7 +1079,8 @@ models:                           # starting point; Phase 1 benchmark determines
 grounding:
   nli_fast: vectara-hhem-2.1-open
   nli_secondary: minicheck
-  embedder: bge-small
+  embedder: "C:\\Models\\embeddinggemma-2"  # sentence-transformers CPU (fallback: bge-small)
+  vector_store: faiss                       # faiss-cpu session index (optional sqlite-vec)
   reranker: bge-reranker-base
 
 research:
@@ -1116,12 +1127,12 @@ safety:
 | Phase | Deliverable | Exit criteria |
 |-------|-------------|---------------|
 | **0 Foundations & Repo Setup** (≈3 d) | Repo, config, SQLite schema, Ollama client, structured-output harness, logging/audit | Round-trip typed LLM call with validation; CI green |
-| **1 Model Benchmarking, Spark Quantization & Laya Fine-Tuning** (≈1 wk) | (a) Verify Ollama models; quantize `SparkLLM/Spark-X2.5-4B` to `spark-x25-4b-q4` (Q4_K_M ~2.5 GB); cap writer `num_ctx` to 8192 (reader 32k). (b) Bench harness: test Spark (`spark25` parser, JSON schema, `think:false`, needle retrieval, tok/s, VRAM, load/swap latencies) vs `granite`, `ornith`, `gemma4`. (c) Build LORA decision dataset, fine-tune `laya-typed-decisions`, calibrate temperatures, held-out eval. (d) Download HHEM/MiniCheck/bge-reranker-base, export ONNX | Written role→model assignment backed by benchmark numbers; Spark quantized and verified on GPU; Laya intent accuracy ≥ 90% on held-out with calibrated confidence; model swap latencies measured |
+| **1 Model Benchmarking, Spark Quantization & Laya Fine-Tuning** (≈1 wk) | (a) Verify Ollama models; quantize `SparkLLM/Spark-X2.5-4B` to `spark-x25-4b-q4` (Q4_K_M ~2.5 GB); cap writer `num_ctx` to 8192 (reader 32k). (b) Bench harness: test Spark (`spark25` parser, JSON schema, `think:false`, needle retrieval, tok/s, VRAM, load/swap latencies) vs `granite`, `ornith`, `gemma4`. (c) Build LORA decision dataset, fine-tune `laya-typed-decisions`, calibrate temperatures, held-out eval. (d) Download HHEM/MiniCheck/bge-reranker-base, export ONNX; benchmark `C:\Models\embeddinggemma-2` (740M) latency and RAM footprint on CPU via `sentence-transformers`; verify `faiss-cpu` in-process indexing. | Written role→model assignment backed by benchmark numbers; Spark quantized and verified on GPU; Laya intent accuracy ≥ 90% on held-out with calibrated confidence; model swap latencies measured; CPU embeddings and FAISS index throughput validated |
 | **2 Safety & Policy Core** (≈1 wk) *(before any control/browser tools)* | Policy engine, hard-deny first ordering, path/extension allowlists, origin enforcement, kill switch, audit logger, CI deterministic Red-Team suite | CI Red-Team suite passes with 0 forbidden actions |
 | **3 File & App Control** (≈1 wk) | Narrow tools (`open_app` allowlist, `open_path` allowed roots & safe extensions, `list_dir`, `read_file`, `search_files`, `focus_window`, `list_windows`); intent router, planner, controller | Voice/CLI: "open folder X and read README" works reliably with strict extension blocking |
 | **4 Browser Driving & Search** (≈1.5 wk) | Playwright driver (dedicated profile with preserved session cookies), SearXNG setup, DOM locators/adapters, extraction, PDF pipeline, ask-other-AI tool, injection shield, URL egress allowlist | Fetch+extract+PDF tests pass; DOM typing adapters work on allowlisted sites; injection and egress defenses pass |
 | **5 Voice Pipeline** (≈1.5 wk) | Train `hey_lora.onnx` + `lora voice-enroll` CLI (`user_verifier.onnx` on 5–10 enrolled samples); Silero VAD; faster-whisper `distil-small.en` on CPU (INT8, `initial_prompt` technical vocabulary); verify `C:\Models` Qwen3-TTS weights (1.7B-CustomVoice + Tokenizer) running in separate GPU worker process; Piper CPU fallback; pause-and-listen / headset AEC; GPU time-multiplexing; push-to-talk hotkey; HUD stub | Wake → ack < 2.5 s; system activates only for enrolled owner voice (<0.5 false wakes/h, 0 imposter wakes in test); faster-whisper transcribes technical terms accurately without VRAM; Qwen3-TTS speaks verified text cleanly |
-| **6 Grounded Research Engine** (≈2 wk) | Ingest, hybrid retrieval (`bge-small` ONNX/CPU), rerank (`bge-reranker-base`, top 20–30 chunks), evidence cards, writer (`spark-x25-4b-q4`), depth modes, copy check, persistent notebooks | Answers with citations from fixtures; own-words paraphrase check passes |
+| **6 Grounded Research Engine** (≈2 wk) | Ingest, chunking pipeline (adapted from AnythingLLM/Open Notebook), `embeddinggemma-2` CPU embeddings, `faiss-cpu` session-bound vector DB (ephemeral cleanup on session close or saved to notebook), rerank (`bge-reranker-base`, top 20–30 chunks), evidence cards, writer (`spark-x25-4b-q4`), depth modes, copy check, persistent notebooks | Answers with citations from fixtures; own-words paraphrase check passes; ephemeral session vector index cleanup verified |
 | **7 Verification Pipeline** (≈1.5 wk) | V1–V8 pipeline, claim decomposition, HHEM-2.1/MiniCheck CPU NLI, Granite verifier, cross-source corroboration, number check, repair loop, confidence labels, abstention | Truthfulness eval passes targets (per-claim $\ge 0.80$, gate $\ge 0.85$, benchmark $\ge 95\%$) |
 | **8 Gateway API & Mobile Web App** (≈1 wk) | (a) FastAPI Gateway with dual listeners (`127.0.0.1:8765` desktop & `192.168.50.10:8765` mobile). (b) Origin capability gating: mobile = `user_remote`, Tier 0 research only (no local files, no UI, client-side Web Speech TTS). (c) QR pairing for `LORA_MOBILE_TOKEN`, listener token isolation, auth rate limiting. (d) `docs/NETWORK_SETUP.md` (Topologies 0, A, B), `scripts/net_setup.ps1` (`-InterfaceAlias`, `SetThreadExecutionState`), `lora net-check` CLI with external probe. (e) Responsive Preact/TS web app + home-screen shortcut | `lora net-check` all PASS; mobile web app asks research question, streams verified response over LAN; Tier ≥ 1 tools and local files completely inaccessible from mobile |
 | **9 Supervisor & Round Table** (≈1 wk) | Supervisor checkpoints, round-table personas (Skeptic, Fact-checker, Editor [`granite4.2:8b`], Safety Officer), anomaly detection, deadlock-free gating | Catches seeded errors in eval set; hard-fail arbitration works |
@@ -1187,6 +1198,8 @@ These are gaps in the original brief. Each has a **default I will implement** un
 | 27 | TTS voice selection default | Use preset "Vivian" on CustomVoice 1.7B in `C:\Models`; voice cloning deferred to later phase (§4.1.3) |
 | 28 | Chatbot automation ToS risk | Feature is opt-in per site, rate-limited to 1 req/5s, uses DOM locators, prefers free official APIs (§4.3.1) |
 | 29 | WSL2 host RAM exhaustion | Set `.wslconfig` with `memory=4GB` cap to prevent Docker SearXNG from starving Ollama & Qwen3-TTS (§2.3) |
+| 30 | Session-bound RAG & local embeddings model | Designated `C:\Models\embeddinggemma-2` (740M, 1.48 GB) on CPU via `sentence-transformers` + `faiss-cpu` in-process/ephemeral index; flushed on session close unless user explicitly saves to notebook (§4.5, §6) |
+| 31 | Architectural code reuse & attribution from open-source inspirations | Reference checkouts stored in `references/` (git-ignored); code patterns ported to typed async Python; attributions documented in `THIRD_PARTY_NOTICES.md` (§3.1, §8) |
 
 **Questions I'd like you to confirm (answer any or none; defaults apply):**
 1. OK to install **Docker Desktop (WSL2)** to run a local **SearXNG**? Else fallback = knowledge APIs + visible-browser search only.
@@ -1245,11 +1258,13 @@ Retrieve once → baseline run 3 times (ε from variance, floor 0.02) score 0.68
 | R19 | Extra features you'd add | §4.10 (A1–A20) | — |
 | R20 | **Special feature:** Outer Loop with iterations, max limit, supervisor/round table pick best, prompt changes, rollback if worse, continue if better, stop at max, present best | §4.9 (genome split, algorithm, deadlock-free scoring, guardrails, modes, method details) | "Deep research with refinement on X" |
 | R21 | Inspirations' architectures used without naming them | §3.1 | Notebook, workspace RAG, permissioned loop, self-improving agent, control gateway, voice butler |
-| R22 | Plug holes with recommended defaults | §13 (29 holes) | Defaults apply unless you object |
+| R22 | Plug holes with recommended defaults | §13 (31 holes) | Defaults apply unless you object |
 | R23 | Spark-X2.5-4B model integration | §2.1, §4.8.2 | 4.1B hybrid attention model; quantized Q4_K_M candidate for Writer (8k context) / Long-Doc Reader (32k context); verified by Granite-4.2 |
 | R24 | Isolated home-router network (`192.168.50.0/24`) | §4.12 | Dedicated subnet/AP, Topologies 0/A/B, static binding, `scripts/net_setup.ps1`, `lora net-check` CLI |
 | R25 | LORA Gateway API & Mobile Web App | §4.11, §3 (L1), §5.1, §5.4 | FastAPI + WebSocket `/v1`, mobile web app + shortcut, QR token auth, origin capability filtering |
 | R26 | Dedicated local model weights in `C:\Models` | §2.1, §4.1, §9 | Recognizes pre-downloaded Qwen3-TTS 1.7B-CustomVoice & Tokenizer in `C:\Models`, avoids redownload |
+| R27 | Local session RAG with embeddinggemma-2 (740M) & FAISS | §4.5, §6, §7 | Ingests PDFs into local `faiss-cpu` index using `C:\Models\embeddinggemma-2` on CPU; ephemeral cleanup on session close |
+| R28 | Open-source reference architecture & attribution (OpenNotebook, AnythingLLM, Hermes, OpenCode, OpenClaw) | §3.1, §8 | Architectural patterns ported to async Python; `references/` git-ignored; `THIRD_PARTY_NOTICES.md` attribution |
 
 ---
 
@@ -1259,6 +1274,7 @@ Retrieve once → baseline run 3 times (ε from variance, floor 0.02) score 0.68
 |------|--------|--------------|
 | Installed Ollama models, sizes, families, capabilities (incl. SparkLLM/Spark-X2.5-4B:latest) | ✅ Verified | `ollama list` / `ollama show` on this machine; Spark is 8.2 GB BF16 spark2_5 architecture, requires Q4_K_M and 8k writer context cap |
 | Local Qwen3-TTS weights in `C:\Models` | ✅ Verified | File system inspection: `C:\Models\Qwen3-TTS-12Hz-1.7B-CustomVoice` (3.83 GB) + Tokenizer (682 MB) present; HF cache has pointers only |
+| Local `embeddinggemma-2` weights in `C:\Models` | ✅ Verified | File system inspection: `C:\Models\embeddinggemma-2` (1.48 GB safetensors, 740M params, sentence-transformers format) present |
 | Qwen3-TTS repos (0.6B/1.7B Base, CustomVoice, 1.7B VoiceDesign, Tokenizer), `qwen-tts` API | ✅ Verified | Hugging Face API + official model card |
 | Laya package, API (`Router.predict`, `choice/score/noul`), checkpoints, Apache-2.0, fine-tune gain | ✅ Verified | Official PyPI README + Hugging Face API |
 | openWakeWord: Windows ONNX-only, synthetic training < 1 h, < 0.5 FA/h target, speaker verifier | ✅ Verified | Official README |
@@ -1270,4 +1286,4 @@ Retrieve once → baseline run 3 times (ε from variance, floor 0.02) score 0.68
 
 ---
 
-*End of plan (v1.2). Next step upon approval: Phase 0 (foundations & repo setup) and Phase 1 (model benchmarking, Spark quantization & Laya fine-tuning) — followed by the safety core before any control or browser tools are written.*
+*End of plan (v1.3). Next step upon approval: Phase 1 (model benchmarking, Spark quantization, embeddinggemma-2 evaluation & Laya fine-tuning) — followed by the safety core before any control or browser tools are written.*
