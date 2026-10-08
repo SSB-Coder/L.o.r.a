@@ -45,7 +45,59 @@ class ControlPlanner:
                 reasoning=f"User requested switching to window '{target}'",
             )]
 
-        # 3. Open path (Downloads, Documents, Desktop)
+        # 3. Ask External AI (ChatGPT, Claude)
+        ask_ai_match = re.search(r"^ask\s+(claude|chatgpt|deepseek)\s+(?:to\s+)?(.+)", text.strip(), re.IGNORECASE)
+        if ask_ai_match:
+            svc = ask_ai_match.group(1).strip().lower()
+            prompt = ask_ai_match.group(2).strip()
+            return [PlannedAction(
+                tool="ask_other_ai",
+                params={"service": svc, "prompt": prompt},
+                reasoning=f"User requested asking {svc} external AI",
+            )]
+
+        # 4. Search specific knowledge provider (e.g. "search arxiv for quantum", "search github for lora")
+        search_spec_match = re.search(r"^search\s+(arxiv|wikipedia|pubmed|github|crossref|hackernews|openlibrary|searxng|duckduckgo)\s+(?:for|about)?\s*(.+)", text.strip(), re.IGNORECASE)
+        if search_spec_match:
+            src = search_spec_match.group(1).strip().lower()
+            query = search_spec_match.group(2).strip()
+            return [PlannedAction(
+                tool="web_search",
+                params={"query": query, "source": src},
+                reasoning=f"User requested searching {src} for '{query}'",
+            )]
+
+        # 5. General Web Search (e.g. "search web for X", "search for X")
+        search_web_match = re.search(r"^search\s+(?:(?:the\s+)?(?:web|online|internet)\s+)?for\s+(.+)", text.strip(), re.IGNORECASE)
+        if search_web_match:
+            query = search_web_match.group(1).strip()
+            return [PlannedAction(
+                tool="web_search",
+                params={"query": query, "source": "auto"},
+                reasoning=f"User requested web search for '{query}'",
+            )]
+
+        # 6. Fetch Page / Webpage (case-preserving URL extraction)
+        fetch_match = re.search(r"^(?:fetch|read|extract)\s+(?:webpage|page|article|url)\s+(https?://\S+)", text.strip(), re.IGNORECASE)
+        if fetch_match:
+            url = fetch_match.group(1).strip()
+            return [PlannedAction(
+                tool="fetch_page",
+                params={"url": url},
+                reasoning=f"User requested reading webpage {url}",
+            )]
+
+        # 7. Fetch PDF (case-preserving URL extraction)
+        pdf_match = re.search(r"^(?:fetch|read|download)\s+pdf\s+(https?://\S+)", text.strip(), re.IGNORECASE)
+        if pdf_match:
+            url = pdf_match.group(1).strip()
+            return [PlannedAction(
+                tool="pdf_fetch",
+                params={"url": url},
+                reasoning=f"User requested fetching PDF {url}",
+            )]
+
+        # 8. Open path (Downloads, Documents, Desktop)
         for folder_name, folder_path in self.standard_paths.items():
             if f"open my {folder_name}" in clean or f"open {folder_name}" in clean:
                 return [PlannedAction(

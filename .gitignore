@@ -41,6 +41,7 @@ htmlcov/
 # Local runtime data & caches (keep local within project)
 data/
 logs/
+cache/
 *.db-shm
 *.db-wal
 outputs/

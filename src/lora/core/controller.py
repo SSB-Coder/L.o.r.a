@@ -61,3 +61,39 @@ class Controller:
             "steps": results,
             "step_count": len(results),
         }
+
+    async def aexecute_user_request(
+        self,
+        user_request: str,
+        decision: LayaDecision | None = None,
+        origin: str = "desktop",
+    ) -> dict[str, Any]:
+        """Asynchronously plan and execute a user control request."""
+        planned_actions = self.planner.plan(user_request, decision)
+        results = []
+        overall_success = True
+
+        for action in planned_actions:
+            provenance = {k: DataProvenance.USER for k in action.params}
+            step_res = await self.tool_registry.aexecute(
+                tool_name=action.tool,
+                params=action.params,
+                origin=origin,
+                provenance=provenance,
+            )
+            results.append({
+                "tool": action.tool,
+                "params": action.params,
+                "reasoning": action.reasoning,
+                "result": step_res,
+            })
+            if step_res.get("status") not in ["success", "partial"]:
+                overall_success = False
+                break
+
+        return {
+            "status": "success" if overall_success else "failed",
+            "request": user_request,
+            "steps": results,
+            "step_count": len(results),
+        }
