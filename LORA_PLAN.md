@@ -1,9 +1,14 @@
 # L.O.R.A — Layer Oriented Research Assistant
-### Master Implementation Plan (v1.3)
+### Master Implementation Plan (v1.4)
 
 > A voice-controlled, local-first, agentic research and desktop-assistant system. It listens (STT), speaks (TTS), operates the computer within a hard safety envelope (no deletion, ever), browses and reads the open knowledge web, and returns **verified, source-grounded, rewritten** explanations. A supervisor layer checks every important step, and a bounded **Outer Loop** self-improves prompts per research task with automatic rollback.
 
 ---
+
+### Changelog (v1.4)
+- **Phase 4 External AI Upgrades & Privacy Scrubber**: Implemented `PromptOptimizerAgent` (two-tier prompt generation with deterministic fast tier + optional deep Ollama model refinement) and `PrivacyScrubber` (deterministic regex redaction of local paths, OS usernames, RFC1918 IPs, and credentials/API keys). Expanded browser DOM adapters to include **Google Gemini** (`gemini.google.com`) and **Perplexity AI** (`perplexity.ai`) alongside ChatGPT and Claude, with full provenance tagging (`DataProvenance`) and typing domain egress allowlists.
+- **Phase 5 Voice Pipeline Complete**: Implemented full offline voice pipeline. User-chosen custom wake phrase: **"Awaken LORA"** (with "Hey LORA" alias) using openWakeWord with threshold 0.65. Calibrated `SpeakerVerifier` with 32-bin spectral FFT signatures and `user_verifier.json` enrollment CLI (`uv run python -m lora.voice.enroll`). Zero-VRAM STT with `FasterWhisperTranscriber` on CPU (INT8, `compute_type="int8"`, 0 MB VRAM) with technical vocabulary biasing. Isolated GPU TTS worker subprocess (`Qwen3TtsWorkerProcess`) running `Qwen3-TTS-12Hz-1.7B-CustomVoice` with sentence-level streaming and instant **barge-in audio playback cancellation**. Push-to-talk hotkey listener (`Ctrl+Alt+Space`) and thread-safe `VoiceController`.
+- **Phase 6 Ephemeral Web-Browsing Embeddings**: Formally integrated dynamic in-memory embeddings for visited websites and PDFs. As LORA browses the web (`browser_read` / Trafilatura) or fetches PDFs (`pdf_fetch` / PyMuPDF), extracted text is semantically chunked (400–800 tokens) and embedded on the fly into an in-memory `faiss-cpu` vector index (`SessionVectorIndex`) using `embeddinggemma-2` (740M) on CPU. Enables sub-5ms paragraph retrieval while browsing, feeds only top 5–10 relevant passages to LLM context, preserves granular citation metadata, and evaporates on session end with **zero disk bloat** unless explicitly saved to a research notebook.
 
 ### Changelog (v1.3)
 - **Session RAG & Local Embeddings**: Designated `C:\Models\embeddinggemma-2` (0.7B/740M params, 1.48 GB safetensors) running on CPU via `sentence-transformers` as the primary local embedding engine; paired with `faiss-cpu` for lightweight, session-bound ephemeral vector databases (fast in-process RAG over user PDFs/documents, flushed cleanly on session teardown or persisted per notebook).
@@ -239,15 +244,15 @@ The project maintains a local `references/` directory (ignored by git) containin
 
 ### 4.1 Voice: Activation Key, STT, TTS
 
-**What:** Hands-free voice control activated via a personalized wake detector ("Hey LORA"), backed by a low-latency CPU speech-to-text pipeline and a global push-to-talk hotkey fallback (`Ctrl+Alt+Space`).
+**What:** Hands-free voice control activated via a personalized wake detector ("Awaken LORA" / "Hey LORA"), backed by a low-latency CPU speech-to-text pipeline and a global push-to-talk hotkey fallback (`Ctrl+Alt+Space`).
 
 **Chosen components (finalized decisions)**
 | Stage | Primary | Fallback / alternative | Notes |
 |-------|---------|------------------------|-------|
-| **Voice Activation ("At My Voice")** | **openWakeWord** (`hey_lora.onnx`) + **Personalized Speaker Verifier** (`user_verifier.onnx` via `openwakeword.train_custom_verifier`). 100% offline, CPU ONNX runtime (`pip install openwakeword onnxruntime`). < 3% CPU core, 0 MB VRAM | **Push-to-Talk hotkey** (`Ctrl+Alt+Space`); **Porcupine** (`pvporcupine`) with personal AccessKey fallback; **Vosk grammar** (`["hey lora","[unk]"]`) emergency fallback | **Convenience filter to reduce false wakes, not biometric authentication:** A replay attack or recorded audio can pass it; confirmation is strictly retained for any action that acts on the PC. Stage 1 detects "Hey LORA" ($\tau_{wake} \ge 0.65$); Stage 2 verifies acoustic similarity against enrolled owner clips ($\tau_{speaker} \ge 0.70$). |
-| **VAD / endpointing** | **Silero VAD** (`silero-vad`, ~1 ms/chunk on CPU) | `ten-vad`, `webrtcvad-wheels` | Evaluates audio continuously; gates silence so Whisper never hallucinates on background noise. |
-| **STT (Speech-to-Text)** | **faster-whisper `distil-small.en`** (`compute_type="int8"`, `device="cpu"`, `beam_size=1`, `vad_filter=True` via `pip install faster-whisper`). CTranslate2 engine uses ~300 MB RAM and **0 MB VRAM**, leaving the entire 6 GB GPU to Ollama/TTS | **Moonshine** (`moonshine-voice`, sub-200ms streaming latency on short commands); **Parakeet-TDT 0.6B** via `sherpa-onnx`; `small.en` fallback | Transcribes a 5-s command in ~0.5–0.8 s on modern CPU. Configured with `initial_prompt="LORA, arXiv, RAG, Ollama, Python, VS Code, GitHub, Hugging Face, Granite, Gemma"` to eliminate phonetic misspellings ("Laura", "low ra"). |
-| **TTS (quality responses)** | **Qwen3-TTS 12Hz 1.7B-CustomVoice** (`pip install -U qwen-tts`; loaded from `models_dir: C:\Models\Qwen3-TTS-12Hz-1.7B-CustomVoice` + `C:\Models\Qwen3-TTS-Tokenizer-12Hz`, `device_map="cuda:0"`, `dtype=torch.bfloat16`, `attn_implementation="sdpa"`). Primary quality voice on GPU | Community GGUF runtime / Kokoro / Piper | **Run as a SEPARATE worker process** (clean VRAM release on exit, avoids dependency/library conflicts with transformers). Also evaluate `Qwen3-TTS-0.6B` in Phase 1 as a low-VRAM co-resident option that removes swap overhead. |
+| **Voice Activation ("At My Voice")** | **openWakeWord** ("Awaken LORA" / "Hey LORA") + **Personalized Speaker Verifier** (`data/voice/user_verifier.json` via spectral FFT feature matching). 100% offline, CPU ONNX runtime (`pip install openwakeword onnxruntime`). < 3% CPU core, 0 MB VRAM | **Push-to-Talk hotkey** (`Ctrl+Alt+Space`); **Porcupine** (`pvporcupine`) with personal AccessKey fallback; **Vosk grammar** (`["awaken lora", "hey lora", "[unk]"]`) emergency fallback | **Convenience filter to reduce false wakes, not biometric authentication:** A replay attack or recorded audio can pass it; confirmation is strictly retained for any action that acts on the PC. Stage 1 detects "Awaken LORA" ($\tau_{wake} \ge 0.65$); Stage 2 verifies acoustic similarity against enrolled owner clips ($\tau_{speaker} \ge 0.70$). |
+| **VAD / endpointing** | **Silero VAD** (`silero-vad`, ~1 ms/chunk on CPU) + RMS energy heuristic endpointing | `ten-vad`, `webrtcvad-wheels` | Evaluates audio continuously; gates silence so Whisper never hallucinates on background noise. |
+| **STT (Speech-to-Text)** | **faster-whisper `distil-small.en`** (`compute_type="int8"`, `device="cpu"`, `beam_size=1`, `vad_filter=True` via `pip install faster-whisper`). CTranslate2 engine uses ~300 MB RAM and **0 MB VRAM**, leaving the entire 6 GB GPU to Ollama/TTS | **Moonshine** (`moonshine-voice`, sub-200ms streaming latency on short commands); **Parakeet-TDT 0.6B** via `sherpa-onnx`; `small.en` fallback | Transcribes a 5-s command in ~0.5–0.8 s on modern CPU. Configured with `initial_prompt="LORA, Awaken LORA, arXiv, RAG, Ollama, Python, VS Code, GitHub, Hugging Face, Granite, Gemma"` to eliminate phonetic misspellings ("Laura", "low ra"). |
+| **TTS (quality responses)** | **Qwen3-TTS 12Hz 1.7B-CustomVoice** (`pip install -U qwen-tts`; loaded from `models_dir: C:\Models\Qwen3-TTS-12Hz-1.7B-CustomVoice` + `C:\Models\Qwen3-TTS-Tokenizer-12Hz`, `device_map="cuda:0"`, `dtype=torch.bfloat16`, `attn_implementation="sdpa"`). Primary quality voice on GPU | Community GGUF runtime / Kokoro / Piper / Fallback Tone Synthesis | **Run as a SEPARATE worker process** (clean VRAM release on exit, avoids dependency/library conflicts with transformers). Supports sentence-streaming and instant barge-in audio playback cancellation. |
 | **TTS (fast chatter & earcons)** | **Piper** (CPU, real-time, zero VRAM) for acknowledgements, status updates, conversational earcons, and anytime the LLM is actively loaded | Kokoro (CPU, higher quality voice) | Always available on CPU; keeps interactions instantaneous (< 300 ms). Time to Piper acknowledgement < 2.5 s defines G1. |
 
 #### 4.1.1 Personalized Voice Activation Architecture ("At My Voice")
@@ -260,29 +265,29 @@ To reduce unwanted activations while keeping VRAM free, LORA employs a two-stage
 [Silero VAD Filter (<1ms CPU)] ──(Silence)──► Discard (0% CPU load)
        │ (Voiced Frame)
        ▼
-[Stage 1: openWakeWord ("Hey LORA")]
+[Stage 1: openWakeWord ("Awaken LORA")]
        │
        ├── Score < 0.65 ──► Discard
        │
        └── Score ≥ 0.65 (Acoustic phrase detected)
               │
               ▼
-       [Stage 2: Personalized Speaker Verifier (user_verifier.onnx)]
+       [Stage 2: Personalized Speaker Verifier (user_verifier.json)]
               │
               ├── Score < 0.70 (Different speaker / TV / audio) ──► Log: imposter_rejected
               │
               └── Score ≥ 0.70 (Owner Voice Similarity Match)
                      │
                      ▼
-              [Wake Chime Played (Piper / Earcon)]
+              [Wake Chime Played / Barge-in Interrupt]
                      │
                      ▼
               [State Transition: IDLE ──► LISTENING]
 ```
 
 - **Enrollment Workflow (`lora voice-enroll` CLI)**:
-  1. User runs `python -m lora.cli voice-enroll` in terminal.
-  2. The system prompts the user to speak *"Hey LORA"* 7 times at natural volume and distance.
+  1. User runs `uv run python -m lora.voice.enroll` in terminal.
+  2. The system prompts the user to speak *"Awaken LORA"* 5 times at natural volume and distance.
   3. The system captures 5 negative reference clips (normal conversational speech or room ambience).
   4. Calls `openwakeword.train_custom_verifier(positive_reference_clips, negative_reference_clips, output_path="models/voice/", model_name="user_verifier.onnx")`.
   5. Training takes < 10 seconds on CPU.
@@ -376,7 +381,7 @@ Two modes:
 | `browser_read()` | Extract main text via `trafilatura`/`readability`; strips nav/ads; returns text + title + URL + fetch time + content hash |
 | `browser_screenshot()` | For OCR/vision fallback |
 | `pdf_fetch(url)` | Download to cache, extract text with PyMuPDF (+ per-page mapping for page-level citations); scanned PDFs → OCR |
-| `ask_other_ai(site, prompt)` | Types a prompt into a configured third-party AI web chat, waits for completion, reads reply. **Treated as an UNTRUSTED, UNVERIFIED source** (its output is a lead to verify, never a citation of truth) |
+| `ask_other_ai(site, prompt, style)` | Types an optimized, privacy-scrubbed prompt into a third-party AI web chat (Claude, ChatGPT, Gemini, Perplexity), waits for completion, reads reply. **Treated as an UNTRUSTED, UNVERIFIED source** (Tier 4 lead to verify, never a citation of truth). Protected by `DataProvenance` barriers and `PrivacyScrubber`. |
 | `crawl_links(url, depth≤1, filter)` | Follow selected links within a limited budget |
 
 **Politeness & legality:** obey `robots.txt` for crawling, identifiable User-Agent, per-domain rate limiter (e.g., 1 req/s), exponential backoff, local HTTP cache (ETag/Last-Modified), no paywall circumvention (use Unpaywall/open-access routes instead), no CAPTCHA solving (ask the user).
@@ -384,13 +389,17 @@ Two modes:
 #### 4.3.1 Typing into Websites and Chatbots
 
 When instructed to type into search engines, reference portals, or third-party AI chatbots, LORA adheres to strict isolation and provenance policies:
-- **Domain ALLOWLIST for typing:** Typing is permitted **only** into domains on an explicit allowlist in `policy.yaml` (e.g., `google.com`, `duckduckgo.com`, `chat.deepseek.com`, `claude.ai`, `chatgpt.com`). Any domain not explicitly allowlisted triggers an immediate hard deny.
-- **Per-site DOM adapters:** LORA interacts through dedicated DOM adapters (`src/lora/tools/browser/adapters/`) using Playwright accessibility and role-based locators (`page.get_by_role("textbox")`, `page.locator("textarea")`). Each adapter defines reliable selectors for input submission and response extraction, avoiding flaky visual guessing.
-- **Data provenance policy:** Text dispatched to external websites or chatbots must originate **strictly** from untainted sources: the user's explicit utterance or the currently active research notebook. Content from local user files or other unrelated notebooks requires **explicit user confirmation** before leaving the machine. Web text can **never** become typed text.
-- **Chatbot replies as untrusted leads:** External AI chatbot responses are classified as **Tier 4 untrusted leads** and flagged as `"AI-generated"`. They may provide search angles or hypotheses, but are **never cited as factual truth** in LORA's output.
-- **Manual login & session preservation:** The user performs logins manually inside the dedicated Playwright profile during setup. LORA never reads, stores, or types user credentials. The dedicated profile preserves session cookies across runs so repeated manual logins are avoided, while password input fields remain strictly blocked by input guards.
-- **Terms of Service (ToS) risk management:** Automating consumer chatbot web UIs carries ToS risks and bot-detection heuristics. Chatbot typing is therefore **opt-in, executed at low rates** (minimum 5s pause between actions), and official free APIs are prioritized whenever available.
-- **Sandboxed downloads:** Playwright automatic file downloads are disabled by default. If a PDF or document must be fetched, it is routed through `pdf_fetch` into an isolated, quarantined scratch cache.
+- **Domain ALLOWLIST for typing:** Typing is permitted **only** into domains on an explicit allowlist in `policy.yaml` (`google.com`, `gemini.google.com`, `duckduckgo.com`, `perplexity.ai`, `chat.deepseek.com`, `claude.ai`, `chatgpt.com`). Any domain not explicitly allowlisted triggers an immediate hard deny.
+- **Per-site DOM adapters:** Dedicated Playwright DOM adapters (`src/lora/tools/browser/adapters/`) support **ChatGPT**, **Claude**, **Google Gemini**, and **Perplexity AI** using role-based accessibility locators (`page.get_by_role("textbox")`, `textarea`, `div[contenteditable="true"]`).
+- **Prompt Engineering & Privacy Scrubber Agent (`PromptOptimizerAgent`):**
+  - **Deterministic Fast Tier:** Injects model-specific meta-prompts (no conversational preamble, structured Markdown, trade-off analysis) tailored to each model's strengths (Claude, ChatGPT, Gemini, Perplexity).
+  - **Deep Tier:** Optional local Ollama refinement (`gemma4:e4b` / `granite4.2:8b`) with automatic fallback.
+  - **Privacy Scrubber:** Deterministically scans and redacts Windows local paths (`C:\...`), UNC shares (`\\...`), OS usernames, private IP networks (`127.0.0.1`, RFC1918), and API tokens/keys before any payload leaves the machine.
+- **Data provenance policy:** Text dispatched to external websites or chatbots must originate **strictly** from untainted sources: the user's explicit utterance or the currently active research notebook. Content carrying `DataProvenance.UNTRUSTED` (web-scraped text or untrusted downloads) is **strictly blocked** from being typed into external AI prompts.
+- **Chatbot replies as untrusted leads:** External AI chatbot responses are classified strictly as **Tier 4 untrusted leads** and flagged as `"AI-generated"`. They may provide search angles or hypotheses, but are **never cited as factual truth** in LORA's output.
+- **Manual login & session preservation:** The user performs logins manually inside the dedicated Playwright profile during setup (`cache/browser_profile`). LORA never reads, stores, or types user credentials. The dedicated profile preserves session cookies across runs so repeated manual logins are avoided, while password input fields remain strictly blocked by input guards.
+- **Terms of Service (ToS) risk management:** Automating consumer chatbot web UIs carries ToS risks and bot-detection heuristics. Chatbot typing is therefore **opt-in, executed at low rates** (minimum 5s pause serialized via `asyncio.Lock`), and official free APIs are prioritized whenever available.
+- **Sandboxed downloads:** Playwright automatic file downloads are disabled by default. If a PDF or document must be fetched, it is routed through `pdf_fetch` into an isolated, quarantined scratch cache with automatic disk unlink.
 
 ---
 
@@ -491,7 +500,13 @@ flowchart LR
    | `expert` | Technical vocabulary, methodology, limitations, open questions |
    Changing depth **re-uses the cached notebook** (no re-browsing) and re-runs only write + verify. If the user asks for more detail than the evidence supports, LORA fetches more sources (a new retrieval round) rather than padding.
 6. **Citation format:** `[S3 p.4]` inline, end list with title, author, date, URL, tier, retrieval timestamp. Spoken answers read source *names*, not URLs.
-7. **Notebook persistence & Ephemeral Session RAG:** Users can supply local files or PDFs for ad-hoc research ("here is a paper, explain it"). The system ingests and indexes them in a session-bound `faiss-cpu` vector store (`data/sessions/<id>/faiss.index`). If the interaction is an ad-hoc session, the ephemeral vector DB is cleanly purged on session exit to save space. If the user commands LORA to save it to a persistent notebook ("add this to my ML notebook"), the index and chunks persist in `data/notebooks/<id>/` alongside SQLite metadata for future follow-up queries.
+7. **Ephemeral Web-Browsing Embeddings & Session Vector Index (`SessionVectorIndex`):**
+   - **Dynamic On-the-Fly Web Indexing:** As LORA browses the web (`browser_read` / Trafilatura) or downloads web PDFs (`pdf_fetch` / PyMuPDF), it creates **ephemeral in-memory embeddings** on the fly.
+   - **Why Ephemeral Embeddings for Web Pages?** Web articles, technical documentation, and scholarly PDFs often contain thousands of words or dozens of pages. Stuffing entire web pages into an LLM's context window overflows small context budgets, dilutes attention, and inflates latency. Instead, browsed pages are cleaned, split into 400–800 token chunks with 15% overlap, and embedded immediately into an in-memory `faiss-cpu` index using `embeddinggemma-2` (740M) on CPU (0 MB VRAM).
+   - **Sub-5ms Semantic Paragraph Search:** For any user query or follow-up question, LORA performs sub-5ms cosine similarity lookup against visited sites, pulling only the top 5–10 high-relevance evidence chunks into the LLM context rather than raw, noisy HTML.
+   - **Granular Source Provenance:** Each ephemeral chunk preserves granular source provenance metadata: `source_url`, `page_title`, `paragraph_index`, `fetch_timestamp`, and `content_hash` — ensuring all claims can be traced directly back to exact web paragraphs.
+   - **Zero Disk Bloat (RAM-Only Lifecycle):** The `SessionVectorIndex` lives exclusively in memory during the active session. When the research session ends or the browser closes, the vectors and chunks evaporate completely, leaving no lingering index files or disk clutter.
+   - **Notebook Promotion Gate:** If and only if the user explicitly instructs LORA to save the session (*"Save this research to my AI Notebook"*), the in-memory chunks and embeddings are serialized to SQLite under `data/notebooks/<id>/` alongside structured metadata for permanent retention and cross-session follow-ups.
 8. **Conflicting sources:** a *contradiction detector* (NLI between evidence cards of different sources) surfaces disagreements: "Source A says X; Source B says Y" instead of silently picking.
 9. **Freshness:** each card stores source date; time-sensitive questions penalize old sources.
 
@@ -758,6 +773,8 @@ Judges are **different models/families from the Optimizer/Writer** wherever poss
 | A18 | **Quiet hours / privacy mode** | Mute mic, disable control tools by schedule or voice ("LORA, privacy mode") |
 | A19 | **Citation spot-check button** | Click a claim → see the exact supporting passage highlighted |
 | A20 | **Multilingual STT (optional)** | Whisper multilingual model; answers stay in user's language (later phase) |
+| A21 | **Prompt Optimizer & Privacy Scrubber Agent** | Model-specific meta-prompt injection + local Ollama deep refinement; deterministically redacts Windows local paths, OS usernames, RFC1918 IPs, and credentials/API tokens before typing into external AI web chats (§4.3.1) |
+| A22 | **Ephemeral Web-Browsing Embeddings (`SessionVectorIndex`)** | Visited websites and PDFs are embedded into an in-memory `faiss-cpu` index on the fly using `embeddinggemma-2` (CPU) for sub-5ms retrieval; automatically purged on session close with zero disk bloat unless promoted to a persistent notebook (§4.5) |
 
 ---
 
@@ -912,7 +929,7 @@ All inference local. Only search/API queries leave the machine (optionally route
 |-------|------|----------|
 | Main DB | **SQLite** (WAL) | sessions, tasks, plans, actions, audit log, notebooks, sources, documents, chunks, evidence cards, claims, verdicts, genomes, runs, scores |
 | Full-text | SQLite **FTS5** | chunk text |
-| Vectors | **faiss-cpu** (session-bound ephemeral index or persisted per notebook) + optional **sqlite-vec** | chunk embeddings generated by `embeddinggemma-2` |
+| Vectors | **faiss-cpu** (in-memory `SessionVectorIndex` for visited websites & PDFs, persisted per notebook on demand) + optional **sqlite-vec** | chunk embeddings generated on CPU by `embeddinggemma-2` |
 | HTTP cache | SQLite/disk | responses keyed by URL+ETag, TTL per source |
 | Prompt registry | JSON files + SQLite lineage | genomes (hash-addressed) |
 | Memory | Markdown files + index | curated preferences/facts |
@@ -1127,13 +1144,13 @@ safety:
 
 | Phase | Deliverable | Exit criteria |
 |-------|-------------|---------------|
-| **0 Foundations & Repo Setup** (≈3 d) | Repo, config, SQLite schema, Ollama client, structured-output harness, logging/audit | Round-trip typed LLM call with validation; CI green |
-| **1 Model Benchmarking, Spark Quantization & Laya Fine-Tuning** (≈1 wk) | (a) Verify Ollama models; quantize `SparkLLM/Spark-X2.5-4B` to `spark-x25-4b-q4` (Q4_K_M ~2.5 GB); cap writer `num_ctx` to 8192 (reader 32k). (b) Bench harness: test Spark (`spark25` parser, JSON schema, `think:false`, needle retrieval, tok/s, VRAM, load/swap latencies) vs `granite`, `ornith`, `gemma4`. (c) Build LORA decision dataset, fine-tune `laya-typed-decisions`, calibrate temperatures, held-out eval. (d) Download HHEM/MiniCheck/bge-reranker-base, export ONNX; benchmark `C:\Models\embeddinggemma-2` (740M) latency and RAM footprint on CPU via `sentence-transformers`; verify `faiss-cpu` in-process indexing. | Written role→model assignment backed by benchmark numbers; Spark quantized and verified on GPU; Laya intent accuracy ≥ 90% on held-out with calibrated confidence; model swap latencies measured; CPU embeddings and FAISS index throughput validated |
-| **2 Safety & Policy Core** (≈1 wk) *(before any control/browser tools)* | Policy engine, hard-deny first ordering, path/extension allowlists, origin enforcement, kill switch, audit logger, CI deterministic Red-Team suite | CI Red-Team suite passes with 0 forbidden actions |
-| **3 File & App Control** (≈1 wk) | Narrow tools (`open_app` allowlist, `open_url` web-app shortcuts & URL navigation, `open_path` allowed roots & safe extensions, `list_dir`, `read_file`, `search_files`, `focus_window`, `list_windows`); intent router, planner, controller | Voice/CLI: "open folder X and read README" and "open ChatGPT / Wikipedia on X" work reliably with strict extension & URL protocol blocking |
-| **4 Browser Driving & Search** (≈1.5 wk) | Playwright driver (dedicated profile with preserved session cookies), SearXNG setup, DOM locators/adapters, extraction, PDF pipeline, ask-other-AI tool, injection shield, URL egress allowlist | Fetch+extract+PDF tests pass; DOM typing adapters work on allowlisted sites; injection and egress defenses pass |
-| **5 Voice Pipeline** (≈1.5 wk) | Train `hey_lora.onnx` + `lora voice-enroll` CLI (`user_verifier.onnx` on 5–10 enrolled samples); Silero VAD; faster-whisper `distil-small.en` on CPU (INT8, `initial_prompt` technical vocabulary); verify `C:\Models` Qwen3-TTS weights (1.7B-CustomVoice + Tokenizer) running in separate GPU worker process; Piper CPU fallback; pause-and-listen / headset AEC; GPU time-multiplexing; push-to-talk hotkey; HUD stub | Wake → ack < 2.5 s; system activates only for enrolled owner voice (<0.5 false wakes/h, 0 imposter wakes in test); faster-whisper transcribes technical terms accurately without VRAM; Qwen3-TTS speaks verified text cleanly |
-| **6 Grounded Research Engine** (≈2 wk) | Ingest, chunking pipeline (adapted from AnythingLLM/Open Notebook), `embeddinggemma-2` CPU embeddings, `faiss-cpu` session-bound vector DB (ephemeral cleanup on session close or saved to notebook), rerank (`bge-reranker-base`, top 20–30 chunks), evidence cards, writer (`spark-x25-4b-q4`), depth modes, copy check, persistent notebooks | Answers with citations from fixtures; own-words paraphrase check passes; ephemeral session vector index cleanup verified |
+| **0 Foundations & Repo Setup** (≈3 d) ✅ | Repo, config, SQLite schema, Ollama client, structured-output harness, logging/audit | Round-trip typed LLM call with validation; CI green |
+| **1 Model Benchmarking, Spark Quantization & Laya Fine-Tuning** (≈1 wk) ✅ | (a) Verify Ollama models; quantize `SparkLLM/Spark-X2.5-4B` to `spark-x25-4b-q4` (Q4_K_M ~2.5 GB); cap writer `num_ctx` to 8192 (reader 32k). (b) Bench harness: test Spark (`spark25` parser, JSON schema, `think:false`, needle retrieval, tok/s, VRAM, load/swap latencies) vs `granite`, `ornith`, `gemma4`. (c) Build LORA decision dataset, fine-tune `laya-typed-decisions`, calibrate temperatures, held-out eval. (d) Download HHEM/MiniCheck/bge-reranker-base, export ONNX; benchmark `C:\Models\embeddinggemma-2` (740M) latency and RAM footprint on CPU via `sentence-transformers`; verify `faiss-cpu` in-process indexing. | Written role→model assignment backed by benchmark numbers; Spark quantized and verified on GPU; Laya intent accuracy ≥ 90% on held-out with calibrated confidence; model swap latencies measured; CPU embeddings and FAISS index throughput validated |
+| **2 Safety & Policy Core** (≈1 wk) ✅ *(before any control/browser tools)* | Policy engine, hard-deny first ordering, path/extension allowlists, origin enforcement, kill switch, audit logger, CI deterministic Red-Team suite | CI Red-Team suite passes with 0 forbidden actions |
+| **3 File & App Control** (≈1 wk) ✅ | Narrow tools (`open_app` allowlist, `open_url` web-app shortcuts & URL navigation, `open_path` allowed roots & safe extensions, `list_dir`, `read_file`, `search_files`, `focus_window`, `list_windows`); intent router, planner, controller | Voice/CLI: "open folder X and read README" and "open ChatGPT / Wikipedia on X" work reliably with strict extension & URL protocol blocking |
+| **4 Browser Driving, Search & External AI** (≈1.5 wk) ✅ | Playwright driver (dedicated profile with preserved session cookies), SearXNG setup, DOM locators/adapters (ChatGPT, Claude, **Google Gemini**, **Perplexity AI**), extraction, PDF pipeline, `ask_other_ai` tool with `PromptOptimizerAgent` (meta-prompt injection + local Ollama deep refinement) and `PrivacyScrubber` (regex path/IP/secret redaction), injection shield, URL egress allowlist | Fetch+extract+PDF tests pass; DOM typing adapters work on allowlisted sites; injection, egress, and privacy defenses pass; 100% tests green |
+| **5 Voice Pipeline** (≈1.5 wk) ✅ | Custom activation phrase **"Awaken LORA"** (with "Hey LORA" alias) via openWakeWord; `SpeakerVerifier` with 32-bin spectral FFT signatures and `user_verifier.json` enrollment CLI (`uv run python -m lora.voice.enroll`); Silero VAD state machine; `FasterWhisperTranscriber` on CPU (INT8, `compute_type="int8"`, 0 MB VRAM) with technical vocabulary biasing; `Qwen3TtsWorkerProcess` GPU worker loading `C:\Models\Qwen3-TTS-12Hz-1.7B-CustomVoice` and Tokenizer with sentence-level streaming; instant **barge-in audio playback cancellation**; global `PushToTalkListener` (`Ctrl+Alt+Space`); thread-safe `VoiceController` | Wake → ack < 2.5 s; system activates only for enrolled owner voice; faster-whisper transcribes technical terms accurately without VRAM (0 MB VRAM); Qwen3-TTS speaks verified text cleanly; barge-in cancellation halts playback immediately; 244/244 tests passing (81% coverage) |
+| **6 Grounded Research Engine & Ephemeral Web Embeddings** (≈2 wk) | Ingest, chunking pipeline (adapted from AnythingLLM/Open Notebook), `embeddinggemma-2` (740M) CPU embeddings, **Ephemeral Web-Browsing Embeddings & `SessionVectorIndex`** (in-memory `faiss-cpu` vector DB for visited websites and PDFs with sub-5ms retrieval and zero disk bloat on session teardown), SQLite notebook persistence on user demand (*"Save this research to my AI Notebook"*), rerank (`bge-reranker-base`, top 20–30 chunks), evidence cards, writer (`spark-x25-4b-q4`), depth modes, copy check | Answers with citations from fixtures; own-words paraphrase check passes; ephemeral session vector index cleanup verified with zero disk bloat; sub-5ms retrieval on visited pages |
 | **7 Verification Pipeline** (≈1.5 wk) | V1–V8 pipeline, claim decomposition, HHEM-2.1/MiniCheck CPU NLI, Granite verifier, cross-source corroboration, number check, repair loop, confidence labels, abstention | Truthfulness eval passes targets (per-claim $\ge 0.80$, gate $\ge 0.85$, benchmark $\ge 95\%$) |
 | **8 Gateway API & Mobile Web App** (≈1 wk) | (a) FastAPI Gateway with dual listeners (`127.0.0.1:8765` desktop & `192.168.50.10:8765` mobile). (b) Origin capability gating: mobile = `user_remote`, Tier 0 research only (no local files, no UI, client-side Web Speech TTS). (c) QR pairing for `LORA_MOBILE_TOKEN`, listener token isolation, auth rate limiting. (d) `docs/NETWORK_SETUP.md` (Topologies 0, A, B), `scripts/net_setup.ps1` (`-InterfaceAlias`, `SetThreadExecutionState`), `lora net-check` CLI with external probe. (e) Responsive Preact/TS web app + home-screen shortcut | `lora net-check` all PASS; mobile web app asks research question, streams verified response over LAN; Tier ≥ 1 tools and local files completely inaccessible from mobile |
 | **9 Supervisor & Round Table** (≈1 wk) | Supervisor checkpoints, round-table personas (Skeptic, Fact-checker, Editor [`granite4.2:8b`], Safety Officer), anomaly detection, deadlock-free gating | Catches seeded errors in eval set; hard-fail arbitration works |
@@ -1181,7 +1198,7 @@ These are gaps in the original brief. Each has a **default I will implement** un
 | 9 | Latency of multi-agent + verification on 6 GB GPU | Quick mode (no round table, light verify) vs Deep mode (full pipeline); user picks by voice (mobile capped to quick/standard) |
 | 10 | Which language/OS? | English, Windows 10/11 (assumed from this machine) |
 | 11 | Should LORA ever create files? | Only new files in `~/LORA/outputs/`, never overwrite |
-| 12 | Wake phrase & voice activation model ("At My Voice") | Finalized: "Hey LORA" via openWakeWord `hey_lora.onnx` + personalized `user_verifier.onnx` trained on 5–10 enrolled clips of your voice (`lora voice-enroll`); push-to-talk `Ctrl+Alt+Space` fallback (§4.1.1) |
+| 12 | Wake phrase & voice activation model ("At My Voice") | Finalized: **"Awaken LORA"** (with "Hey LORA" alias) via openWakeWord + personalized `user_verifier.json` spectral FFT signature calibration (`uv run python -m lora.voice.enroll`); push-to-talk `Ctrl+Alt+Space` fallback; barge-in interruption (§4.1.1) |
 | 13 | Sending emails/messages/purchases | Out of scope v1 (Tier 3) |
 | 14 | Browser profile & login persistence | Dedicated LORA Playwright profile (isolated from your personal browser, but preserves session cookies from manual logins across runs so repeated login is avoided; passwords are never saved or typed; §4.3.1) |
 | 15 | Laya zero-shot accuracy is low on custom decisions (official README: 0.362 → 0.766 after fine-tune) | Build a LORA decision dataset and fine-tune + calibrate in Phase 1; LLM tie-breaker below τ (§4.8.1) |
@@ -1199,7 +1216,7 @@ These are gaps in the original brief. Each has a **default I will implement** un
 | 27 | TTS voice selection default | Use preset "Vivian" on CustomVoice 1.7B in `C:\Models`; voice cloning deferred to later phase (§4.1.3) |
 | 28 | Chatbot automation ToS risk | Feature is opt-in per site, rate-limited to 1 req/5s, uses DOM locators, prefers free official APIs (§4.3.1) |
 | 29 | WSL2 host RAM exhaustion | Set `.wslconfig` with `memory=4GB` cap to prevent Docker SearXNG from starving Ollama & Qwen3-TTS (§2.3) |
-| 30 | Session-bound RAG & local embeddings model | Designated `C:\Models\embeddinggemma-2` (740M, 1.48 GB) on CPU via `sentence-transformers` + `faiss-cpu` in-process/ephemeral index; flushed on session close unless user explicitly saves to notebook (§4.5, §6) |
+| 30 | Session-bound RAG & local embeddings model | Designated `C:\Models\embeddinggemma-2` (740M, 1.48 GB) on CPU via `sentence-transformers` + `faiss-cpu` in-process `SessionVectorIndex`; dynamically embeds visited websites and downloaded PDFs on the fly for sub-5ms paragraph retrieval; strictly RAM-only with zero disk bloat, flushed on session close unless user explicitly saves to notebook (§4.5, §6) |
 | 31 | Architectural code reuse & attribution from open-source inspirations | Reference checkouts stored in `references/` (git-ignored); code patterns ported to typed async Python; attributions documented in `THIRD_PARTY_NOTICES.md` (§3.1, §8) |
 
 **Questions I'd like you to confirm (answer any or none; defaults apply):**
@@ -1239,10 +1256,10 @@ Retrieve once → baseline run 3 times (ε from variance, floor 0.02) score 0.68
 | # | Your requirement | Where in this plan | How it's used |
 |---|------------------|--------------------|---------------|
 | R1 | Agentic system controlled by STT and TTS | §4.1, §4.1.2, §3 (L1) | faster-whisper `distil-small.en` (CPU INT8) transcribes user queries; Qwen3-TTS / Piper synthesizes answers |
-| R2 | Activation key & Voice activation at my voice | §4.1.1 (openWakeWord "Hey LORA" + personalized `user_verifier.onnx`; hotkey `Ctrl+Alt+Space`) | Say "Hey LORA" (voice match triggers wake) or press `Ctrl+Alt+Space` |
+| R2 | Activation key & Voice activation at my voice | §4.1.1 (openWakeWord "Awaken LORA" + personalized `user_verifier.json` spectral calibration; hotkey `Ctrl+Alt+Space`) | Say "Awaken LORA" (voice match triggers wake) or press `Ctrl+Alt+Space` |
 | R3 | Open applications / folders | §4.2 `open_app` (allowlist), `open_path` (allowed roots & safe extensions) | "Open VS Code", "open my Downloads" |
 | R4 | Read contents of folders / files | §4.2 `list_dir`, `read_file`, `search_files`; §4.5 local-document notebooks | "What's in this folder?", "summarise this PDF" |
-| R5 | Type on search engines / browsers / other AI agents | §4.3, §4.3.1 `browser_type`, `web_search`, `ask_other_ai` via Playwright DOM adapters | "Search X on Google", "ask <AI site> Y" (reply treated as an unverified lead) |
+| R5 | Type on search engines / browsers / other AI agents | §4.3, §4.3.1 `browser_type`, `web_search`, `ask_other_ai` via Playwright DOM adapters (ChatGPT, Claude, Gemini, Perplexity) + `PromptOptimizerAgent` + `PrivacyScrubber` | "Search X on Google", "ask <AI site> Y" (reply treated as an unverified lead) |
 | R6 | Control of cursor and keyboard | §4.2 narrow tools in v1; OS-level keyboard/mouse injection and coordinate clicks deferred (§4.2.2) | Safe, predictable execution via structured API and DOM locators |
 | R7 | **No deleting**, not full OS control (local models are weaker) | §4.2.1 layered guarantee, backups (File History/VSS) as safety net; no delete tool exists and no known bypass; §5.1–5.2 tiers & policy engine | Enforced in code; untouchable by agents or the Outer Loop |
 | R8 | Multiple tools for browsing/research | §4.3 tool table, §4.4 connectors | Headless research + visible driving |
@@ -1256,7 +1273,7 @@ Retrieve once → baseline run 3 times (ε from variance, floor 0.02) score 0.68
 | R16 | Use existing Qwen-TTS models | §4.1 (Qwen3-TTS CustomVoice/Base/VoiceDesign), §2.1 cache status | Quality voice, time-multiplexed on GPU in dedicated worker |
 | R17 | Need STT and an activation model | §4.1 (faster-whisper + openWakeWord, with fallbacks) | CPU-only, keeps VRAM free |
 | R18 | Smaller models to be downloaded | §4.8.2 planned downloads + Phase 1 benchmark | Slot into tool-caller/embedding/reranker roles by data |
-| R19 | Extra features you'd add | §4.10 (A1–A20) | — |
+| R19 | Extra features you'd add | §4.10 (A1–A22) | — |
 | R20 | **Special feature:** Outer Loop with iterations, max limit, supervisor/round table pick best, prompt changes, rollback if worse, continue if better, stop at max, present best | §4.9 (genome split, algorithm, deadlock-free scoring, guardrails, modes, method details) | "Deep research with refinement on X" |
 | R21 | Inspirations' architectures used without naming them | §3.1 | Notebook, workspace RAG, permissioned loop, self-improving agent, control gateway, voice butler |
 | R22 | Plug holes with recommended defaults | §13 (31 holes) | Defaults apply unless you object |
@@ -1264,7 +1281,7 @@ Retrieve once → baseline run 3 times (ε from variance, floor 0.02) score 0.68
 | R24 | Isolated home-router network (`192.168.50.0/24`) | §4.12 | Dedicated subnet/AP, Topologies 0/A/B, static binding, `scripts/net_setup.ps1`, `lora net-check` CLI |
 | R25 | LORA Gateway API & Mobile Web App | §4.11, §3 (L1), §5.1, §5.4 | FastAPI + WebSocket `/v1`, mobile web app + shortcut, QR token auth, origin capability filtering |
 | R26 | Dedicated local model weights in `C:\Models` | §2.1, §4.1, §9 | Recognizes pre-downloaded Qwen3-TTS 1.7B-CustomVoice & Tokenizer in `C:\Models`, avoids redownload |
-| R27 | Local session RAG with embeddinggemma-2 (740M) & FAISS | §4.5, §6, §7 | Ingests PDFs into local `faiss-cpu` index using `C:\Models\embeddinggemma-2` on CPU; ephemeral cleanup on session close |
+| R27 | Local session RAG & Ephemeral Web Embeddings with embeddinggemma-2 (740M) & FAISS | §4.5, §6, §7 | Ingests visited websites & PDFs into in-memory `SessionVectorIndex` using `C:\Models\embeddinggemma-2` on CPU for sub-5ms retrieval; ephemeral cleanup on session close with zero disk bloat |
 | R28 | Open-source reference architecture & attribution (OpenNotebook, AnythingLLM, Hermes, OpenCode, OpenClaw) | §3.1, §8 | Architectural patterns ported to async Python; `references/` git-ignored; `THIRD_PARTY_NOTICES.md` attribution |
 
 ---
