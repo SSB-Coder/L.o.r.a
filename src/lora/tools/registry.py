@@ -173,14 +173,16 @@ class ToolRegistry:
         # 12. Ask Other AI
         self.register(
             name="ask_other_ai",
-            description="Ask an external AI chatbot (ChatGPT, Claude) a question via DOM automation.",
+            description="Ask an external AI chatbot (ChatGPT, Claude, Gemini, Perplexity) a question via DOM automation with prompt engineering.",
             tier=ActionRiskTier.TIER1,
             handler=self.ask_other_ai_tool.ask,
             parameters_schema={
                 "type": "object",
                 "properties": {
-                    "service": {"type": "string"},
+                    "service": {"type": "string", "enum": ["chatgpt", "claude", "gemini", "perplexity"]},
                     "prompt": {"type": "string"},
+                    "optimize_prompt": {"type": "boolean", "default": True},
+                    "style": {"type": "string", "default": "general"},
                 },
                 "required": ["service", "prompt"],
             },

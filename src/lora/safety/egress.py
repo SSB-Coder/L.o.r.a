@@ -61,9 +61,11 @@ class EgressFilter:
 
     DEFAULT_ALLOWED_TYPING_DOMAINS = [
         "google.com",
+        "gemini.google.com",
         "duckduckgo.com",
         "chatgpt.com",
         "claude.ai",
+        "perplexity.ai",
         "chat.deepseek.com",
         "wikipedia.org",
         "arxiv.org",

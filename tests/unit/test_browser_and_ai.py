@@ -178,3 +178,160 @@ async def test_ask_other_ai_typing_execution():
         assert "superposition" in res["response"]
         assert res["reliability_tier"] == "T4"
         assert res["is_untrusted_lead"] is True
+        assert res["optimized"] is True
+        assert "Markdown headings" in res["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_ask_other_ai_gemini_and_perplexity():
+    tool = AskOtherAiTool()
+
+    mock_page = AsyncMock()
+    mock_context = AsyncMock()
+    mock_context.new_page.return_value = mock_page
+
+    # Test Gemini
+    with patch.object(tool.driver, "_ensure_context", return_value=mock_context), \
+         patch.object(tool.adapters["gemini"], "submit_prompt", return_value="Gemini response on neural nets."):
+        res_gemini = await tool.ask(
+            service="gemini",
+            prompt="Explain neural networks",
+            provenance=DataProvenance.USER,
+        )
+        assert res_gemini["status"] == "success"
+        assert res_gemini["service"] == "gemini"
+        assert "neural nets" in res_gemini["response"]
+        assert "gemini.google.com" in res_gemini["url"]
+
+    # Test Perplexity
+    with patch.object(tool.driver, "_ensure_context", return_value=mock_context), \
+         patch.object(tool.adapters["perplexity"], "submit_prompt", return_value="Perplexity response with sources."):
+        res_perp = await tool.ask(
+            service="perplexity",
+            prompt="Latest research in LLM reasoning",
+            provenance=DataProvenance.USER,
+        )
+        assert res_perp["status"] == "success"
+        assert res_perp["service"] == "perplexity"
+        assert "with sources" in res_perp["response"]
+        assert "perplexity.ai" in res_perp["url"]
+
+
+@pytest.mark.asyncio
+async def test_ask_other_ai_privacy_scrubbing_integration():
+    tool = AskOtherAiTool()
+
+    mock_page = AsyncMock()
+    mock_context = AsyncMock()
+    mock_context.new_page.return_value = mock_page
+
+    captured_prompt = {}
+
+    async def mock_submit(page, prompt, timeout_seconds=30.0):
+        captured_prompt["sent"] = prompt
+        return "Simulated response"
+
+    with patch.object(tool.driver, "_ensure_context", return_value=mock_context), \
+         patch.object(tool.adapters["claude"], "submit_prompt", side_effect=mock_submit):
+        res = await tool.ask(
+            service="claude",
+            prompt="Debug code in C:\\Users\\shash\\Projects\\app.py using key sk-1234567890abcdef12345678",
+            provenance=DataProvenance.USER,
+        )
+        assert res["status"] == "success"
+        assert res["redacted_count"] >= 2
+        # Verify the actual prompt sent to Claude had local paths and keys scrubbed
+        sent = captured_prompt["sent"]
+        assert "C:\\Users\\shash\\Projects\\app.py" not in sent
+        assert "sk-1234567890abcdef12345678" not in sent
+        assert "[LOCAL_PATH]" in sent
+        assert "[SECRET_KEY]" in sent
+
+
+def test_adapters_attributes_and_selectors():
+    from lora.tools.browser.adapters.gemini import GeminiAdapter
+    from lora.tools.browser.adapters.perplexity import PerplexityAdapter
+
+    gemini = GeminiAdapter()
+    assert gemini.name == "gemini"
+    assert "gemini.google.com" in gemini.url
+    assert len(gemini.INPUT_SELECTORS) > 0
+    assert len(gemini.RESPONSE_SELECTORS) > 0
+
+    perp = PerplexityAdapter()
+    assert perp.name == "perplexity"
+    assert "perplexity.ai" in perp.url
+    assert len(perp.INPUT_SELECTORS) > 0
+    assert len(perp.RESPONSE_SELECTORS) > 0
+
+
+class MockPageLocator:
+    def __init__(self, count: int = 1, is_enabled: bool = True, text: str = "This is a stabilized model answer for testing."):
+        self._count = count
+        self._enabled = is_enabled
+        self._text = text
+        self.first = self
+
+    async def count(self) -> int:
+        return self._count
+
+    async def is_enabled(self) -> bool:
+        return self._enabled
+
+    async def click(self) -> None:
+        pass
+
+    async def fill(self, text: str) -> None:
+        pass
+
+    async def press(self, key: str) -> None:
+        pass
+
+    def nth(self, idx: int) -> "MockPageLocator":
+        return self
+
+    async def inner_text(self) -> str:
+        return self._text
+
+
+class MockDomPage:
+    def __init__(self, has_input: bool = True, text: str = "This is a stabilized model answer for testing."):
+        self.has_input = has_input
+        self.text = text
+
+    def locator(self, selector: str) -> MockPageLocator:
+        if not self.has_input:
+            return MockPageLocator(count=0)
+        return MockPageLocator(count=1, is_enabled=True, text=self.text)
+
+
+@pytest.mark.asyncio
+async def test_adapters_submit_prompt_mocked():
+    from lora.tools.browser.adapters.chatgpt import ChatGPTAdapter
+    from lora.tools.browser.adapters.claude import ClaudeAdapter
+    from lora.tools.browser.adapters.gemini import GeminiAdapter
+    from lora.tools.browser.adapters.perplexity import PerplexityAdapter
+
+    page = MockDomPage(has_input=True, text="This is a stabilized model answer for testing.")
+
+    for adapter_cls in [ChatGPTAdapter, ClaudeAdapter, GeminiAdapter, PerplexityAdapter]:
+        adapter = adapter_cls()
+        res = await adapter.submit_prompt(page, prompt="Test prompt", timeout_seconds=3.0)
+        assert "stabilized model answer" in res
+
+
+@pytest.mark.asyncio
+async def test_adapters_no_input_raises_error():
+    from lora.tools.browser.adapters.chatgpt import ChatGPTAdapter
+    from lora.tools.browser.adapters.claude import ClaudeAdapter
+    from lora.tools.browser.adapters.gemini import GeminiAdapter
+    from lora.tools.browser.adapters.perplexity import PerplexityAdapter
+
+    bad_page = MockDomPage(has_input=False)
+
+    for adapter_cls in [ChatGPTAdapter, ClaudeAdapter, GeminiAdapter, PerplexityAdapter]:
+        adapter = adapter_cls()
+        with pytest.raises(RuntimeError):
+            await adapter.submit_prompt(bad_page, prompt="Test", timeout_seconds=1.0)
+
+

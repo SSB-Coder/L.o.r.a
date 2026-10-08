@@ -14,11 +14,23 @@ def planner():
 
 
 def test_fast_path_ask_ai(planner: ControlPlanner):
-    plan = planner.plan("ask claude what is quantum entanglement")
-    assert len(plan) == 1
-    assert plan[0].tool == "ask_other_ai"
-    assert plan[0].params["service"] == "claude"
-    assert "quantum entanglement" in plan[0].params["prompt"]
+    plan_claude = planner.plan("ask claude what is quantum entanglement")
+    assert len(plan_claude) == 1
+    assert plan_claude[0].tool == "ask_other_ai"
+    assert plan_claude[0].params["service"] == "claude"
+    assert "quantum entanglement" in plan_claude[0].params["prompt"]
+
+    plan_gemini = planner.plan("ask gemini to summarize general relativity")
+    assert len(plan_gemini) == 1
+    assert plan_gemini[0].tool == "ask_other_ai"
+    assert plan_gemini[0].params["service"] == "gemini"
+    assert "summarize general relativity" in plan_gemini[0].params["prompt"]
+
+    plan_perp = planner.plan("ask perplexity for latest quantum benchmarks")
+    assert len(plan_perp) == 1
+    assert plan_perp[0].tool == "ask_other_ai"
+    assert plan_perp[0].params["service"] == "perplexity"
+    assert "latest quantum benchmarks" in plan_perp[0].params["prompt"]
 
 
 def test_fast_path_search_specific_source(planner: ControlPlanner):

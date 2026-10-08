@@ -45,8 +45,8 @@ class ControlPlanner:
                 reasoning=f"User requested switching to window '{target}'",
             )]
 
-        # 3. Ask External AI (ChatGPT, Claude)
-        ask_ai_match = re.search(r"^ask\s+(claude|chatgpt|deepseek)\s+(?:to\s+)?(.+)", text.strip(), re.IGNORECASE)
+        # 3. Ask External AI (ChatGPT, Claude, Gemini, Perplexity)
+        ask_ai_match = re.search(r"^ask\s+(claude|chatgpt|gemini|perplexity)\s+(?:to\s+)?(.+)", text.strip(), re.IGNORECASE)
         if ask_ai_match:
             svc = ask_ai_match.group(1).strip().lower()
             prompt = ask_ai_match.group(2).strip()

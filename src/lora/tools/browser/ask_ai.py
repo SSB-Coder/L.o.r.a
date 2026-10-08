@@ -8,11 +8,14 @@ from lora.safety.egress import EgressFilter
 from lora.safety.gate import DataProvenance
 from lora.tools.browser.adapters.chatgpt import ChatGPTAdapter
 from lora.tools.browser.adapters.claude import ClaudeAdapter
+from lora.tools.browser.adapters.gemini import GeminiAdapter
+from lora.tools.browser.adapters.perplexity import PerplexityAdapter
 from lora.tools.browser.driver import PlaywrightBrowserDriver
+from lora.tools.browser.prompt_agent import PromptOptimizerAgent
 
 
 class AskOtherAiTool:
-    """Safely automates external AI chatbot interfaces under strict typing and provenance controls."""
+    """Safely automates external AI chatbot interfaces under strict typing, provenance, and prompt optimization controls."""
 
     MIN_ACTION_INTERVAL_SECONDS = 5.0  # ToS politeness rate-limiting
 
@@ -20,12 +23,16 @@ class AskOtherAiTool:
         self,
         driver: PlaywrightBrowserDriver | None = None,
         egress_filter: EgressFilter | None = None,
+        prompt_optimizer: PromptOptimizerAgent | None = None,
     ) -> None:
         self.driver = driver or PlaywrightBrowserDriver()
         self.egress_filter = egress_filter or EgressFilter()
+        self.prompt_optimizer = prompt_optimizer or PromptOptimizerAgent()
         self.adapters = {
             "chatgpt": ChatGPTAdapter(),
             "claude": ClaudeAdapter(),
+            "gemini": GeminiAdapter(),
+            "perplexity": PerplexityAdapter(),
         }
         self._last_call_time = 0.0
         self._lock = asyncio.Lock()
@@ -35,14 +42,18 @@ class AskOtherAiTool:
         service: str,
         prompt: str,
         provenance: DataProvenance = DataProvenance.USER,
+        optimize_prompt: bool = True,
+        style: str = "general",
+        deep_optimize: bool = False,
     ) -> dict[str, Any]:
         """Ask question to third-party AI chatbot via browser DOM automation.
 
         Enforces:
         1. Provenance: Web text (UNTRUSTED) can NEVER be dispatched or typed into external AI.
-        2. Egress: Destination domain must be on typing allowlist.
-        3. Rate limit: Minimum 5-second interval between actions.
-        4. Classification: Response is classified as Tier 4 untrusted lead.
+        2. Prompt Engineering & Privacy: Scrubs local paths/tokens and refines the prompt.
+        3. Egress: Destination domain must be on typing allowlist.
+        4. Rate limit: Minimum 5-second interval between actions.
+        5. Classification: Response is classified as Tier 4 untrusted lead.
         """
         # 1. Provenance Guard
         if provenance == DataProvenance.UNTRUSTED:
@@ -72,7 +83,25 @@ class AskOtherAiTool:
                 "message": f"External AI domain typing blocked by policy: {egress_res.reason}",
             }
 
-        # 4. Politeness rate limiting & Playwright automation (serialized with lock)
+        # 4. Prompt Optimization and Privacy Scrubbing
+        effective_prompt = prompt.strip()
+        redactions_count = 0
+        redactions: list[str] = []
+        applied_style = style
+
+        if optimize_prompt:
+            opt_res = await self.prompt_optimizer.optimize(
+                prompt=prompt,
+                target_ai=svc_key,
+                style=style,
+                deep=deep_optimize,
+            )
+            effective_prompt = opt_res.optimized_prompt
+            redactions_count = opt_res.redacted_count
+            redactions = opt_res.redactions
+            applied_style = opt_res.style.value
+
+        # 5. Politeness rate limiting & Playwright automation (serialized with lock)
         async with self._lock:
             now = time.monotonic()
             elapsed = now - self._last_call_time
@@ -86,7 +115,7 @@ class AskOtherAiTool:
                 try:
                     await page.goto(adapter.url, wait_until="domcontentloaded", timeout=20000)
                     await asyncio.sleep(1.0)
-                    reply = await adapter.submit_prompt(page, prompt=prompt.strip(), timeout_seconds=30.0)
+                    reply = await adapter.submit_prompt(page, prompt=effective_prompt, timeout_seconds=30.0)
                 finally:
                     await page.close()
 
@@ -94,7 +123,12 @@ class AskOtherAiTool:
                     "status": "success",
                     "service": adapter.name,
                     "url": adapter.url,
-                    "prompt": prompt,
+                    "original_prompt": prompt,
+                    "prompt": effective_prompt,
+                    "optimized": optimize_prompt,
+                    "style": applied_style,
+                    "redacted_count": redactions_count,
+                    "redactions": redactions,
                     "response": reply,
                     "reliability_tier": "T4",
                     "is_untrusted_lead": True,
