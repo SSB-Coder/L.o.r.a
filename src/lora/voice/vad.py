@@ -1,0 +1,110 @@
+"""Voice Activity Detection (VAD) and endpointing for L.O.R.A Voice Pipeline."""
+
+from enum import StrEnum
+from typing import Any
+
+import numpy as np
+
+
+class SpeechState(StrEnum):
+    """Current state of voice activity."""
+
+    SILENCE = "silence"
+    SPEAKING = "speaking"
+    ENDED = "ended"
+
+
+class VoiceActivityDetector:
+    """Detects speech boundaries and pauses to segment user voice commands cleanly."""
+
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        threshold: float = 0.5,
+        silence_duration_seconds: float = 0.6,
+        min_speech_duration_seconds: float = 0.25,
+        onnx_model_path: str | None = None,
+    ) -> None:
+        self.sample_rate = sample_rate
+        self.threshold = threshold
+        self.silence_duration_seconds = silence_duration_seconds
+        self.min_speech_duration_seconds = min_speech_duration_seconds
+        self.state = SpeechState.SILENCE
+
+        self._session: Any = None
+        if onnx_model_path:
+            try:
+                import onnxruntime as ort
+                self._session = ort.InferenceSession(onnx_model_path)
+            except Exception:
+                self._session = None
+
+        self._consecutive_speech_frames = 0
+        self._consecutive_silence_frames = 0
+        self._total_speech_samples = 0
+        self._recorded_utterance_chunks: list[np.ndarray] = []
+
+    def compute_energy_prob(self, chunk: np.ndarray) -> float:
+        """Heuristic fallback RMS energy-based voice activity score (0.0 to 1.0)."""
+        if len(chunk) == 0:
+            return 0.0
+        rms = float(np.sqrt(np.mean(chunk**2)))
+        # RMS of quiet room is ~0.005 - 0.01; speech is ~0.03 - 0.2
+        scaled = (rms - 0.015) / 0.05
+        return float(np.clip(scaled, 0.0, 1.0))
+
+    def evaluate_chunk(self, chunk: np.ndarray) -> float:
+        """Calculate speech probability for a single audio frame (typically 512 samples / 32ms)."""
+        if self._session is not None:
+            try:
+                # Prepare tensor for Silero VAD ONNX: shape (1, len(chunk))
+                inp = chunk.astype(np.float32).reshape(1, -1)
+                sr_tensor = np.array([self.sample_rate], dtype=np.int64)
+                outputs = self._session.run(None, {"input": inp, "sr": sr_tensor})
+                return float(outputs[0][0][0])
+            except Exception:
+                pass
+        return self.compute_energy_prob(chunk)
+
+    def process_chunk(self, chunk: np.ndarray) -> tuple[SpeechState, float]:
+        """Process incoming audio chunk, track speech lifecycle, and return (state, speech_prob)."""
+        prob = self.evaluate_chunk(chunk)
+        chunk_duration = len(chunk) / self.sample_rate
+
+        if prob >= self.threshold:
+            self._consecutive_speech_frames += 1
+            self._consecutive_silence_frames = 0
+            self._total_speech_samples += len(chunk)
+            self._recorded_utterance_chunks.append(chunk)
+
+            # Check if speech just started
+            if self.state == SpeechState.SILENCE:
+                if (self._consecutive_speech_frames * chunk_duration) >= self.min_speech_duration_seconds:
+                    self.state = SpeechState.SPEAKING
+        else:
+            self._consecutive_silence_frames += 1
+            if self.state == SpeechState.SPEAKING:
+                self._recorded_utterance_chunks.append(chunk)
+                silence_elapsed = self._consecutive_silence_frames * chunk_duration
+                if silence_elapsed >= self.silence_duration_seconds:
+                    self.state = SpeechState.ENDED
+
+        return self.state, prob
+
+    def get_and_reset_utterance(self) -> np.ndarray:
+        """Retrieve the recorded utterance audio and reset the detector to SILENCE."""
+        if self._recorded_utterance_chunks:
+            audio = np.concatenate(self._recorded_utterance_chunks)
+        else:
+            audio = np.zeros(0, dtype=np.float32)
+
+        self.reset()
+        return audio
+
+    def reset(self) -> None:
+        """Reset state tracking back to SILENCE."""
+        self.state = SpeechState.SILENCE
+        self._consecutive_speech_frames = 0
+        self._consecutive_silence_frames = 0
+        self._total_speech_samples = 0
+        self._recorded_utterance_chunks.clear()
