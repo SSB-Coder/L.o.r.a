@@ -1,6 +1,9 @@
+import os
 from pathlib import Path
 
 import pytest
+
+os.environ.setdefault("LORA_VERIFY_OFFLINE", "1")
 
 
 @pytest.fixture
