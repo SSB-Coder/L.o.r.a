@@ -6,6 +6,7 @@
 ---
 
 ### Changelog (v1.4)
+- **Ambient Corner Droplet Widget & Turn-Off Lifecycle**: Added specifications for background presence awareness and complete power management. A minimalist, always-on-top, borderless floating screen-corner widget (the "Ambient Droplet") provides an unmistakable, unobtrusive indicator of whether LORA is active/listening (breathing cyan droplet), thinking (swirling vortex), speaking (cymatic ripple), or sleeping (dormant slate droplet). Features a dual-tier power lifecycle: (1) 1-click low-power Sleep/Standby (immediately closes audio streams, pauses VAD, and consumes 0% CPU; wakes via click, hotkey `Ctrl+Alt+Space`, or wake phrase), and (2) Complete Turn-Off / Shutdown (terminates all background processes, workers, and gateway cleanly via voice "LORA, turn off", right-click menu, tray, or CLI `lora stop`).
 - **Aqueous Hydro-Orb Visual Resonator (Water-Sphere Animation)**: Added architectural design and physics specifications for a procedural, non-anthropomorphic visual presence for L.O.R.A. A 3D translucent liquid sphere with surface tension, refraction, and caustic reflections that dynamically ripples, swirls, and breathes in real-time. Modulates across agent states: ambient 0.2 Hz breathing when idle, concentric capillary ripples on user speech, internal convective vortex currents during Laya/search/NLI thinking, real-time cymatic acoustic standing waves driven by TTS audio frequency spectra, chromatic azure/amber shifts during Phase 7 verification gates, and cavitation splash on barge-in interruptions. Implemented via procedural GLSL raymarching (0 MB VRAM) for the Phase 8 mobile client and desktop HUD.
 - **Phase 7 Verification Pipeline & Truthfulness Engine Complete**: Implemented full end-to-end V1–V8 verification stack: `CitationExistenceChecker` (V1 tag existence and exact quote authentication), `ClaimDecomposer` (V2 bracket-safe atomic claim extraction with compound clause splitting), `NliGroundednessChecker` (V3 zero-VRAM CPU NLI with semantic entailment scoring and negation-contradiction guard), `LlmFactChecker` (V4 cross-family supervisor `granite4.2:8b` auditing writer output with structured JSON citations), `CorroborationChecker` (V5 multi-source domain independence tracking and single-source flagging), `NumberEntityChecker` (V6 numerical, date, and percentage discrepancy auditor), `CopyChecker` (V7 n-gram plagiarism auditor), and `VerificationPipeline` (V8 composite faithfulness scoring with $\ge 0.85$ acceptance gate, High/Medium/Low confidence badges, abstention triggers, and automated hallucination repair loops). Added truthfulness benchmark suite across answerable, unanswerable, false-premise, and conflicting sources. 283/283 project tests passing (83% coverage).
 - **Phase 4 External AI Upgrades & Privacy Scrubber**: Implemented `PromptOptimizerAgent` (two-tier prompt generation with deterministic fast tier + optional deep Ollama model refinement) and `PrivacyScrubber` (deterministic regex redaction of local paths, OS usernames, RFC1918 IPs, and credentials/API keys). Expanded browser DOM adapters to include **Google Gemini** (`gemini.google.com`) and **Perplexity AI** (`perplexity.ai`) alongside ChatGPT and Claude, with full provenance tagging (`DataProvenance`) and typing domain egress allowlists.
@@ -757,7 +758,7 @@ Judges are **different models/families from the Optimizer/Writer** wherever poss
 |---|---------|-----------|
 | A1 | **Push-to-talk hotkey + text box** | Wake words fail in noise; also vital for testing |
 | A2 | **Barge-in & spoken status** | Natural interaction; interrupt long answers |
-| A3 | **Always-visible HUD/tray** (state, current action, kill button, last sources) | Trust + safety; user sees what the agent is doing |
+| A3 | **Always-visible HUD/tray & Ambient Corner Droplet Widget** | Unobtrusive, floating screen-corner water-droplet micro-widget showing live engine state (awake/listening/thinking/speaking/sleep), single-click sleep toggle, double-click HUD expansion, and right-click power off (§4.10.2) |
 | A4 | **Kill-switch + dry-run + confirmation tiers** | Core safety (see §5) |
 | A5 | **Research Notebooks (persistent workspaces)** | Follow-ups, "add this PDF", resume tomorrow |
 | A6 | **Skills folder (voice-triggered routines)** | "LORA, morning setup" → opens your allowlisted apps/folders; skills are human-readable files, editable |
@@ -778,6 +779,7 @@ Judges are **different models/families from the Optimizer/Writer** wherever poss
 | A21 | **Prompt Optimizer & Privacy Scrubber Agent** | Model-specific meta-prompt injection + local Ollama deep refinement; deterministically redacts Windows local paths, OS usernames, RFC1918 IPs, and credentials/API tokens before typing into external AI web chats (§4.3.1) |
 | A22 | **Ephemeral Web-Browsing Embeddings (`SessionVectorIndex`)** | Visited websites and PDFs are embedded into an in-memory `faiss-cpu` index on the fly using `embeddinggemma-2` (CPU) for sub-5ms retrieval; automatically purged on session close with zero disk bloat unless promoted to a persistent notebook (§4.5) |
 | A23 | **Aqueous Hydro-Orb Visual Resonator (Water-Sphere Animation)** | Procedural 3D translucent liquid sphere with surface tension caustics, wave propagation, internal vorticity, and audio-reactive cymatic ripples for mobile web client and desktop HUD (§4.10.1) |
+| A24 | **Complete Sleep/Standby & Turn-Off Lifecycle** | Dual-tier shutdown: instant low-power Sleep/Mute (0% CPU, audio closed, wake via hotkey/click/phrase) and Complete Turn-Off (terminates all background processes, workers, and gateway cleanly via voice, UI, or CLI) (§4.10.2) |
 
 #### 4.10.1 The Aqueous Hydro-Orb Visual Resonator ("L.O.R.A Water Sphere")
 
@@ -806,6 +808,72 @@ To provide a living, non-anthropomorphic visual presence for L.O.R.A without unc
    - Consumes **0 MB VRAM** and $<1\text{–}2\%$ GPU compute, ensuring zero contention with local Ollama models (`granite4.2:8b`, `Spark-X2.5-4B`) or Qwen3-TTS.
    - **Mobile Client (`/app`)**: WebGL Canvas powered by Web Audio API `AnalyserNode` during TTS speech playback and WebSocket state messages (`/v1/events`).
    - **Desktop HUD (Phase 11)**: Hardware-accelerated `QOpenGLWidget` in a transparent, borderless PySide6 window overlay.
+
+#### 4.10.2 The Ambient Corner Micro-Widget & Power Control Lifecycle
+
+**Motivation:**
+L.O.R.A operates as an ambient background assistant and research engine. Users require two daily guarantees:
+1. **Unmistakable State Awareness**: Always knowing at a glance whether L.O.R.A is active, listening, thinking, or asleep without needing a bulky window open.
+2. **Effortless Turn-Off & Sleep**: Instant, foolproof controls to mute/sleep L.O.R.A during private conversations or completely turn it off when done for the day.
+
+##### 1. The Screen-Corner Micro-Widget ("The Ambient Droplet")
+- **Form Factor & Placement**: A minimalist, borderless, semi-translucent floating widget (default 36×36 px, scalable to 48×48 px) docked in the bottom-right corner (above the Windows notification area) or top-right. Draggable, snappable to screen edges, and remembers its pinned coordinates across restarts.
+- **Micro Hydro-Orb State Indicator**:
+  | Engine State | Visual Behavior in Corner Droplet | System Action |
+  |--------------|-----------------------------------|---------------|
+  | **Active / Listening** | Gently breathing translucent cyan droplet (`#00e5ff`) with subtle caustic glow | Microphones active, VAD evaluating audio for "Awaken LORA" or hotkey `Ctrl+Alt+Space` |
+  | **User Speaking** | Concentric surface ripples actively radiating across droplet | Receiving audio input, computing VAD speech frames |
+  | **Thinking / Routing** | Miniature swirling fluid vortex with rotating luminescent speckles | Laya routing, web searching, or NLI verification in progress |
+  | **Speaking (TTS)** | Harmonic acoustic wave ripples across droplet surface | Audio playback streaming through Qwen3-TTS / sound device |
+  | **Sleep / Standby (Muted)** | Dimmed slate-grey droplet (`#607d8b`) with an amber standby pin (`#ffb300`) | Audio streams completely stopped (0% CPU, 0 MB buffer). Wakes via 1-click or hotkey |
+  | **Off / Shutdown** | Droplet smoothly evaporates/fades out | All processes, workers, and servers terminated |
+
+- **Corner Widget Interactions**:
+  - **Hover**: Minimal glass tooltip displaying live engine status ("L.O.R.A: Active & Listening", CPU/VRAM usage, last query).
+  - **Single Click**: Instant **Mute/Sleep Toggle** (toggles between Active and Standby/Sleep in $<10$ ms).
+  - **Double Click**: Smoothly expands the droplet into the full Desktop HUD panel (chat feed, research notebook, citations, search box).
+  - **Right Click**: Quick-action context menu:
+    - *Sleep / Standby (Mute)*
+    - *Awaken (Active)*
+    - *Open Full HUD*
+    - *Copy Last Research Answer*
+    - *Settings / Audio Devices*
+    - **"Turn Off L.O.R.A"** (clean full process shutdown).
+
+##### 2. The Power Control Lifecycle (Sleep vs Complete Turn-Off)
+Users have two distinct tiers of stopping L.O.R.A:
+
+1. **Tier 1: Sleep / Standby Mode (Temporary Pause & Mute)**
+   - **When to use**: Private phone calls, meetings, gaming, or when you don't want L.O.R.A listening in the background.
+   - **How to trigger**:
+     - *Voice*: "LORA, sleep" / "LORA, go to sleep" / "LORA, standby" / "LORA, mute".
+     - *1-Click*: Single-click the screen-corner droplet widget.
+     - *Hotkey*: Global toggle hotkey `Ctrl+Alt+S`.
+     - *Mobile*: Tap the "Sleep" switch in the mobile web app header.
+   - **System Behavior**:
+     - Immediately calls `pyaudio.Stream.stop_stream()` or closes audio capture handles.
+     - Pauses Silero VAD evaluation loops.
+     - Drops CPU utilization to **0.0%**. No audio is captured, processed, or buffered.
+     - Keeps gateway and model servers warm in RAM/VRAM for zero-latency instant wake.
+   - **How to wake up**:
+     - Single-click the dimmed corner droplet widget.
+     - Press push-to-talk hotkey `Ctrl+Alt+Space` or `Ctrl+Alt+S`.
+     - Tap "Wake" on the mobile web app.
+
+2. **Tier 2: Complete Shutdown / Turn-Off (Exit Process)**
+   - **When to use**: End of the day, shutting down the computer, or freeing all system resources.
+   - **How to trigger**:
+     - *Voice*: "LORA, turn off" / "LORA, shut down" / "LORA, exit".
+     - *Widget*: Right-click the corner droplet $\rightarrow$ click **"Turn Off L.O.R.A"**.
+     - *System Tray*: Right-click LORA tray icon $\rightarrow$ click **"Exit L.O.R.A"**.
+     - *Terminal / CLI*: Run `lora stop` or `lora kill`.
+     - *Emergency Abort*: Global emergency killswitch `Ctrl+Alt+Shift+Esc`.
+   - **System Behavior**:
+     - Cleanly flushes pending SQLite audit logs and notebook entries.
+     - Closes all active WebSocket connections and shuts down FastAPI gateway servers.
+     - Sends `SIGTERM` / termination event to the isolated `Qwen3TtsWorkerProcess` GPU subprocess, releasing all VRAM.
+     - Terminates audio capture threads and keyboard listeners.
+     - Closes the corner widget and exits the host Python process cleanly with exit code 0.
 
 ### 4.11 Gateway API & Mobile Web App
 
@@ -1185,7 +1253,7 @@ safety:
 | **8 Gateway API & Mobile Web App** (≈1 wk) | (a) FastAPI Gateway with dual listeners (`127.0.0.1:8765` desktop & `192.168.50.10:8765` mobile). (b) Origin capability gating: mobile = `user_remote`, Tier 0 research only (no local files, no UI, client-side Web Speech TTS). (c) QR pairing for `LORA_MOBILE_TOKEN`, listener token isolation, auth rate limiting. (d) `docs/NETWORK_SETUP.md` (Topologies 0, A, B), `scripts/net_setup.ps1` (`-InterfaceAlias`, `SetThreadExecutionState`), `lora net-check` CLI with external probe. (e) Responsive Preact/TS web app with integrated Aqueous Hydro-Orb WebGL visualizer (rippling water sphere reacting to state and voice) + home-screen shortcut | `lora net-check` all PASS; mobile web app asks research question, streams verified response over LAN; Hydro-Orb WebGL visualizer renders smoothly with zero VRAM impact; Tier ≥ 1 tools and local files completely inaccessible from mobile |
 | **9 Supervisor & Round Table** (≈1 wk) | Supervisor checkpoints, round-table personas (Skeptic, Fact-checker, Editor [`granite4.2:8b`], Safety Officer), anomaly detection, deadlock-free gating | Catches seeded errors in eval set; hard-fail arbitration works |
 | **10 ★ Outer Loop / Recursive Self-Improvement** (≈1.5 wk) | Post-retrieval genome registry, prompt optimizer, scorer, loop with rollback/stop rules, per-query mode, leaderboard UI; offline tuning mode with empirical check on held-out tasks | Demonstrated net improvement on eval tasks with correct rollback behavior; zero regressions on safety suite |
-| **11 Polish, Extra Features & Hardening** (≈1.5 wk) | Skills folder, curated long-term memory, PySide6 desktop HUD with hardware-accelerated Aqueous Hydro-Orb visualizer (`QOpenGLWidget`), report export, compare mode, privacy mode, installer, performance profiling, final security review | Daily-driver usable; desktop HUD displays liquid orb ripples during speech; all documentation and runbooks finalized |
+| **11 Polish, Extra Features & Hardening** (≈1.5 wk) | Skills folder, curated long-term memory, **Ambient Corner Droplet Widget (`src/lora/ui/widget.py`)** with live engine state & 1-click sleep toggle, **dual-tier shutdown lifecycle** (Sleep vs Turn-Off), PySide6 desktop HUD with hardware-accelerated Aqueous Hydro-Orb visualizer (`QOpenGLWidget`), report export, compare mode, privacy mode, installer, performance profiling, final security review | Daily-driver usable; corner droplet gives instant state awareness and 1-click sleep; desktop HUD displays liquid orb ripples during speech; all documentation and runbooks finalized |
 
 *Order rationale:* **safety before control**, **grounding before supervision**, **gateway & mobile right after core research** (so research can be used comfortably on mobile while supervisor and outer loop are tuned), **verification before the Outer Loop** (the loop needs a trustworthy score).
 
@@ -1314,6 +1382,7 @@ Retrieve once → baseline run 3 times (ε from variance, floor 0.02) score 0.68
 | R27 | Local session RAG & Ephemeral Web Embeddings with embeddinggemma-2 (740M) & FAISS | §4.5, §6, §7 | Ingests visited websites & PDFs into in-memory `SessionVectorIndex` using `C:\Models\embeddinggemma-2` on CPU for sub-5ms retrieval; ephemeral cleanup on session close with zero disk bloat |
 | R28 | Open-source reference architecture & attribution (OpenNotebook, AnythingLLM, Hermes, OpenCode, OpenClaw) | §3.1, §8 | Architectural patterns ported to async Python; `references/` git-ignored; `THIRD_PARTY_NOTICES.md` attribution |
 | R29 | Aqueous Hydro-Orb Visual Resonator (coolness factor: rippling water sphere when thinking/speaking) | §4.10.1, §4.11.3 | Procedural 3D fluid sphere with surface ripples, cymatic voice resonance, and internal vortex currents for mobile web app and desktop HUD (0 MB VRAM) |
+| R30 | Ambient Corner Droplet Widget & Background Turn-Off Controls | §4.10.2 | Always-on-top screen-corner micro-droplet indicating live state, 1-click sleep/mute (0% CPU), and complete graceful shutdown via voice, UI, or CLI |
 
 ---
 
