@@ -11,6 +11,7 @@ from lora.grounding.cards import EvidenceCard, EvidenceCardExtractor
 from lora.grounding.chunk import DocumentChunk, DocumentChunker
 from lora.grounding.embed import EmbeddingEngine
 from lora.grounding.modes import DepthMode
+from lora.grounding.rerank import CrossEncoderReranker
 from lora.grounding.session_index import SessionVectorIndex
 from lora.grounding.writer import CitationItem, GroundedAnswer, ResearchWriter
 from lora.storage.notebook import DEFAULT_NOTEBOOK_DB, NotebookStore
@@ -40,6 +41,7 @@ class ResearchPipeline:
     def __init__(
         self,
         embedding_engine: EmbeddingEngine | None = None,
+        reranker: CrossEncoderReranker | None = None,
         ollama_client: Any = None,
         session_id: str | None = None,
         notebook_db_path: Path = DEFAULT_NOTEBOOK_DB,
@@ -51,6 +53,7 @@ class ResearchPipeline:
             embedding_engine=self.embedding_engine,
         )
         self.chunker = DocumentChunker()
+        self.reranker = reranker or CrossEncoderReranker()
         self.extractor = EvidenceCardExtractor()
         self.writer = ResearchWriter(ollama_client=ollama_client)
         self.notebook_store = NotebookStore(db_path=notebook_db_path)
@@ -121,10 +124,12 @@ class ResearchPipeline:
         top_k: int = 8,
     ) -> ResearchResponse:
         """Perform semantic retrieval over visited web pages and synthesize grounded answer."""
-        search_hits = self.session_index.search(query=query, top_k=top_k)
+        candidate_k = max(top_k * 2, 16)
+        search_hits = self.session_index.search(query=query, top_k=candidate_k)
         retrieved_chunks = [hit[0] for hit in search_hits]
+        reranked_chunks = self.reranker.rerank(query=query, chunks=retrieved_chunks, top_k=top_k)
 
-        cards = self.extractor.extract_cards(chunks=retrieved_chunks, max_cards=top_k)
+        cards = self.extractor.extract_cards(chunks=reranked_chunks, max_cards=top_k)
         self._last_cards = cards
 
         answer = await self.writer.synthesize(query=query, cards=cards, depth=depth)
