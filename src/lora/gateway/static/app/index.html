@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#0a0e17">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="mobile-web-app-capable" content="yes">
+  <title>L.O.R.A Mobile</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app-container">
+    <!-- Header with Aqueous Hydro-Orb Visualizer -->
+    <header id="header">
+      <div id="orb-container">
+        <canvas id="hydro-orb-canvas" width="220" height="220"></canvas>
+      </div>
+      <div id="status-bar">
+        <div id="status-indicator">
+          <span class="status-dot"></span>
+          <span id="status-text">Connecting...</span>
+        </div>
+        <div id="queue-banner" class="hidden">
+          Queue position: <span id="queue-pos">1</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Controls Bar: Depth Selector & Notebooks -->
+    <div id="controls-bar">
+      <div class="depth-selector" role="radiogroup" aria-label="Research Depth">
+        <button class="depth-chip" data-depth="eli5">ELI5</button>
+        <button class="depth-chip" data-depth="simple">Simple</button>
+        <button class="depth-chip active" data-depth="standard">Standard</button>
+        <button class="depth-chip" data-depth="detailed">Detailed</button>
+        <button class="depth-chip" data-depth="expert">Expert</button>
+      </div>
+      <div class="audio-toggle-container">
+        <button id="tts-toggle" class="icon-btn active" title="Toggle Voice Readout" aria-label="Voice Readout">
+          <svg class="icon" viewBox="0 0 24 24" width="20" height="20">
+            <path fill="currentColor" d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Main Chat & Research Feed -->
+    <main id="chat-feed" role="log" aria-live="polite">
+      <div class="message system-message">
+        <div class="msg-bubble">
+          <strong>L.O.R.A Mobile Gateway</strong><br>
+          Connected to isolated LAN research environment. Ask any question to trigger verified research.
+        </div>
+      </div>
+    </main>
+
+    <!-- Floating Stop Button -->
+    <div id="floating-stop-container" class="hidden">
+      <button id="floating-stop-btn" class="stop-btn" aria-label="Stop ongoing research">
+        <span class="stop-icon">■</span> Cancel Research
+      </button>
+    </div>
+
+    <!-- Citation Modal Sheet -->
+    <div id="citation-sheet" class="modal-sheet hidden">
+      <div class="sheet-scrim" id="sheet-scrim"></div>
+      <div class="sheet-content">
+        <div class="sheet-header">
+          <span id="citation-badge-label" class="badge">S1</span>
+          <h3 id="citation-title">Source Citation</h3>
+          <button id="close-sheet-btn" class="close-btn">&times;</button>
+        </div>
+        <div class="sheet-body">
+          <div class="citation-meta">
+            <span id="citation-tier" class="tier-pill">Tier 1</span>
+            <span id="citation-url" class="url-text"></span>
+          </div>
+          <div class="citation-quote-box">
+            <em>Exact Supporting Passage:</em>
+            <blockquote id="citation-quote"></blockquote>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Input Footer -->
+    <footer id="input-footer">
+      <form id="ask-form">
+        <input 
+          type="text" 
+          id="query-input" 
+          placeholder="Ask L.O.R.A or dictate..." 
+          autocomplete="off" 
+          required 
+        />
+        <button type="submit" id="submit-btn" aria-label="Send">
+          <svg viewBox="0 0 24 24" width="20" height="20">
+            <path fill="currentColor" d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+          </svg>
+        </button>
+      </form>
+    </footer>
+  </div>
+
+  <script src="orb.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

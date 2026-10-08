@@ -236,7 +236,7 @@ class PolicyEngine:
             )
 
         # 1.4 Mobile origin restrictions
-        if origin_lower == "mobile":
+        if origin_lower in ("mobile", "user_remote"):
             # Mobile is strictly restricted to Tier 0 research
             if tier_int > ActionRiskTier.TIER0:
                 return PolicyResult(
@@ -275,7 +275,7 @@ class PolicyEngine:
         # -------------------------------------------------------------
 
         # Mobile allowed research tools
-        if origin_lower == "mobile" and tier_int == ActionRiskTier.TIER0:
+        if origin_lower in ("mobile", "user_remote") and tier_int == ActionRiskTier.TIER0:
             allowed_mobile_tools = [
                 "web_search",
                 "fetch_page",

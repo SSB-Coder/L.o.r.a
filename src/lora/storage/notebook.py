@@ -26,6 +26,8 @@ class SavedNotebook(BaseModel):
     title: str
     answer: str
     created_at: float
+    visibility: str = "public"
+    depth_mode: str = "standard"
     chunks: list[DocumentChunk] = Field(default_factory=list)
     cards: list[EvidenceCard] = Field(default_factory=list)
 
@@ -36,6 +38,10 @@ class NotebookStore:
     def __init__(self, db_path: Path = DEFAULT_NOTEBOOK_DB) -> None:
         self.db_path = Path(db_path)
         self._initialized = False
+
+    async def initialize(self) -> None:
+        """Alias for init_db."""
+        await self.init_db()
 
     async def init_db(self) -> None:
         """Create notebook tables if they do not exist."""
@@ -49,7 +55,9 @@ class NotebookStore:
                     id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
                     answer TEXT NOT NULL,
-                    created_at REAL NOT NULL
+                    created_at REAL NOT NULL,
+                    visibility TEXT DEFAULT 'public',
+                    depth_mode TEXT DEFAULT 'standard'
                 )
                 """
             )
@@ -91,23 +99,46 @@ class NotebookStore:
 
     async def save_notebook(
         self,
-        title: str,
-        chunks: list[DocumentChunk],
-        cards: list[EvidenceCard],
-        answer: str,
+        title: str | SavedNotebook,
+        chunks: list[DocumentChunk] | None = None,
+        cards: list[EvidenceCard] | None = None,
+        answer: str | None = None,
         notebook_id: str | None = None,
+        visibility: str = "public",
+        depth_mode: str = "standard",
     ) -> str:
         """Persist a research session to SQLite."""
         await self.init_db()
-        nb_id = notebook_id or f"nb-{uuid.uuid4().hex[:8]}"
-        now = time.time()
+
+        if isinstance(title, SavedNotebook):
+            nb = title
+            nb_id = nb.id
+            nb_title = nb.title
+            ans = nb.answer
+            nb_chunks = nb.chunks
+            nb_cards = nb.cards
+            vis = getattr(nb, "visibility", "public")
+            depth = getattr(nb, "depth_mode", "standard")
+            now = nb.created_at or time.time()
+        else:
+            nb_id = notebook_id or f"nb-{uuid.uuid4().hex[:8]}"
+            nb_title = title
+            ans = answer or ""
+            nb_chunks = chunks or []
+            nb_cards = cards or []
+            vis = visibility
+            depth = depth_mode
+            now = time.time()
 
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "INSERT OR REPLACE INTO notebooks (id, title, answer, created_at) VALUES (?, ?, ?, ?)",
-                (nb_id, title, answer, now),
+                """
+                INSERT OR REPLACE INTO notebooks (id, title, answer, created_at, visibility, depth_mode)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (nb_id, nb_title, ans, now, vis, depth),
             )
-            for c in chunks:
+            for c in nb_chunks:
                 await db.execute(
                     """
                     INSERT OR REPLACE INTO notebook_chunks
@@ -127,7 +158,7 @@ class NotebookStore:
                         c.content_hash,
                     ),
                 )
-            for card in cards:
+            for card in nb_cards:
                 await db.execute(
                     """
                     INSERT OR REPLACE INTO notebook_cards
@@ -148,7 +179,7 @@ class NotebookStore:
                 )
             await db.commit()
 
-        logger.info("Saved notebook %s ('%s') with %d chunks and %d cards", nb_id, title, len(chunks), len(cards))
+        logger.info("Saved notebook %s ('%s') with %d chunks and %d cards", nb_id, title, len(nb_chunks), len(nb_cards))
         return nb_id
 
     async def get_notebook(self, notebook_id: str) -> SavedNotebook | None:
@@ -156,13 +187,13 @@ class NotebookStore:
         await self.init_db()
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
-                "SELECT id, title, answer, created_at FROM notebooks WHERE id = ?",
+                "SELECT id, title, answer, created_at, visibility, depth_mode FROM notebooks WHERE id = ?",
                 (notebook_id,),
             ) as cursor:
                 row = await cursor.fetchone()
                 if not row:
                     return None
-                nb_id, title, answer, created_at = row
+                nb_id, title, answer, created_at, visibility, depth_mode = row
 
             chunks: list[DocumentChunk] = []
             async with db.execute(
@@ -214,6 +245,8 @@ class NotebookStore:
                 title=title,
                 answer=answer,
                 created_at=created_at,
+                visibility=visibility or "public",
+                depth_mode=depth_mode or "standard",
                 chunks=chunks,
                 cards=cards,
             )
@@ -223,7 +256,16 @@ class NotebookStore:
         await self.init_db()
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
-                "SELECT id, title, created_at FROM notebooks ORDER BY created_at DESC"
+                "SELECT id, title, created_at, visibility, depth_mode FROM notebooks ORDER BY created_at DESC"
             ) as cursor:
                 rows = await cursor.fetchall()
-                return [{"id": r[0], "title": r[1], "created_at": r[2]} for r in rows]
+                return [
+                    {
+                        "id": r[0],
+                        "title": r[1],
+                        "created_at": r[2],
+                        "visibility": r[3] or "public",
+                        "depth_mode": r[4] or "standard",
+                    }
+                    for r in rows
+                ]
