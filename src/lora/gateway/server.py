@@ -59,4 +59,10 @@ def create_gateway_app(
     if static_path.exists():
         app.mount("/app", StaticFiles(directory=str(static_path), html=True), name="app")
 
+        from fastapi.responses import RedirectResponse
+
+        @app.get("/", include_in_schema=False)
+        def redirect_to_app():
+            return RedirectResponse(url="/app")
+
     return app

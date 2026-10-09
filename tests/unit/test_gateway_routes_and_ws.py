@@ -73,6 +73,20 @@ def test_healthz_unauthenticated(test_setup):
     assert "uptime" not in res.json()
 
 
+def test_root_redirects_to_app(test_setup):
+    app = create_gateway_app(
+        origin="desktop",
+        queue=test_setup["queue"],
+        token_validator=test_setup["validator"],
+        ip_limiter=test_setup["limiter"],
+        notebook_store=test_setup["notebook_store"],
+    )
+    client = TestClient(app)
+    res = client.get("/", follow_redirects=False)
+    assert res.status_code in (302, 307)
+    assert res.headers["location"] == "/app"
+
+
 def test_desktop_auth_enforcement(test_setup):
     app = create_gateway_app(
         origin="desktop",
