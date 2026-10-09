@@ -98,3 +98,58 @@ def test_system_tray_creation(qapp):
     assert "Sleeping" in tray.toolTip()
     tray.update_state(WidgetState.IDLE)
     assert "Active" in tray.toolTip()
+
+
+def test_droplet_3d_widget_states(qapp):
+    from lora.ui.droplet_3d import Droplet3DWidget
+
+    droplet = Droplet3DWidget(size=200)
+    assert droplet.width() == 200
+    assert droplet.height() == 200
+
+    # Test state changes
+    droplet.set_state("listening")
+    assert droplet.is_active is True
+
+    droplet.set_state("idle")
+    assert droplet.is_active is False
+
+    # Test audio level and truthfulness
+    droplet.set_audio_level(0.75)
+    assert droplet._audio_level == pytest.approx(0.75, abs=0.01)
+
+    droplet.set_truthfulness(0.95)
+    assert droplet._truthfulness == pytest.approx(0.95, abs=0.01)
+
+
+def test_hud_evidence_cards_and_voice_states(qapp):
+    hud = LoraDesktopHUD()
+
+    # Test voice state changes
+    hud.set_voice_state("listening")
+    assert "LISTENING" in hud.voice_state_badge.text()
+
+    hud.set_voice_state("speaking")
+    assert "SPEAKING" in hud.voice_state_badge.text()
+
+    # Test audio level update
+    hud.set_audio_level(0.8)
+    assert hud.mic_vu_bar.value() == 80
+
+    # Test truthfulness score
+    hud.set_truthfulness_score(0.96, verified=8, total=8)
+    assert hud.grounding_bar.value() == 96
+    assert "96%" in hud.grounding_lbl.text()
+
+    # Test evidence cards
+    hud.add_evidence_card(
+        title="Attention Is All You Need",
+        source="arxiv",
+        snippet="We propose the Transformer model based on self-attention...",
+        confidence=0.98,
+        url="https://arxiv.org/abs/1706.03762",
+    )
+    assert hud.evidence_cards_layout.count() >= 2  # Card + stretch
+    hud.clear_evidence_cards()
+    assert hud.evidence_cards_layout.count() == 1  # Only stretch remaining
+

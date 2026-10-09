@@ -39,6 +39,7 @@ class AmbientDropletWidget(QWidget):
         super().__init__(parent)
         self._idle_opacity = idle_opacity
         self._state = WidgetState.IDLE
+        self._audio_level = 0.0
         self._drag_pos = QPoint()
         self._is_dragging = False
 
@@ -72,6 +73,13 @@ class AmbientDropletWidget(QWidget):
 
         self.update()
         self.state_changed.emit(self._state.value)
+
+    def set_audio_level(self, level: float) -> None:
+        """Sets mic audio level to trigger liquid ripples."""
+        self._audio_level = max(0.0, min(1.0, level))
+        if self._audio_level > 0.05 and self._state != WidgetState.SLEEPING:
+            self.setWindowOpacity(0.95)
+        self.update()
 
     def toggle_sleep(self) -> None:
         """Toggles between SLEEPING and IDLE state."""
@@ -161,6 +169,13 @@ class AmbientDropletWidget(QWidget):
         highlight_path.addEllipse(int(center_x - radius * 0.5), int(center_y - radius * 0.7), int(radius * 1.0), int(radius * 0.5))
         painter.setBrush(QColor(255, 255, 255, 70))
         painter.drawPath(highlight_path)
+
+        # Concentric liquid ripples when audio is active
+        if self._audio_level > 0.05:
+            rip_rad = radius * (0.5 + 0.5 * self._audio_level)
+            painter.setPen(QColor(56, 189, 248, int(180 * self._audio_level)))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(int(center_x - rip_rad), int(center_y - rip_rad), int(rip_rad * 2), int(rip_rad * 2))
 
     @override
     def mousePressEvent(self, event: QMouseEvent) -> None:
