@@ -145,6 +145,84 @@ def run_desktop_app(
 
     tray.exit_requested.connect(on_exit)
 
+    def on_query_submitted(query: str, depth: str) -> None:
+        if droplet.state == WidgetState.SLEEPING:
+            droplet.toggle_sleep()
+
+        droplet.set_state(WidgetState.THINKING)
+        hud.status_label.setText("<span style='color:#38bdf8;'>● Researching & Grounding...</span>")
+        hud.orb.set_active(True)
+
+        def _worker() -> None:
+            try:
+                import asyncio
+
+                from lora.models.ollama_client import OllamaClient
+                from lora.storage.memory import MemoryStore
+
+                ollama = OllamaClient(base_url=user_cfg.models.ollama_url)
+                is_online = asyncio.run(ollama.is_online())
+                if is_online:
+                    models_list = asyncio.run(ollama.list_models())
+                    available_tags = [m.get("name", "") for m in models_list]
+                    model_to_use = user_cfg.models.default_model
+                    if model_to_use not in available_tags:
+                        for candidate in (
+                            "spark-x25-4b-8k:latest",
+                            "spark-x25-4b-32k:latest",
+                            "granite4.2:8b",
+                            "gemma4:e4b",
+                            "ornith-1.5:9b",
+                        ):
+                            if candidate in available_tags:
+                                model_to_use = candidate
+                                break
+                        else:
+                            if available_tags:
+                                model_to_use = available_tags[0]
+
+                    memory_store = MemoryStore(profile_path=cfg_mgr.paths.user_profile_file)
+                    profile_ctx = memory_store.get_profile_markdown()
+
+                    sys_prompt = (
+                        "You are L.O.R.A (Layer Oriented Research Assistant), a sovereign, "
+                        "grounded local AI peer running entirely on the user's laptop. "
+                        "Provide concise, precise, evidence-based answers."
+                    )
+                    if profile_ctx:
+                        sys_prompt += f"\nUser Context & Preferences:\n{profile_ctx[:600]}"
+
+                    messages = [
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": query},
+                    ]
+                    response_text = asyncio.run(
+                        ollama.generate_chat(model=model_to_use, messages=messages)
+                    )
+                else:
+                    response_text = (
+                        f"⚠️ Local Ollama service is offline at {user_cfg.models.ollama_url}. "
+                        "Please make sure Ollama is running (`ollama serve`) to enable local model generation."
+                    )
+            except Exception as e:
+                response_text = f"Error processing query: {e}"
+
+            from PySide6.QtCore import QTimer
+
+            def _post() -> None:
+                hud.append_message("L.O.R.A", response_text)
+                hud.orb.set_active(False)
+                droplet.set_state(WidgetState.IDLE)
+                hud.status_label.setText("<span style='color:#10b981;'>● Active & Grounded</span>")
+                audio.play_cue(SoundCue.COMPLETE)
+
+            QTimer.singleShot(0, _post)
+
+        worker_thread = threading.Thread(target=_worker, daemon=True)
+        worker_thread.start()
+
+    hud.query_submitted.connect(on_query_submitted)
+
     # Start Gateway background server
     gateway_server = start_gateway_thread(host=args.host, port=args.port)
 

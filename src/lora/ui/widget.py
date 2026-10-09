@@ -2,7 +2,7 @@ import logging
 from enum import StrEnum
 from typing import override
 
-from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtCore import QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QContextMenuEvent,
@@ -41,6 +41,10 @@ class AmbientDropletWidget(QWidget):
         self._state = WidgetState.IDLE
         self._drag_pos = QPoint()
         self._is_dragging = False
+
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.timeout.connect(self._on_single_click_timeout)
 
         # Configure frameless ambient floating window
         self.setWindowFlags(
@@ -171,12 +175,15 @@ class AmbientDropletWidget(QWidget):
             new_pos = event.globalPosition().toPoint() - self._drag_pos
             self.move(new_pos)
 
+    def _on_single_click_timeout(self) -> None:
+        self.toggle_sleep()
+
     @override
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             if not self._is_dragging:
-                # Single-click toggles sleep mode
-                self.toggle_sleep()
+                # Delay single click to avoid triggering on double click
+                self._click_timer.start(250)
             else:
                 # Snap to edge on release
                 screen = self.screen().geometry()
@@ -195,6 +202,8 @@ class AmbientDropletWidget(QWidget):
     @override
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
+            # Cancel single-click timer so sleep is not toggled
+            self._click_timer.stop()
             # Double-click opens full HUD
             self.hud_requested.emit()
 
