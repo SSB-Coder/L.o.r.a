@@ -1,11 +1,26 @@
 """Qwen3-TTS Worker Process and Audio Synthesis Backend."""
 
+import logging
 import multiprocessing as mp
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+SUPPORTED_VOICES = [
+    "vivian",
+    "serena",
+    "aiden",
+    "dylan",
+    "eric",
+    "ono_anna",
+    "ryan",
+    "sohee",
+    "uncle_fu",
+]
 
 
 @dataclass(frozen=True)
@@ -14,7 +29,7 @@ class TtsJob:
 
     job_id: str
     text: str
-    voice: str = "default"
+    voice: str = "vivian"
 
 
 @dataclass(frozen=True)
@@ -39,6 +54,29 @@ def _fallback_synth(text: str, sample_rate: int = 24000) -> np.ndarray:
     return samples
 
 
+_CACHED_QWEN_MODEL: Any = None
+
+
+def get_qwen_model(models_dir: str = r"C:\Models\Qwen3-TTS-12Hz-1.7B-CustomVoice") -> Any:
+    """Lazy loads and caches the local Qwen3TTSModel."""
+    global _CACHED_QWEN_MODEL
+    if _CACHED_QWEN_MODEL is not None:
+        return _CACHED_QWEN_MODEL
+
+    try:
+        p = Path(models_dir)
+        if p.exists() and (p / "model.safetensors").exists():
+            from qwen_tts import Qwen3TTSModel
+
+            logger.info("Loading Qwen3-TTS model from %s on CPU...", models_dir)
+            _CACHED_QWEN_MODEL = Qwen3TTSModel.from_pretrained(str(p), device_map="cpu")
+            logger.info("Qwen3-TTS model successfully loaded.")
+            return _CACHED_QWEN_MODEL
+    except Exception as e:
+        logger.warning("Could not load Qwen3-TTS model: %s", e)
+    return None
+
+
 def _run_tts_worker_loop(
     input_queue: mp.Queue,
     output_queue: mp.Queue,
@@ -46,15 +84,7 @@ def _run_tts_worker_loop(
     tokenizer_dir: str,
 ) -> None:
     """Main execution loop for isolated TTS worker process."""
-    qwen_model: Any = None
-    try:
-        # Check if local model directory exists
-        if Path(models_dir).exists() and Path(tokenizer_dir).exists():
-            # If Qwen TTS library is installed, instantiate
-            # Note: falls back gracefully if custom library is not in path
-            pass
-    except Exception:
-        qwen_model = None
+    qwen_model = get_qwen_model(models_dir)
 
     while True:
         job = input_queue.get()
@@ -62,10 +92,20 @@ def _run_tts_worker_loop(
             break
 
         try:
-            # Generate audio
+            sample_rate = 24000
             if qwen_model is not None:
-                # Direct model inference would happen here
-                samples = _fallback_synth(job.text)
+                try:
+                    speaker = job.voice if job.voice in SUPPORTED_VOICES else "vivian"
+                    wavs, sr = qwen_model.generate_custom_voice(
+                        text=job.text,
+                        speaker=speaker,
+                        language="English",
+                    )
+                    samples = wavs[0].astype(np.float32)
+                    sample_rate = sr
+                except Exception as ex:
+                    logger.warning("Qwen3 synthesis error in loop, using fallback: %s", ex)
+                    samples = _fallback_synth(job.text)
             else:
                 samples = _fallback_synth(job.text)
 
@@ -73,8 +113,8 @@ def _run_tts_worker_loop(
                 job_id=job.job_id,
                 text=job.text,
                 samples=samples,
-                sample_rate=24000,
-                duration=len(samples) / 24000,
+                sample_rate=sample_rate,
+                duration=len(samples) / sample_rate,
                 is_last=True,
             )
             output_queue.put(chunk)
@@ -90,16 +130,18 @@ def _run_tts_worker_loop(
 
 
 class Qwen3TtsWorkerProcess:
-    """Manages the lifecycle and IPC with the isolated Qwen3-TTS worker process."""
+    """Manages the lifecycle and IPC with Qwen3-TTS model."""
 
     def __init__(
         self,
         models_dir: str = r"C:\Models\Qwen3-TTS-12Hz-1.7B-CustomVoice",
         tokenizer_dir: str = r"C:\Models\Qwen3-TTS-Tokenizer-12Hz",
+        default_voice: str = "vivian",
         spawn_process: bool = False,
     ) -> None:
         self.models_dir = models_dir
         self.tokenizer_dir = tokenizer_dir
+        self.default_voice = default_voice
         self.spawn_process = spawn_process
 
         self._in_queue: mp.Queue | None = None
@@ -108,6 +150,9 @@ class Qwen3TtsWorkerProcess:
 
         if self.spawn_process:
             self.start()
+
+    def get_supported_voices(self) -> list[str]:
+        return list(SUPPORTED_VOICES)
 
     def start(self) -> None:
         """Start the worker subprocess."""
@@ -122,8 +167,8 @@ class Qwen3TtsWorkerProcess:
         )
         self._process.start()
 
-    def synthesize(self, text: str, job_id: str = "1", voice: str = "default") -> TtsAudioChunk:
-        """Synthesize text into speech audio."""
+    def synthesize(self, text: str, job_id: str = "1", voice: str = "vivian") -> TtsAudioChunk:
+        """Synthesize text into speech audio using Qwen3-TTS."""
         if not text.strip():
             return TtsAudioChunk(
                 job_id=job_id,
@@ -132,8 +177,31 @@ class Qwen3TtsWorkerProcess:
                 is_last=True,
             )
 
-        # In-process direct fallback path for low latency and unit tests
+        target_voice = voice if voice in SUPPORTED_VOICES else self.default_voice
+
+        # 1. Direct in-process execution if not running separate subprocess
         if not self.spawn_process or self._process is None or not self._process.is_alive():
+            model = get_qwen_model(self.models_dir)
+            if model is not None:
+                try:
+                    wavs, sr = model.generate_custom_voice(
+                        text=text,
+                        speaker=target_voice,
+                        language="English",
+                    )
+                    samples = wavs[0].astype(np.float32)
+                    return TtsAudioChunk(
+                        job_id=job_id,
+                        text=text,
+                        samples=samples,
+                        sample_rate=sr,
+                        duration=len(samples) / sr,
+                        is_last=True,
+                    )
+                except Exception as e:
+                    logger.warning("In-process Qwen3 generation failed: %s", e)
+
+            # Fallback for tests or missing model
             samples = _fallback_synth(text)
             return TtsAudioChunk(
                 job_id=job_id,
@@ -144,11 +212,12 @@ class Qwen3TtsWorkerProcess:
                 is_last=True,
             )
 
-        job = TtsJob(job_id=job_id, text=text, voice=voice)
+        # 2. Subprocess execution
+        job = TtsJob(job_id=job_id, text=text, voice=target_voice)
         assert self._in_queue is not None
         assert self._out_queue is not None
         self._in_queue.put(job)
-        return self._out_queue.get(timeout=10.0)
+        return self._out_queue.get(timeout=25.0)
 
     def stop(self) -> None:
         """Terminate the worker subprocess."""

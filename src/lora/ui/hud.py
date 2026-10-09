@@ -1,7 +1,11 @@
 import html
+import json
 import logging
+import urllib.parse
+from pathlib import Path
+from typing import Any
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QKeySequence,
     QShortcut,
@@ -21,9 +25,43 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+try:
+    from PySide6.QtWebEngineCore import QWebEnginePage
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+
+    WEB_ENGINE_AVAILABLE = True
+except Exception:
+    WEB_ENGINE_AVAILABLE = False
+
 from lora.ui.droplet_3d import Droplet3DWidget
 
 logger = logging.getLogger(__name__)
+
+
+class LoraWebEnginePage(QWebEnginePage if WEB_ENGINE_AVAILABLE else object):  # type: ignore
+    """Custom WebEnginePage intercepting lora:// navigation actions from droplet.html."""
+
+    def __init__(self, hud: "LoraDesktopHUD", parent: QWidget | None = None) -> None:
+        if WEB_ENGINE_AVAILABLE:
+            super().__init__(parent)
+        self.hud = hud
+
+    def acceptNavigationRequest(self, url: QUrl, nav_type: Any, is_main_frame: bool) -> bool:  # noqa: N802
+        if url.scheme() == "lora":
+            action = url.host()
+            query_str = url.query()
+            payload: dict[str, Any] = {}
+            if query_str.startswith("payload="):
+                try:
+                    raw = urllib.parse.unquote(query_str[8:])
+                    payload = json.loads(raw)
+                except Exception as e:
+                    logger.warning("Error parsing lora url payload: %s", e)
+            self.hud._handle_web_action(action, payload)
+            return False
+        if WEB_ENGINE_AVAILABLE:
+            return super().acceptNavigationRequest(url, nav_type, is_main_frame)
+        return True
 
 
 class HydroOrbWidget(Droplet3DWidget):
@@ -101,7 +139,8 @@ class LoraDesktopHUD(QMainWindow):
     - Clipboard Quick-Inspect (Ctrl+Alt+Q)
     """
 
-    query_submitted = Signal(str, str)  # query, depth
+    query_submitted = Signal(str, str)  # query, depth or voice
+    voice_changed = Signal(str)  # new voice name
     ptt_pressed = Signal()
     ptt_released = Signal()
     stop_audio_requested = Signal()
@@ -109,16 +148,35 @@ class LoraDesktopHUD(QMainWindow):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("L.O.R.A - Desktop HUD")
-        self.resize(1020, 720)
-        self.setMinimumSize(880, 620)
+        self.resize(1120, 720)
+        self.setMinimumSize(920, 620)
 
         self._depth_mode = "deep"
+        self.web_view: Any = None
         self._init_ui()
         self._init_shortcuts()
 
     def _init_ui(self) -> None:
-        central = QWidget(self)
-        self.setCentralWidget(central)
+        self._fallback_container = QWidget(self)
+        self._setup_fallback_ui(self._fallback_container)
+
+        self.web_view = None
+        html_path = Path(__file__).parent / "droplet.html"
+        if WEB_ENGINE_AVAILABLE and html_path.exists():
+            try:
+                self.web_view = QWebEngineView(self)
+                self.web_page = LoraWebEnginePage(self, self.web_view)
+                self.web_view.setPage(self.web_page)
+                self.web_view.load(QUrl.fromLocalFile(str(html_path.resolve())))
+                self.setCentralWidget(self.web_view)
+                self._fallback_container.hide()
+            except Exception as e:
+                logger.warning("Could not initialize QWebEngineView: %s", e)
+                self.setCentralWidget(self._fallback_container)
+        else:
+            self.setCentralWidget(self._fallback_container)
+
+    def _setup_fallback_ui(self, central: QWidget) -> None:
         central.setStyleSheet("""
             QWidget {
                 background-color: #080c14;
@@ -400,6 +458,31 @@ class LoraDesktopHUD(QMainWindow):
         self._depth_mode = depth
         logger.info("HUD research depth set to: %s", depth)
 
+    def _handle_web_action(self, action: str, payload: dict[str, Any]) -> None:
+        """Handles actions dispatched from the WebGL droplet.html interface."""
+        if action == "on_user_submit":
+            text = payload.get("text", "").strip()
+            voice = payload.get("voice", "vivian")
+            if text:
+                self.append_message("You", text)
+                self.set_voice_state("thinking")
+                self.query_submitted.emit(text, voice)
+        elif action == "on_ptt_down":
+            self._on_ptt_pressed()
+        elif action == "on_ptt_up":
+            self._on_ptt_released()
+        elif action == "on_voice_changed":
+            voice = payload.get("voice", "vivian")
+            self.voice_changed.emit(voice)
+
+    def _run_js(self, script: str) -> None:
+        """Executes JavaScript safely in the WebEngine page if present."""
+        if self.web_view is not None:
+            try:
+                self.web_view.page().runJavaScript(script)
+            except Exception:
+                pass
+
     def _on_ptt_pressed(self) -> None:
         self.ptt_btn.setText("🔴 Listening...")
         self.set_voice_state("listening")
@@ -410,32 +493,46 @@ class LoraDesktopHUD(QMainWindow):
         self.ptt_released.emit()
 
     def set_voice_state(self, state: str) -> None:
-        """Updates the 3D Droplet, badge, and HUD controls."""
+        """Updates the 3D Droplet, badge, and HUD controls across both engines."""
         st = state.lower()
         self.orb.set_state(st)
-        if st == "listening":
+        web_mode = "idle"
+        if st in ("listening", "listen"):
             self.voice_state_badge.setText("<b style='color:#00f0ff; font-size:13px;'>[ 🎤 LISTENING... ]</b>")
             self.status_label.setText("<span style='color:#00f0ff; font-size:12px;'>● LISTENING (VAD ACTIVE)</span>")
-        elif st in ("thinking", "acting"):
+            web_mode = "listen"
+        elif st in ("thinking", "think", "acting", "act"):
             self.voice_state_badge.setText("<b style='color:#818cf8; font-size:13px;'>[ ⚙️ ANALYZING EVIDENCE ]</b>")
             self.status_label.setText("<span style='color:#818cf8; font-size:12px;'>● RETRIEVING & GROUNDING</span>")
-        elif st == "speaking":
+            web_mode = "think"
+        elif st in ("speaking", "speak"):
             self.voice_state_badge.setText("<b style='color:#38bdf8; font-size:13px;'>[ 🗣️ SPEAKING BRIEF ]</b>")
             self.status_label.setText("<span style='color:#38bdf8; font-size:12px;'>● ARTICULATING SYNTHESIS</span>")
             self.audio_status_badge.setText("<span style='color:#38bdf8; font-size:11px;'>🔊 Speaking</span>")
-        elif st == "sleeping":
+            web_mode = "speak"
+        elif st in ("sleeping", "sleep"):
             self.voice_state_badge.setText("<b style='color:#64748b; font-size:13px;'>[ 💤 SLEEPING (0% CPU) ]</b>")
             self.status_label.setText("<span style='color:#64748b; font-size:12px;'>● SLEEPING</span>")
+            web_mode = "idle"
         else:
             self.voice_state_badge.setText("<b style='color:#00f0ff; font-size:13px;'>[ ● VOICE READY ]</b>")
             self.status_label.setText("<span style='color:#10b981; font-size:12px;'>● ACTIVE & GROUNDED</span>")
             self.audio_status_badge.setText("<span style='color:#64748b; font-size:11px;'>Audio: Idle</span>")
+            web_mode = "idle"
+
+        self._run_js(f"window.setDropletState && window.setDropletState('{web_mode}');")
 
     def set_audio_level(self, level: float) -> None:
         """Updates mic VU bar and 3D droplet surface capillary ripples."""
         clamped = max(0.0, min(1.0, level))
         self.mic_vu_bar.setValue(int(clamped * 100))
         self.orb.set_audio_level(clamped)
+        self._run_js(f"window.setAudioLevel && window.setAudioLevel({clamped:.3f});")
+
+    def pulse_droplet(self, amount: float = 0.6) -> None:
+        """Triggers dynamic capillary ripples and pulse on the droplet surface."""
+        self.orb.trigger_impulse(amount)
+        self._run_js(f"window.pulseDroplet && window.pulseDroplet({amount:.3f});")
 
     def set_truthfulness_score(self, score: float, verified: int = 8, total: int = 8) -> None:
         pct = int(score * 100)
@@ -446,7 +543,6 @@ class LoraDesktopHUD(QMainWindow):
 
     def add_evidence_card(self, title: str, source: str, snippet: str, confidence: float = 0.95, url: str = "") -> None:
         card = EvidenceCardWidget(title=title, source=source, snippet=snippet, confidence=confidence, url=url, parent=self.evidence_container)
-        # Insert before trailing stretch
         idx = max(0, self.evidence_cards_layout.count() - 1)
         self.evidence_cards_layout.insertWidget(idx, card)
 
@@ -468,14 +564,21 @@ class LoraDesktopHUD(QMainWindow):
             self.activateWindow()
 
     def append_message(self, sender: str, text: str) -> None:
-        """Appends formatted research synthesis to the executive briefing feed."""
+        """Appends formatted research synthesis to both the briefing feed and WebGL dialog box."""
         clean_sender = html.escape(sender)
         clean_text = html.escape(text).replace("\n", "<br/>")
         formatted = f"<p style='margin-bottom:10px;'><b><span style='color:#00f0ff;'>[{clean_sender}]</span></b><br/><span style='color:#e2e8f0;'>{clean_text}</span></p>"
         self.chat_feed.append(formatted)
 
+        # Synchronize with WebGL glassmorphic dialog stream
+        js_sender = json.dumps(sender)
+        js_text = json.dumps(text)
+        self._run_js(f"window.addMessage && window.addMessage({js_sender}, {js_text});")
+
     def set_input_text(self, text: str) -> None:
         self.input_field.setText(text)
+        js_text = json.dumps(text)
+        self._run_js(f"const el = document.getElementById('query-input'); if (el) el.value = {js_text};")
 
     def toggle_window(self) -> None:
         if self.isVisible():

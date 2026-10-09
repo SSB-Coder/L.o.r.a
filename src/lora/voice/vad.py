@@ -20,7 +20,7 @@ class VoiceActivityDetector:
     def __init__(
         self,
         sample_rate: int = 16000,
-        threshold: float = 0.5,
+        threshold: float = 0.35,
         silence_duration_seconds: float = 0.6,
         min_speech_duration_seconds: float = 0.25,
         onnx_model_path: str | None = None,
@@ -45,12 +45,17 @@ class VoiceActivityDetector:
         self._recorded_utterance_chunks: list[np.ndarray] = []
 
     def compute_energy_prob(self, chunk: np.ndarray) -> float:
-        """Heuristic fallback RMS energy-based voice activity score (0.0 to 1.0)."""
+        """Heuristic fallback RMS energy-based voice activity score (0.0 to 1.0).
+
+        Calibrated for standard laptop microphones (e.g., Realtek Audio):
+        - Ambient silence: ~0.001 - 0.006 RMS -> score 0.0
+        - Conversational speech: ~0.012 - 0.040 RMS -> score ~0.35 - 0.90
+        - Assertive / close speech: >= 0.050 RMS -> score 1.0
+        """
         if len(chunk) == 0:
             return 0.0
         rms = float(np.sqrt(np.mean(chunk**2)))
-        # RMS of quiet room is ~0.005 - 0.01; speech is ~0.03 - 0.2
-        scaled = (rms - 0.015) / 0.05
+        scaled = (rms - 0.006) / 0.020
         return float(np.clip(scaled, 0.0, 1.0))
 
     def evaluate_chunk(self, chunk: np.ndarray) -> float:

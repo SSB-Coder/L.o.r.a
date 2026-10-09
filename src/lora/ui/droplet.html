@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>L.O.R.A - Voice Research Assistant</title>
+<style>
+:root {
+  --bg: #04111b;
+  --panel-bg: rgba(6, 20, 32, 0.82);
+  --border-color: rgba(126, 163, 181, 0.22);
+  --accent-cyan: #00f0ff;
+  --accent-blue: #38bdf8;
+  --text-main: #f1f5f9;
+  --text-mute: #7ea3b5;
+  --user-bubble: rgba(14, 165, 233, 0.18);
+  --lora-bubble: rgba(6, 182, 212, 0.12);
+  box-sizing: border-box;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; width: 100%; overflow: hidden; background: var(--bg); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: var(--text-main); }
+
+#app-container {
+  display: flex;
+  width: 100vw;
+  height: 100vh;
+  position: relative;
+}
+
+/* LEFT / CENTER: 3D WATER DROPLET VISUALIZER */
+#visualizer-area {
+  flex: 1;
+  position: relative;
+  height: 100%;
+  overflow: hidden;
+}
+
+canvas#c {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  cursor: pointer;
+}
+
+#status {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 24px;
+  text-align: center;
+  color: var(--text-mute);
+  font-size: 13px;
+  letter-spacing: 0.05em;
+  pointer-events: none;
+  text-shadow: 0 1px 4px rgba(0,0,0,0.6);
+}
+
+/* RIGHT SIDE: DIALOG & CONTROL BOX */
+#dialog-panel {
+  width: 440px;
+  min-width: 380px;
+  max-width: 520px;
+  height: 100%;
+  background: var(--panel-bg);
+  backdrop-filter: blur(28px);
+  -webkit-backdrop-filter: blur(28px);
+  border-left: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  box-shadow: -10px 0 35px rgba(0, 0, 0, 0.5);
+  z-index: 10;
+}
+
+.panel-header {
+  padding: 18px 20px 14px 20px;
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.title-group {
+  display: flex;
+  flex-direction: column;
+}
+
+.title-group h1 {
+  font-size: 18px;
+  letter-spacing: 1.5px;
+  font-weight: 700;
+  color: #ffffff;
+}
+
+.title-group h1 span {
+  color: var(--accent-cyan);
+}
+
+.title-group .sub {
+  font-size: 11px;
+  letter-spacing: 0.8px;
+  color: var(--text-mute);
+  text-transform: uppercase;
+}
+
+.voice-picker {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+}
+
+.voice-picker label {
+  font-size: 9px;
+  letter-spacing: 0.8px;
+  color: var(--text-mute);
+}
+
+.voice-picker select {
+  background: rgba(15, 23, 42, 0.85);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--accent-cyan);
+  font-size: 12px;
+  padding: 4px 8px;
+  outline: none;
+  cursor: pointer;
+}
+
+.voice-picker select:focus {
+  border-color: var(--accent-cyan);
+}
+
+/* STATE PILL */
+.state-strip {
+  padding: 8px 20px;
+  background: rgba(4, 17, 27, 0.5);
+  border-bottom: 1px solid rgba(126, 163, 181, 0.12);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+}
+
+.state-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.state-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #10b981;
+  box-shadow: 0 0 8px #10b981;
+}
+
+.state-idle .state-dot { background-color: #10b981; box-shadow: 0 0 8px #10b981; }
+.state-listen .state-dot { background-color: #00f0ff; box-shadow: 0 0 10px #00f0ff; }
+.state-think .state-dot { background-color: #a855f7; box-shadow: 0 0 10px #a855f7; }
+.state-speak .state-dot { background-color: #38bdf8; box-shadow: 0 0 10px #38bdf8; }
+
+.vitals-meta {
+  color: var(--text-mute);
+  font-size: 11px;
+}
+
+/* DIALOG STREAM */
+#dialog-stream {
+  flex: 1;
+  padding: 16px 20px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+#dialog-stream::-webkit-scrollbar {
+  width: 5px;
+}
+
+#dialog-stream::-webkit-scrollbar-thumb {
+  background: rgba(126, 163, 181, 0.3);
+  border-radius: 3px;
+}
+
+.msg {
+  display: flex;
+  flex-direction: column;
+  max-width: 94%;
+  animation: fadeIn 0.25s ease-out;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.msg.user {
+  align-self: flex-end;
+}
+
+.msg.lora {
+  align-self: flex-start;
+}
+
+.msg .sender-tag {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  margin-bottom: 4px;
+  text-transform: uppercase;
+}
+
+.msg.user .sender-tag {
+  color: var(--accent-blue);
+  text-align: right;
+}
+
+.msg.lora .sender-tag {
+  color: var(--accent-cyan);
+  text-align: left;
+}
+
+.msg .bubble {
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: #f8fafc;
+  word-wrap: break-word;
+}
+
+.msg.user .bubble {
+  background: var(--user-bubble);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  border-top-right-radius: 2px;
+}
+
+.msg.lora .bubble {
+  background: var(--lora-bubble);
+  border: 1px solid rgba(0, 240, 255, 0.3);
+  border-top-left-radius: 2px;
+}
+
+/* AUDIO VU METER */
+.audio-vu-box {
+  padding: 6px 20px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(4, 17, 27, 0.4);
+  border-top: 1px solid rgba(126, 163, 181, 0.1);
+}
+
+.vu-label {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-mute);
+  letter-spacing: 0.5px;
+}
+
+.vu-track {
+  flex: 1;
+  height: 5px;
+  background: rgba(15, 23, 42, 0.8);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.vu-bar {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #00f0ff, #38bdf8);
+  border-radius: 3px;
+  transition: width 0.06s ease;
+}
+
+/* BOTTOM CONTROLS */
+.controls-bottom {
+  padding: 14px 20px 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border-top: 1px solid var(--border-color);
+  background: rgba(6, 20, 32, 0.95);
+}
+
+.ptt-button {
+  width: 100%;
+  padding: 11px;
+  background: linear-gradient(135deg, #0284c7, #0369a1);
+  border: 1px solid var(--accent-blue);
+  border-radius: 8px;
+  color: #ffffff;
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.ptt-button:hover {
+  background: linear-gradient(135deg, #0369a1, #0284c7);
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.4);
+}
+
+.ptt-button:active, .ptt-button.recording {
+  background: linear-gradient(135deg, #06b6d4, #0891b2);
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 16px rgba(0, 240, 255, 0.6);
+}
+
+.input-form {
+  display: flex;
+  gap: 8px;
+}
+
+.input-form input {
+  flex: 1;
+  background: rgba(15, 23, 42, 0.9);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: #ffffff;
+  outline: none;
+}
+
+.input-form input:focus {
+  border-color: var(--accent-cyan);
+}
+
+.input-form button {
+  background: #0ea5e9;
+  border: none;
+  border-radius: 6px;
+  padding: 0 14px;
+  font-size: 14px;
+  font-weight: bold;
+  color: #ffffff;
+  cursor: pointer;
+}
+
+.input-form button:hover {
+  background: #0284c7;
+}
+</style>
+</head>
+<body>
+<div id="app-container">
+  <!-- 3D DROPLET VISUALIZER -->
+  <div id="visualizer-area">
+    <canvas id="c"></canvas>
+    <div id="status">Tap the droplet to speak</div>
+  </div>
+
+  <!-- RIGHT DIALOG & CONTROL BOX -->
+  <div id="dialog-panel">
+    <div class="panel-header">
+      <div class="title-group">
+        <h1>L.O.R.A <span>// HUD</span></h1>
+        <div class="sub">Layer Oriented Research Assistant</div>
+      </div>
+      <div class="voice-picker">
+        <label for="voice-select">QWEN VOICE</label>
+        <select id="voice-select" onchange="onVoiceChanged(this.value)">
+          <option value="vivian" selected>Vivian (Default)</option>
+          <option value="serena">Serena</option>
+          <option value="aiden">Aiden</option>
+          <option value="dylan">Dylan</option>
+          <option value="eric">Eric</option>
+          <option value="ono_anna">Ono Anna</option>
+          <option value="ryan">Ryan</option>
+          <option value="sohee">Sohee</option>
+          <option value="uncle_fu">Uncle Fu</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- State Indicator Strip -->
+    <div class="state-strip state-idle" id="state-strip">
+      <div class="state-badge">
+        <div class="state-dot"></div>
+        <span id="state-text">ACTIVE & GROUNDED</span>
+      </div>
+      <div class="vitals-meta">Qwen3-TTS | Whisper CPU | RTX 3050</div>
+    </div>
+
+    <!-- Real-time Dialog Stream -->
+    <div id="dialog-stream">
+      <div class="msg lora">
+        <div class="sender-tag">L.O.R.A</div>
+        <div class="bubble">All systems online. Qwen3-TTS and Whisper are active. You can speak naturally, hold the Push-to-Talk button, or tap the droplet.</div>
+      </div>
+    </div>
+
+    <!-- Mic Audio VU Meter -->
+    <div class="audio-vu-box">
+      <span class="vu-label">MIC</span>
+      <div class="vu-track">
+        <div id="vu-bar" class="vu-bar"></div>
+      </div>
+    </div>
+
+    <!-- Bottom Controls -->
+    <div class="controls-bottom">
+      <button id="ptt-btn" class="ptt-button" onmousedown="onPttDown()" onmouseup="onPttUp()" ontouchstart="onPttDown()" ontouchend="onPttUp()">
+        <span class="icon">🎙️</span> <span id="ptt-label">Push to Talk (Hold)</span>
+      </button>
+      <form class="input-form" onsubmit="event.preventDefault(); submitInput();">
+        <input type="text" id="query-input" placeholder="Speak or enter research question..." autocomplete="off"/>
+        <button type="submit">→</button>
+      </form>
+    </div>
+  </div>
+</div>
+
+<script>
+// ==========================================
+// 1. GLSL 3D TRANSLUCENT WATER DROPLET SHADER
+// ==========================================
+const $=id=>document.getElementById(id),cv=$('c'),st=$('status');
+const gl=cv.getContext('webgl',{antialias:false,alpha:false});
+const dark=()=>true;
+
+const VS='attribute vec2 a;void main(){gl_Position=vec4(a,0.,1.);}';
+const FS=`precision highp float;
+uniform vec2 u_res;
+uniform float u_t,u_tw,u_amp,u_imp,u_think,u_speak,u_f,u_br,u_sq,u_dark,u_bob;
+uniform vec2 u_rip[6];
+float hash(vec2 p){p=fract(p*vec2(123.34,456.21));p+=dot(p,p+45.32);return fract(p.x*p.y);}
+float deform(float a){
+ float d=sin(2.*a+u_tw*.9)+.65*sin(3.*a-u_tw*1.3+1.7)+.42*sin(4.*a+u_tw*1.7+3.1)+.3*sin(5.*a-u_tw*2.2+.6)+.22*sin(6.*a+u_tw*2.7+2.4);
+ return d*u_amp*.55;
+}
+vec3 env(vec3 d){
+ float up=d.y*.5+.5;
+ vec3 dk=mix(vec3(.01,.05,.08),vec3(.05,.17,.24),up);
+ vec3 lt=mix(vec3(.72,.82,.88),vec3(.93,.97,1.),up);
+ vec3 c=mix(lt,dk,u_dark);
+ c+=pow(max(dot(d,normalize(vec3(-.55,.65,.52))),0.),24.)*mix(1.3,2.4,u_dark);
+ c+=vec3(.5,.85,1.)*pow(max(dot(d,normalize(vec3(.85,.25,.45))),0.),30.)*1.2;
+ c+=vec3(.3,.7,.9)*pow(max(-d.y,0.),2.)*.4*u_dark;
+ return c;
+}
+vec3 bg(vec2 p){
+ float r2=dot(p,p);
+ vec3 dk=mix(vec3(.012,.05,.08),vec3(.07,.27,.37),exp(-r2*.45)*.9);
+ vec3 lt=mix(vec3(.82,.90,.94),vec3(.97,.99,1.),exp(-r2*.4));
+ vec3 c=mix(lt,dk,u_dark);
+ float fy=p.y+1.6,fy2=p.y+1.78;
+ c+=mix(vec3(-.05,-.03,-.01),vec3(.05,.20,.27),u_dark)*exp(-abs(fy)*5.)*.9;
+ c+=mix(vec3(-.12,-.05,0.),vec3(.35,.8,1.),u_dark)*exp(-(p.x*p.x*1.1+fy2*fy2*45.))*.24*(.7+u_imp);
+ if(p.y<-.9){
+  float de=length(vec2(p.x,fy*6.5));
+  for(int i=0;i<6;i++){
+   float s=u_rip[i].y;
+   if(s>0.){float age=u_rip[i].x;float x=(de-(.3+age*.55))/.04;
+    c+=mix(vec3(-.08,-.04,0.),vec3(.45,.85,1.),u_dark)*exp(-x*x)*s*(1.-age/2.8)*.55;}
+  }
+ }
+ return c;
+}
+void main(){
+ vec2 px=gl_FragCoord.xy;
+ vec2 c0=u_res*.5+vec2(0.,8.);
+ float R=min(u_res.x,u_res.y*1.05)*.24;
+ vec2 p=(px-c0)/R;
+ float aa=1.5/R;
+ vec3 col=bg(p);
+ vec3 tc=mix(vec3(.04,.30,.42),vec3(.59,.91,1.),u_dark);
+
+ // drifting dust
+ vec2 g=p*5.+vec2(0.,u_t*.12);vec2 id=floor(g);vec2 gf=fract(g)-.5;
+ float h=hash(id);vec2 off=(vec2(hash(id+3.),hash(id+7.))-.5)*.5;
+ float ds=step(.72,h)*(1.-smoothstep(0.,.07,length(gf-off)))*(.5+.5*sin(u_t*.8+h*30.));
+ col+=mix(vec3(-.05,-.03,-.01),vec3(.30,.55,.65),u_dark)*ds*.55;
+
+ // orbit rings + spectrum ticks
+ float r=length(p);float a=atan(p.y,p.x);
+ float rl=1.-smoothstep(0.,aa*1.2,abs(r-1.72));
+ col=mix(col,tc,rl*step(.35,fract((a-u_t*.05)/6.28318*60.))*.18);
+ float rl2=1.-smoothstep(0.,aa*1.2,abs(r-1.52));
+ col=mix(col,tc,rl2*step(fract((a+u_t*.12)/2.0944+.1),.43)*.26);
+ float fi=a/6.28318*120.;float idx=floor(fi);float ff=fract(fi)-.5;
+ float n1=.5+.5*sin(idx*.7+u_t*(3.+u_f))*sin(idx*.23-u_t*2.1+1.);
+ float sp=u_speak*(.12+.88*n1)*(.3+.7*u_imp)+u_think*.08*(.5+.5*sin(a*3.-u_t*2.2))+.02;
+ float ew=aa/.065,top=1.27+sp*.3;
+ float tm=(1.-smoothstep(.14-ew,.14+ew,abs(ff)))*smoothstep(1.24-aa,1.24,r)*(1.-smoothstep(top,top+aa,r));
+ col=mix(col,tc,tm*(.25+sp*.7));
+
+ // droplet geometry
+ vec2 pp=p-vec2(0.,u_bob);
+ pp.x/=1.-.5*u_sq;pp.y/=1.+u_sq;
+ float rd=1.+deform(atan(pp.y,pp.x))+u_br;
+ vec2 q=pp/rd;float rq=length(q);
+ float gl=exp(-max(rq-1.,0.)*3.2)*(.10+.10*u_speak+.22*u_imp+.05*u_think);
+ col+=mix(vec3(-.10,-.05,-.02),vec3(.25,.75,1.),u_dark)*gl;
+ float mask=1.-smoothstep(1.-aa/rd,1.,rq);
+ if(mask>0.){
+  float z=sqrt(max(1.-rq*rq,0.));
+  vec3 n=vec3(q,z);
+  vec2 dir=q/max(rq,1e-4);
+  float slope=sin(rq*9.-u_t*1.2)*.012*(.4+u_think+.4*u_speak);
+  for(int i=0;i<6;i++){
+   float s=u_rip[i].y;
+   if(s>0.){float age=u_rip[i].x;float dd=(rq-age*.5)/.13;
+    slope+=cos((rq-age*.5)*26.)*exp(-dd*dd)*.16*s*(1.-age/2.8);}
+  }
+  n.xy+=dir*slope+vec2(sin(q.y*6.+u_tw*1.5),cos(q.x*6.-u_tw*1.3))*u_amp*.9;
+  n=normalize(n);
+  vec3 v=vec3(0.,0.,-1.);
+  float cosT=max(n.z,0.);
+  vec3 r1=refract(v,n,1./1.325),r2=refract(v,n,1./1.333),r3=refract(v,n,1./1.345);
+  vec2 b0=-q*.95;
+  vec3 tr=vec3(bg(b0+r1.xy*1.3).r,bg(b0+r2.xy*1.3).g,bg(b0+r3.xy*1.3).b);
+  tr+=vec3(.01,.07,.11)*(1.-.5*z)*u_dark;
+  vec3 ab=exp(-z*vec3(.65,.2,.1));
+  float F=.03+.97*pow(1.-cosT,4.);
+  vec3 rv=reflect(v,n);
+  vec3 cd=mix(tr*ab,env(rv),clamp(F+.05,0.,1.));
+  cd+=vec3(1.)*smoothstep(.915,.935,dot(rv,normalize(vec3(-.5,.62,.6))))*.85;
+  cd+=vec3(.7,.95,1.)*smoothstep(.975,.99,dot(rv,normalize(vec3(.5,-.5,.7))))*.45;
+  cd+=mix(vec3(-.30,-.18,-.08),vec3(.28,.72,.95),u_dark)*pow(1.-cosT,3.)*.5;
+  float ty=(q.y+.62)/.2;
+  float cb=exp(-ty*ty)*exp(-q.x*q.x/.3)*(.6+.4*sin(q.x*14.+u_t*1.2));
+  float fl=abs(sin(q.x*9.+sin(q.y*7.+u_tw*1.1)*(1.5+u_amp*30.)));
+  float fil=pow(1.-fl,14.)*smoothstep(0.,-.5,q.y);
+  vec3 cc=mix(vec3(1.),vec3(.6,.95,1.),u_dark);
+  cd+=cc*(cb*.55+fil*.35)*z;
+  vec2 sg=q*6.+vec2(u_t*.05,u_t*.08);vec2 sid=floor(sg);vec2 sf=fract(sg)-.5;
+  float sh=hash(sid+11.);vec2 so=(vec2(hash(sid+1.),hash(sid+5.))-.5)*.5;
+  float sk=step(.78,sh)*(1.-smoothstep(0.,.05,length(sf-so)))*(.5+.5*sin(u_t*1.5+sh*40.));
+  cd+=cc*sk*.5*z;
+  col=mix(col,cd,mask);
+ }
+ vec2 uv=px/u_res-.5;
+ col*=1.-.3*dot(uv,uv)*mix(.4,1.,u_dark);
+ col+=(hash(px+fract(u_t))-.5)*.012;
+ gl_FragColor=vec4(clamp(col,0.,1.),1.);
+}`;
+
+let mode='idle',t=0,tw=0,amp=.004,ampT=.004,phase=0,impulse=0,freq=3,rings=[],nextRing=0,th=0,sp=0,sq=0,sv=0,last=performance.now();
+const rip=new Float32Array(12);
+
+if(!gl){st.textContent='WebGL is not available in this browser'}
+else{
+ const mk=(ty,src)=>{const s=gl.createShader(ty);gl.shaderSource(s,src);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))console.error(gl.getShaderInfoLog(s));return s};
+ const pr=gl.createProgram();gl.attachShader(pr,mk(gl.VERTEX_SHADER,VS));gl.attachShader(pr,mk(gl.FRAGMENT_SHADER,FS));gl.linkProgram(pr);gl.useProgram(pr);
+ gl.bindBuffer(gl.ARRAY_BUFFER,gl.createBuffer());gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+ const al=gl.getAttribLocation(pr,'a');gl.enableVertexAttribArray(al);gl.vertexAttribPointer(al,2,gl.FLOAT,false,0,0);
+ const U={};['u_res','u_t','u_tw','u_amp','u_imp','u_think','u_speak','u_f','u_br','u_sq','u_dark','u_bob','u_rip'].forEach(n=>U[n]=gl.getUniformLocation(pr,n));
+ 
+ function fit(){
+   const area = $('visualizer-area');
+   const d=Math.min(devicePixelRatio||1,1.75);
+   cv.width=Math.round(area.clientWidth*d);
+   cv.height=Math.round(area.clientHeight*d);
+   gl.viewport(0,0,cv.width,cv.height);
+ }
+ window.addEventListener('resize',fit);fit();
+
+ const ripple=(s=1)=>{rings.push({t0:t,s});if(rings.length>6)rings.shift()};
+
+ function frame(now){
+  const dt=Math.min((now-last)/1000,.05);last=now;t+=dt;
+  let br=0;
+  if(mode==='idle'){ampT=.004;freq=.5}
+  if(mode==='listen'){ampT=.018;freq=2.2;if(t>nextRing){ripple(.6);nextRing=t+0.8}}
+  if(mode==='think'){ampT=.012+.004*Math.sin(t*1.3);freq=.9;if(t>nextRing){ripple(.7);nextRing=t+1+Math.random()*.5}}
+  if(mode==='speak'){
+   impulse*=Math.exp(-dt*5);
+   freq=3.2+2.2*Math.sin(t*.9)+1.4*Math.sin(t*2.3+1);
+   ampT=.016+.028*impulse+.012*(.5+.5*Math.sin(t*1.7));
+  }else impulse*=Math.exp(-dt*5);
+  amp+=(ampT-amp)*Math.min(1,dt*(mode==='speak'?9:3));
+  phase+=dt*freq*Math.PI;
+  if(mode==='speak')br=Math.sin(phase)*amp*1.6;
+  tw+=dt*(mode==='speak'?1+freq*.12:1);
+  th+=((mode==='think'?1:0)-th)*Math.min(1,dt*4);
+  sp+=((mode==='speak'?1:0)-sp)*Math.min(1,dt*5);
+  sv+=(-140*sq-10*sv)*dt;sq=Math.max(-.12,Math.min(.12,sq+sv*dt));
+  rings=rings.filter(r=>t-r.t0<2.8);
+  rip.fill(0);rings.forEach((r,i)=>{rip[i*2]=t-r.t0;rip[i*2+1]=r.s});
+  gl.uniform2f(U.u_res,cv.width,cv.height);
+  gl.uniform1f(U.u_t,t);gl.uniform1f(U.u_tw,tw);gl.uniform1f(U.u_amp,amp);gl.uniform1f(U.u_imp,impulse);
+  gl.uniform1f(U.u_think,th);gl.uniform1f(U.u_speak,sp);gl.uniform1f(U.u_f,freq);gl.uniform1f(U.u_br,br);
+  gl.uniform1f(U.u_sq,sq);gl.uniform1f(U.u_dark,dark()?1:0);gl.uniform1f(U.u_bob,Math.sin(t*.7)*.025);
+  gl.uniform2fv(U.u_rip,rip);
+  gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+  requestAnimationFrame(frame);
+ }
+ requestAnimationFrame(frame);
+
+ cv.onclick = () => {
+   if (mode === 'idle') onPttDown();
+   else onPttUp();
+ };
+}
+
+// ==========================================
+// 2. DIALOG STREAM & INTERACTION LOGIC
+// ==========================================
+function setMode(m, label) {
+  mode = m;
+  const strip = $('state-strip');
+  const txt = $('state-text');
+  strip.className = 'state-strip state-' + m;
+  
+  if (m === 'listen') {
+    txt.textContent = 'LISTENING...';
+    st.textContent = 'Listening to your voice...';
+    $('ptt-btn').classList.add('recording');
+    $('ptt-label').textContent = 'Listening (Release to Submit)';
+  } else if (m === 'think') {
+    txt.textContent = 'REASONING & GROUNDING...';
+    st.textContent = 'Synthesizing evidence...';
+    $('ptt-btn').classList.remove('recording');
+    $('ptt-label').textContent = 'Processing...';
+  } else if (m === 'speak') {
+    txt.textContent = 'SPEAKING (QWEN-TTS)...';
+    st.textContent = 'Articulating response...';
+    $('ptt-btn').classList.remove('recording');
+    $('ptt-label').textContent = 'Speaking...';
+  } else {
+    txt.textContent = 'ACTIVE & GROUNDED';
+    st.textContent = 'Tap the droplet or press Push-to-Talk to speak';
+    $('ptt-btn').classList.remove('recording');
+    $('ptt-label').textContent = 'Push to Talk (Hold)';
+  }
+}
+
+function pulseDroplet(amount) {
+  impulse = Math.max(impulse, amount || 0.6);
+  sv += (amount || 0.4) * 0.5;
+  if (rings.length < 6) rings.push({t0: t, s: amount || 0.8});
+}
+
+function updateAudioLevel(lvl) {
+  const bar = $('vu-bar');
+  const pct = Math.min(100, Math.max(0, Math.round(lvl * 100)));
+  bar.style.width = pct + '%';
+  if (lvl > 0.08) {
+    pulseDroplet(lvl * 0.7);
+  }
+}
+
+function addDialogMessage(sender, text) {
+  const stream = $('dialog-stream');
+  const isUser = sender.toLowerCase() === 'you' || sender.toLowerCase() === 'user';
+  
+  const msgEl = document.createElement('div');
+  msgEl.className = 'msg ' + (isUser ? 'user' : 'lora');
+  
+  const tag = document.createElement('div');
+  tag.className = 'sender-tag';
+  tag.textContent = isUser ? 'YOU' : 'L.O.R.A';
+  
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.textContent = text;
+  
+  msgEl.appendChild(tag);
+  msgEl.appendChild(bubble);
+  stream.appendChild(msgEl);
+  stream.scrollTop = stream.scrollHeight;
+}
+
+function notifyPython(action, payload) {
+  if (window.pyBridge && window.pyBridge[action]) {
+    try {
+      window.pyBridge[action](payload);
+      return;
+    } catch(e) {}
+  }
+  try {
+    const encoded = encodeURIComponent(JSON.stringify(payload || {}));
+    const iframe = document.createElement("iframe");
+    iframe.style.display = "none";
+    iframe.src = "lora://" + action + "?payload=" + encoded;
+    document.body.appendChild(iframe);
+    setTimeout(() => { iframe.remove(); }, 150);
+  } catch(e) {
+    console.error("notifyPython error:", e);
+  }
+}
+
+function submitInput() {
+  const inp = $('query-input');
+  const text = inp.value.trim();
+  if (!text) return;
+  inp.value = '';
+  addDialogMessage('user', text);
+  setMode('think');
+  notifyPython('on_user_submit', { text: text, voice: $('voice-select').value });
+}
+
+function onPttDown() {
+  setMode('listen');
+  notifyPython('on_ptt_down', {});
+}
+
+function onPttUp() {
+  if (mode === 'listen') {
+    setMode('think');
+    notifyPython('on_ptt_up', {});
+  }
+}
+
+function onVoiceChanged(val) {
+  notifyPython('on_voice_changed', { voice: val });
+}
+
+// Global window bindings for Python backend
+window.setDropletState = setMode;
+window.addMessage = addDialogMessage;
+window.setAudioLevel = updateAudioLevel;
+window.pulseDroplet = pulseDroplet;
+</script>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<script>
+if (typeof QWebChannel !== "undefined" && typeof qt !== "undefined" && qt.webChannelTransport) {
+  new QWebChannel(qt.webChannelTransport, function(channel) {
+    window.pyBridge = channel.objects.pyBridge;
+  });
+}
+</script>
+</body>
+</html>

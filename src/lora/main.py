@@ -145,41 +145,105 @@ def run_desktop_app(
 
     tray.exit_requested.connect(on_exit)
 
-    # Voice capture and STT setup
+    # Voice capture, STT, and Qwen3-TTS setup
     capture = None
     transcriber = None
     hotkey = None
     speech_active = threading.Event()
+    active_voice = ["vivian"]
+
+    def on_voice_changed(new_voice: str) -> None:
+        active_voice[0] = new_voice
+        logger.info("Active Qwen3-TTS voice selected: %s", new_voice)
+
+    hud.voice_changed.connect(on_voice_changed)
+
+    tts_engine = None
+    if not args.no_audio:
+        try:
+            from lora.voice.tts.engine import TtsEngine
+            from lora.voice.tts.worker import Qwen3TtsWorkerProcess
+
+            tts_worker = Qwen3TtsWorkerProcess(
+                models_dir=r"C:\Models\Qwen3-TTS-12Hz-1.7B-CustomVoice",
+                tokenizer_dir=r"C:\Models\Qwen3-TTS-Tokenizer-12Hz",
+                default_voice=active_voice[0],
+                spawn_process=False,
+            )
+            tts_engine = TtsEngine(worker=tts_worker)
+            logger.info("Qwen3-TTS engine initialized with custom voice models.")
+        except Exception as e:
+            logger.warning("Could not initialize Qwen3-TTS engine: %s", e)
 
     def speak_briefing_async(text: str) -> None:
-        """Speaks executive summary aloud in background thread with barge-in support."""
-        if args.no_audio:
+        """Speaks executive summary using Qwen3-TTS with real-time droplet surface ripples."""
+        if args.no_audio or not text.strip():
             return
 
         def _speak_thread() -> None:
+            speech_active.set()
             try:
-                import subprocess
+                import time
 
-                clean = text.replace("'", " ").replace('"', " ").replace("\n", " ").strip()
-                sentences = [s.strip() for s in clean.split(".") if len(s.strip()) > 3]
-                spoken = ". ".join(sentences[:3]) + "." if sentences else clean[:200]
-                if not spoken.strip():
-                    return
-                speech_active.set()
-                cmd = f"Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Speak('{spoken}')"
-                subprocess.run(
-                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-                    capture_output=True,
-                    timeout=20,
-                )
+                import numpy as np
+                import sounddevice as sd
+                from PySide6.QtCore import QTimer
+
+                from lora.voice.tts.engine import split_sentences
+
+                clean = text.replace("`", "").strip()
+                sentences = split_sentences(clean)
+                if not sentences:
+                    sentences = [clean]
+
+                voice_to_use = active_voice[0]
+                logger.info("Speaking briefing with Qwen3-TTS voice '%s' (%d sentences)...", voice_to_use, len(sentences))
+
+                for sent in sentences[:4]:  # Speak first concise sentences
+                    if not speech_active.is_set():
+                        break
+
+                    chunk = None
+                    if tts_engine is not None:
+                        chunk = tts_engine.worker.synthesize(sent, voice=voice_to_use)
+
+                    if chunk is not None and len(chunk.samples) > 0 and speech_active.is_set():
+                        sample_rate = chunk.sample_rate
+                        samples = chunk.samples
+                        duration = len(samples) / sample_rate
+
+                        # Audio playback through sounddevice
+                        sd.play(samples, samplerate=sample_rate)
+
+                        # Audio visualization loop pulsing the droplet during speech
+                        num_steps = max(1, int(duration * 25))
+                        slice_size = max(1, len(samples) // num_steps)
+                        for step_idx in range(num_steps):
+                            if not speech_active.is_set():
+                                sd.stop()
+                                break
+                            start_s = step_idx * slice_size
+                            end_s = start_s + slice_size
+                            step_samples = samples[start_s:end_s]
+                            step_rms = float(np.sqrt(np.mean(step_samples**2))) if len(step_samples) > 0 else 0.0
+                            lvl = min(1.0, step_rms * 8.0)
+                            QTimer.singleShot(0, lambda cur_lvl=lvl: (
+                                hud.set_audio_level(cur_lvl),
+                                hud.pulse_droplet(cur_lvl * 0.9),
+                            ))
+                            time.sleep(duration / num_steps)
+
+                        if speech_active.is_set():
+                            sd.wait()
             except Exception as e:
-                logger.debug("TTS playback: %s", e)
+                logger.warning("TTS playback error: %s", e)
             finally:
                 speech_active.clear()
                 from PySide6.QtCore import QTimer
                 QTimer.singleShot(0, lambda: (
                     hud.set_voice_state("idle"),
                     droplet.set_state(WidgetState.IDLE),
+                    hud.set_audio_level(0.0),
                     audio.play_cue(SoundCue.COMPLETE),
                 ))
 
@@ -188,72 +252,118 @@ def run_desktop_app(
 
     def stop_current_speech() -> None:
         speech_active.clear()
+        if tts_engine is not None:
+            tts_engine.interrupt()
+        try:
+            import sounddevice as sd
+            sd.stop()
+        except Exception:
+            pass
         hud.set_voice_state("idle")
         droplet.set_state(WidgetState.IDLE)
+        hud.set_audio_level(0.0)
 
     hud.stop_audio_requested.connect(stop_current_speech)
 
     if not args.no_audio:
         try:
             import numpy as np
+            from PySide6.QtCore import QTimer
 
             from lora.voice.capture import AudioCapture
             from lora.voice.hotkey import PushToTalkListener
             from lora.voice.stt import FasterWhisperTranscriber
+            from lora.voice.vad import SpeechState, VoiceActivityDetector
 
             capture = AudioCapture(sample_rate=16000)
             transcriber = FasterWhisperTranscriber(lazy_load=True)
+            vad = VoiceActivityDetector(
+                sample_rate=16000,
+                threshold=0.35,
+                silence_duration_seconds=0.7,
+                min_speech_duration_seconds=0.25,
+            )
+
+            is_transcribing = threading.Event()
+
+            def _trigger_transcription(audio_samples: np.ndarray) -> None:
+                if is_transcribing.is_set():
+                    return
+                is_transcribing.set()
+
+                QTimer.singleShot(0, lambda: (
+                    hud.set_voice_state("thinking"),
+                    droplet.set_state(WidgetState.THINKING),
+                ))
+
+                def _worker() -> None:
+                    try:
+                        if len(audio_samples) < 3200:  # < 0.2 sec
+                            return
+                        res = transcriber.transcribe(audio_samples)
+                        query_text = res.text.strip()
+                        if query_text:
+                            logger.info("Transcribed voice input: '%s'", query_text)
+                            QTimer.singleShot(0, lambda q=query_text: hud.append_message("You", q))
+                            QTimer.singleShot(0, lambda q=query_text: on_query_submitted(q, active_voice[0]))
+                        else:
+                            logger.info("No speech detected in audio segment.")
+                    except Exception as ex:
+                        logger.warning("Transcription worker error: %s", ex)
+                    finally:
+                        is_transcribing.clear()
+                        if not speech_active.is_set():
+                            QTimer.singleShot(0, lambda: (
+                                hud.set_voice_state("idle"),
+                                droplet.set_state(WidgetState.IDLE),
+                            ))
+
+                t = threading.Thread(target=_worker, daemon=True)
+                t.start()
 
             def _on_mic_chunk(chunk: np.ndarray) -> None:
                 if len(chunk) == 0:
                     return
+
                 rms = float(np.sqrt(np.mean(chunk**2)))
-                level = min(1.0, rms * 7.5)
-                from PySide6.QtCore import QTimer
+                level = min(1.0, rms * 8.0)
                 QTimer.singleShot(0, lambda: (
                     hud.set_audio_level(level),
                     droplet.set_audio_level(level),
                 ))
+
+                if speech_active.is_set() or is_transcribing.is_set():
+                    return
+
+                vad_state, prob = vad.process_chunk(chunk)
+                if vad_state == SpeechState.SPEAKING:
+                    if droplet.state != WidgetState.SPEAKING:
+                        QTimer.singleShot(0, lambda: (
+                            hud.set_voice_state("listening"),
+                            droplet.set_state(WidgetState.SPEAKING),
+                        ))
+                elif vad_state == SpeechState.ENDED:
+                    utterance = vad.get_and_reset_utterance()
+                    if len(utterance) > 3200:
+                        _trigger_transcription(utterance)
 
             capture.register_chunk_callback(_on_mic_chunk)
             capture.start()
 
             def _on_ptt_down() -> None:
                 stop_current_speech()
-                hud.set_voice_state("listening")
-                droplet.set_state(WidgetState.SPEAKING)
+                vad.reset()
+                QTimer.singleShot(0, lambda: (
+                    hud.set_voice_state("listening"),
+                    droplet.set_state(WidgetState.SPEAKING),
+                ))
                 if capture:
                     capture.buffer.clear()
 
             def _on_ptt_up() -> None:
-                hud.set_voice_state("thinking")
-                droplet.set_state(WidgetState.THINKING)
-
-                def _transcribe_worker() -> None:
-                    if not capture or not transcriber:
-                        return
-                    audio_samples = capture.buffer.read_last_n_seconds(6.0)
-                    if len(audio_samples) < 4000:  # < 0.25 sec
-                        from PySide6.QtCore import QTimer
-                        QTimer.singleShot(0, lambda: (
-                            hud.set_voice_state("idle"),
-                            droplet.set_state(WidgetState.IDLE),
-                        ))
-                        return
-
-                    res = transcriber.transcribe(audio_samples)
-                    query_text = res.text.strip()
-                    from PySide6.QtCore import QTimer
-                    if query_text:
-                        QTimer.singleShot(0, lambda: on_query_submitted(query_text, "deep"))
-                    else:
-                        QTimer.singleShot(0, lambda: (
-                            hud.set_voice_state("idle"),
-                            droplet.set_state(WidgetState.IDLE),
-                        ))
-
-                t = threading.Thread(target=_transcribe_worker, daemon=True)
-                t.start()
+                if capture:
+                    audio_samples = capture.buffer.read_last_n_seconds(8.0)
+                    _trigger_transcription(audio_samples)
 
             hud.ptt_pressed.connect(_on_ptt_down)
             hud.ptt_released.connect(_on_ptt_up)
