@@ -33,8 +33,8 @@ function Install-Pkg([string[]]$PipArgs) {
 Write-Host "Installing GPU PyTorch ($Cuda). This downloads about 2.5 GB..." -ForegroundColor Yellow
 Install-Pkg @("torch", "--index-url", "https://download.pytorch.org/whl/$Cuda")
 
-Write-Host "Installing qwen-tts..." -ForegroundColor Yellow
-Install-Pkg @("qwen-tts", "numpy")
+Write-Host "Installing qwen-tts and compatible transformers (<4.52.0)..." -ForegroundColor Yellow
+Install-Pkg @("qwen-tts", "transformers>=4.48.0,<4.52.0", "accelerate", "numpy")
 
 Write-Host "`nChecking GPU support..." -ForegroundColor Yellow
 & $Py -c "import torch; print('torch', torch.__version__, '| CUDA available:', torch.cuda.is_available(), '|', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO GPU FOUND')"

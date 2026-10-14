@@ -207,6 +207,10 @@ def get_qwen_model(models_dir: str = r"C:\Models\Qwen3-TTS-12Hz-1.7B-CustomVoice
             return None
         try:
             from qwen_tts import Qwen3TTSModel
+            for _m in list(__import__("sys").modules.values()):
+                _cls = getattr(_m, "Qwen3TTSTalkerRotaryEmbedding", None)
+                if _cls is not None and not hasattr(_cls, "config"):
+                    _cls.config = None
         except Exception as exc:
             _set_status("failed", f"the qwen-tts package is missing ({exc})", FIX_TORCH)
             return None

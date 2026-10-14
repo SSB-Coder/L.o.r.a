@@ -86,7 +86,7 @@ class ExternalVoiceServer:
         assert self._proc and self._proc.stderr
         for line in self._proc.stderr:
             if line.strip():
-                logger.debug("tts-server: %s", line.strip())
+                logger.info("tts-server: %s", line.strip())
 
     def stop(self) -> None:
         proc, self._proc = self._proc, None

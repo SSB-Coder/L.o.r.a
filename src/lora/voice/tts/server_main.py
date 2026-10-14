@@ -23,6 +23,17 @@ import tempfile
 import wave
 from pathlib import Path
 
+def _patch_qwen_tts_rope() -> None:
+    """Shim Qwen3TTSTalkerRotaryEmbedding for transformers >= 4.52 where .config is accessed before assignment."""
+    try:
+        import sys
+        for mod in list(sys.modules.values()):
+            cls = getattr(mod, "Qwen3TTSTalkerRotaryEmbedding", None)
+            if cls is not None and not hasattr(cls, "config"):
+                cls.config = None
+    except Exception:
+        pass
+
 SMALL_MODEL_NAME = "Qwen3-TTS-12Hz-0.6B-CustomVoice"
 FAKE_SR = 22050
 
@@ -118,6 +129,7 @@ def load_model(models_dir: str):
         raise RuntimeError(f"this PyTorch ({torch.__version__}) has no GPU support|run scripts\\install_tts.ps1 again, or try -Cuda cu126")
     try:
         from qwen_tts import Qwen3TTSModel
+        _patch_qwen_tts_rope()
     except Exception as exc:
         raise RuntimeError(f"qwen-tts is missing in the voice environment ({exc})|run scripts\\install_tts.ps1 again") from exc
     cands = candidate_dirs(models_dir)
