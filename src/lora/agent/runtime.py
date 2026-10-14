@@ -126,6 +126,11 @@ class AgentRuntime:
         self.last_question = ""
         self.last_sources: list[dict[str, str]] = []
 
+    def on_sources_changed(self) -> None:
+        """Clear cached conversation context when a FAISS media source is removed so deleted sources are never echoed."""
+        self.history.clear()
+        self.last_sources.clear()
+
     # ------------------------------------------------------- personalization & MCP
     def _load_personalization(self, skills_dir: Any, agents_dir: Any) -> None:
         from pathlib import Path as _P
@@ -255,7 +260,7 @@ class AgentRuntime:
             raise exc(reason)
 
     # ----------------------------------------------------------------- model
-    async def _plan(self):
+    async def _plan(self, role: str = "writer"):
         from lora.models.ollama_client import OllamaClient
         from lora.models.selection import plan_chat
 
@@ -263,7 +268,7 @@ class AgentRuntime:
         last_exc: Exception | None = None
         for attempt in range(4):  # Ollama may still be starting, or busy loading the model
             try:
-                plan = await plan_chat(client, user_default=self.user_default_model)
+                plan = await plan_chat(client, user_default=self.user_default_model, role=role)
                 if plan is None:
                     raise EngineUnavailable("no models installed")
                 return client, plan
@@ -275,9 +280,9 @@ class AgentRuntime:
                 await asyncio.sleep(self.retry_delay * (attempt + 1))
         raise EngineUnavailable(str(last_exc))
 
-    async def _collect(self, messages: list[dict[str, str]], plan_pair: Any = None, model: str | None = None, keep_alive: str | None = None) -> str:
+    async def _collect(self, messages: list[dict[str, str]], plan_pair: Any = None, model: str | None = None, keep_alive: str | None = None, role: str = "writer") -> str:
         """Run the model to completion without showing the text (critic, rewrite, tool loop)."""
-        client, plan = plan_pair or await self._plan()
+        client, plan = plan_pair or await self._plan(role=role)
         text = ""
         async for delta in client.stream_chat(
             model or plan.model, messages, options=plan.options, think=plan.think, keep_alive=keep_alive or plan.keep_alive
@@ -369,7 +374,7 @@ class AgentRuntime:
 
             self._research_fn = _research
         on_status("Planning the search…")
-        rplan: ResearchPlan = await make_plan(self._collect, q, self.history.messages())
+        rplan: ResearchPlan = await make_plan(lambda msgs: self._collect(msgs, role="planner"), q, self.history.messages())
         logger.info("Prompt engineer: %r -> question=%r queries=%s", q, rplan.question, rplan.queries)
         try:
             takes_queries = "queries" in inspect.signature(self._research_fn).parameters
@@ -391,7 +396,7 @@ class AgentRuntime:
             text = await self._stream(msgs, on_text)
             return TurnResult(text=text, kind="chat")
 
-        plan_pair = await self._plan()
+        plan_pair = await self._plan(role="reader" if deep else "writer")
         client, plan = plan_pair
         on_status("Writing it up…")
         msgs = build_research_messages(rplan.question, found.prompt_block(), self.history, **self._persona_kwargs(q))
@@ -399,12 +404,14 @@ class AgentRuntime:
         self._check_abort()
 
         on_status("Checking the facts…")
-        ver = await verify_answer(draft, found.sources, VerifierLLM(client, plan.model, plan.options))
+        installed_for_ver = await client.installed_models()
+        verifier_model, _ = pick_judge_model(installed_for_ver, plan.model) if installed_for_ver else (plan.model, False)
+        ver = await verify_answer(draft, found.sources, VerifierLLM(client, verifier_model, plan.options))
         meta: dict[str, Any] = {"checked": ver.for_ui()}
         text = draft
 
         async def verify_fn(t: str):
-            return await verify_answer(t, found.sources, VerifierLLM(client, plan.model, plan.options))
+            return await verify_answer(t, found.sources, VerifierLLM(client, verifier_model, plan.options))
 
         async def rewrite_fn(current: str, feedback: str) -> str:
             return await self._collect(build_revise_messages(rplan.question, found.prompt_block(), current, feedback), plan_pair)
@@ -467,6 +474,76 @@ class AgentRuntime:
             first = split_complete(strip_footnote(text) + " ")[0][:2]
             spoken = " ".join(first) or None
         return TurnResult(text=text, sources=sources_ui, kind="research", meta=meta, spoken=spoken)
+
+    async def run_rsi_outer_loop(
+        self,
+        question: str,
+        sources: list[Source],
+        max_iters: int = 3,
+    ) -> dict[str, Any]:
+        """Run the formal Phase 10 RSIEngine (PromptGenome evolution + rollback) over retrieved sources."""
+        import tempfile
+        from lora.outer_loop.genome import EditValidator, GenomeRegistry, PromptGenome, TemplateCompiler
+        from lora.outer_loop.loop import RSIEngine
+        from lora.outer_loop.optimizer import PromptOptimizerAgent
+        from lora.outer_loop.scorer import OuterLoopScorer
+
+        client, plan = await self._plan(role="writer")
+        installed = await client.installed_models()
+        verifier_model, _ = pick_judge_model(installed, plan.model) if installed else (plan.model, False)
+        cards = [{"source_title": s.title, "snippet": (s.text or s.snippet)[:400]} for s in sources]
+
+        base_genome = PromptGenome(
+            system_prompt_base="You are L.O.R.A, a grounded research assistant.",
+            refinement_rules=["Assert only claims directly grounded in evidence.", "Cite sources inline as [S1]."],
+            writer_style="concise_academic",
+            version=0,
+        )
+        registry = GenomeRegistry(Path(tempfile.gettempdir()) / "lora_rsi_genomes.db")
+        engine = RSIEngine(
+            registry=registry,
+            compiler=TemplateCompiler(),
+            optimizer=PromptOptimizerAgent(edit_validator=EditValidator()),
+            scorer=OuterLoopScorer(),
+            max_iters=max_iters,
+        )
+        loop = asyncio.get_running_loop()
+
+        def synth_sync(compiled_prompt: str) -> str:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._collect([{"role": "user", "content": compiled_prompt}], (client, plan)),
+                loop,
+            )
+            return fut.result(timeout=60.0)
+
+        def verify_sync(ans: str) -> dict[str, Any]:
+            fut = asyncio.run_coroutine_threadsafe(
+                verify_answer(ans, sources, VerifierLLM(client, verifier_model, plan.options)),
+                loop,
+            )
+            v = fut.result(timeout=60.0)
+            return {
+                "composite_faithfulness_score": v.score,
+                "supported_claims_ratio": (v.supported / v.total) if v.total else 0.0,
+                "unverified_critical_claims": v.unverified,
+            }
+
+        traj = await asyncio.to_thread(
+            engine.run,
+            base_genome,
+            question,
+            cards,
+            synth_sync,
+            verify_sync,
+        )
+        return {
+            "best_answer": traj.best_answer,
+            "best_score": traj.best_score,
+            "baseline_score": traj.baseline_score,
+            "net_improvement": traj.net_improvement,
+            "iterations_run": traj.iterations_run,
+            "genome_version": traj.best_genome.version,
+        }
 
     # -------------------------------------------------------------- commands
     def _get_registry(self) -> Any:

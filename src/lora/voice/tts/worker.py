@@ -63,8 +63,10 @@ def _windows_speech_synth(text: str, voice: str = "vivian") -> tuple[np.ndarray,
     import wave
     from pathlib import Path
 
-    clean = text.replace('"', '""').replace("`", "").replace("'", "")
-    if not clean.strip():
+    import re as _re
+
+    clean = _re.sub(r'[\r\n"`\'$]+', " ", text).strip()
+    if not clean:
         return None
 
     # Map voice names to installed Windows desktop voices
@@ -141,8 +143,8 @@ def candidate_model_dirs(models_dir: str) -> list[Path]:
 
 
 def _need_gb(p: Path) -> float:
-    """VRAM a bf16 Qwen3-TTS folder needs: the weights, a little overhead, plus working memory."""
-    return _weights_gb(p) * 1.1 + 0.6
+    """VRAM a bf16 Qwen3-TTS folder needs: the weights plus minimal working memory."""
+    return _weights_gb(p) * 1.02 + 0.25
 
 
 def pick_model_dir(candidates: list[Path], free_gb: float | None) -> Path | None:

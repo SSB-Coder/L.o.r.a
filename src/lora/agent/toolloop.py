@@ -158,7 +158,7 @@ class ToolLoop:
         msgs = [{"role": "system", "content": prompt}, *history[-4:], {"role": "user", "content": question}]
         tainted = False
         for _ in range(self.max_steps):
-            raw = await self.rt._collect(msgs)
+            raw = await self.rt._collect(msgs, role="controller")
             action = parse_action(raw)
             if action is None:
                 return raw.strip()

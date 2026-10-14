@@ -16,7 +16,7 @@ from lora.agent.research import Source
 from lora.dialogue import strip_think
 from lora.grounding.cards import EvidenceCard
 
-if os.environ.get("LORA_VERIFY_NLI") != "1":
+if os.environ.get("LORA_VERIFY_NLI") == "0":
     os.environ.setdefault("LORA_VERIFY_OFFLINE", "1")
 
 
@@ -28,6 +28,7 @@ class Verification:
     total: int
     unverified: list[str] = field(default_factory=list)
     claims: list[dict[str, Any]] = field(default_factory=list)
+    repaired_answer: str = ""
 
     @property
     def clean(self) -> bool:
@@ -59,7 +60,7 @@ class VerifierLLM:
     Past the budget it raises, and the pipeline falls back to its word-overlap check.
     """
 
-    def __init__(self, client: Any, model: str, options: dict[str, Any] | None = None, max_calls: int = 4) -> None:
+    def __init__(self, client: Any, model: str, options: dict[str, Any] | None = None, max_calls: int = 12) -> None:
         self.client, self.model, self.options = client, model, options or {}
         self.max_calls, self.calls = max_calls, 0
 
@@ -95,4 +96,5 @@ async def verify_answer(answer: str, sources: list[Source], llm: VerifierLLM | N
         total=len(details),
         unverified=list(report.unverified_claims),
         claims=claims,
+        repaired_answer=str(report.repaired_answer or ""),
     )

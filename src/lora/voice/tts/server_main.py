@@ -53,7 +53,7 @@ def weights_gb(p: Path) -> float:
 
 
 def need_gb(p: Path) -> float:
-    return weights_gb(p) * 1.1 + 0.6
+    return weights_gb(p) * 1.02 + 0.25
 
 
 def candidate_dirs(models_dir: str) -> list[Path]:

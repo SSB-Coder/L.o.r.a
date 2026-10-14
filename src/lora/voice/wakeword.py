@@ -127,21 +127,25 @@ class WakeWordDetector:
         self.transcriber = transcriber
         self._oww_model: Any = None
 
-        if model_path:
+        resolved_model = model_path
+        if resolved_model is None and Path("models/voice/hey_lora.onnx").is_file():
+            resolved_model = "models/voice/hey_lora.onnx"
+        if resolved_model:
             try:
                 from openwakeword.model import Model
-                self._oww_model = Model(wakeword_models=[model_path])
+                self._oww_model = Model(wakeword_models=[resolved_model])
             except Exception:
                 self._oww_model = None
 
     SLEEP_KEYWORDS = (
-        "awaken lora", "awaken laura", "awaken lola", "awaken",
-        "wake up lora", "wake up laura", "wake up", "wake lora",
+        "awaken lora", "awaken laura", "awaken lola", "awaken lara", "awaken nora", "awaken",
+        "wake up lora", "wake up laura", "wake up lola", "wake up", "wake lora", "wake laura",
     )
     IDLE_KEYWORDS = (
-        "hey lora", "hey laura", "hi lora", "hi laura",
-        "hello lora", "hello laura", "awaken lora", "awaken laura",
-        "ok lora", "lora", "laura",
+        "hey lora", "hey laura", "hey lola", "hey lara", "hey nora", "hey dora",
+        "hi lora", "hi laura", "hi lola", "hello lora", "hello laura",
+        "awaken lora", "awaken laura", "ok lora", "okay lora", "ok laura", "okay laura",
+        "lora", "laura",
     )
 
     def match_text(self, text: str, is_sleeping: bool) -> tuple[bool, str]:

@@ -61,7 +61,7 @@ class RSIEngine:
         self.max_iters = min(max_iters, hard_cap)
 
     def _extract_citations(self, text: str) -> list[str]:
-        return re.findall(r"\[\d+\]", text)
+        return re.findall(r"\[(?:S?\d+)[^\]]*\]", text)
 
     def run(
         self,

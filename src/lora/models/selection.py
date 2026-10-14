@@ -82,12 +82,13 @@ def candidate_names(user_default: str | None, role_cfg: dict[str, Any], role: st
     return names
 
 
-def build_options(role_cfg: dict[str, Any]) -> tuple[dict[str, Any], bool | str | None]:
+def build_options(role_cfg: dict[str, Any], role: str = "writer") -> tuple[dict[str, Any], bool | str | None]:
     options: dict[str, Any] = {}
     if "temperature" in role_cfg:
         options["temperature"] = float(role_cfg["temperature"])
     num_ctx = int(role_cfg.get("num_ctx") or 4096)
-    options["num_ctx"] = min(num_ctx, MAX_INTERACTIVE_CTX)
+    ctx_cap = 32768 if role == "reader" else MAX_INTERACTIVE_CTX
+    options["num_ctx"] = min(num_ctx, ctx_cap)
     think = role_cfg.get("think", False)
     if isinstance(think, bool) or isinstance(think, str):
         return options, think
@@ -121,7 +122,7 @@ async def plan_chat(
     model, configured = choose_model(candidate_names(user_default, role_cfg, role), installed)
     if model is None:
         return None
-    options, think = build_options(role_cfg)
+    options, think = build_options(role_cfg, role=role)
     note = "" if configured else "No configured model is installed; using the first available one."
     if note:
         logger.warning("%s (%s)", note, model)

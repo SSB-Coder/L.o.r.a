@@ -260,9 +260,20 @@ class MediaVectorDB:
             target_id = file_id_or_path
             target_meta = self._files[target_id]
         else:
-            clean_str = str(Path(file_id_or_path).resolve())
+            raw_norm = file_id_or_path.strip().lower()
+            try:
+                clean_str = str(Path(file_id_or_path).resolve()).lower()
+            except Exception:
+                clean_str = raw_norm
             for fid, meta in self._files.items():
-                if str(Path(meta["path"]).resolve()) == clean_str or meta["filename"] == file_id_or_path:
+                meta_path_low = str(Path(meta["path"]).resolve()).lower()
+                meta_name_low = str(meta["filename"]).lower()
+                if (
+                    fid.lower() == raw_norm
+                    or meta_path_low == clean_str
+                    or meta_name_low == raw_norm
+                    or Path(meta["path"]).name.lower() == raw_norm
+                ):
                     target_id = fid
                     target_meta = meta
                     break
@@ -293,6 +304,12 @@ class MediaVectorDB:
                 self._index.add(embeddings)
         else:
             self._index = None
+
+        if (self.storage_dir / "metadata.json").exists():
+            try:
+                self.save_db(self.storage_dir)
+            except Exception as e:
+                logger.warning("Could not persist MediaVectorDB after removal: %s", e)
 
         logger.info("Removed '%s' from vector DB. Remaining files: %d", filename, len(self._files))
         return {

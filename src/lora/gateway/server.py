@@ -51,6 +51,7 @@ def create_gateway_app(
     notebook_store: NotebookStore | None = None,
     connection_manager: ConnectionManager | None = None,
     static_dir: str | Path | None = None,
+    media_db: MediaVectorDB | None = None,
 ) -> FastAPI:
     """Create and configure FastAPI application for the specified listener origin."""
     queue = queue or JobQueue()
@@ -84,7 +85,7 @@ def create_gateway_app(
             return JSONResponse({"detail": "Cross-site requests are not allowed."}, status_code=403)
         return await call_next(request)
 
-    media_db = MediaVectorDB()
+    media_db = media_db or MediaVectorDB()
 
     @app.get("/api/hud/status")
     async def get_hud_status():

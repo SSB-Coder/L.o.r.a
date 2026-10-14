@@ -52,7 +52,7 @@ class ModelsConfig(BaseModel):
 class VoiceConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    tts_voice: str = "preset_female"
+    tts_voice: str = "vivian"
     wake_phrase: str = "Awaken LORA"
     vad_level: int = 2
     sound_effects_enabled: bool = True
@@ -154,6 +154,26 @@ class ConfigManager:
                 DEFAULT_USER_PROFILE_MD, encoding="utf-8"
             )
 
+        # Seed default starter skills if skills_dir is empty
+        default_skill_dir = self._paths.skills_dir / "deep_research_brief"
+        default_skill_yaml = default_skill_dir / "skill.yaml"
+        if not any(self._paths.skills_dir.iterdir()):
+            default_skill_dir.mkdir(parents=True, exist_ok=True)
+            default_skill_yaml.write_text(
+                yaml.dump(
+                    {
+                        "name": "deep_research_brief",
+                        "description": "Multi-source verified research briefing with executive summary",
+                        "triggers": ["research brief", "executive briefing", "deep briefing"],
+                        "required_tools": ["web_search", "fetch_page"],
+                        "system_prompt_addon": "Start with a 2-sentence executive summary, then list verified findings with inline [S1] citations.",
+                        "default_depth": "deep_with_refinement",
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+
         if apply_acls and sys.platform == "win32":
             self.apply_ntfs_acls()
 
@@ -193,7 +213,7 @@ class ConfigManager:
             )
             return True
 
-        username = os.environ.get("USERNAME")
+        username = os.environ.get("USERNAME") or os.environ.get("USER")
         if not username:
             logger.warning(
                 "USERNAME environment variable not found; skipping icacls."

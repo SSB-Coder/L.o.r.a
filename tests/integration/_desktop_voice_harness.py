@@ -10,6 +10,7 @@ sys.modules["sounddevice"] = MagicMock()  # sandbox has no PortAudio; importing 
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ["LORA_RETRY_DELAY"] = "0"
+os.environ["LORA_TTS_FAKE"] = "1"
 sys.path.insert(0, os.environ["LORA_SRC"])
 mode = sys.argv[1]  # voice | nomic
 

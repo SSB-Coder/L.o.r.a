@@ -6,8 +6,13 @@ import difflib
 import re
 from typing import Any
 
-_SOUNDS_LIKE = (("vscore", "vscode"), ("vscored", "vscode"), ("viscode", "vscode"), ("visualstudiocore", "visualstudiocode"),
-                ("notepat", "notepad"), ("crom", "chrome"), ("chrom", "chrome"), ("spotifye", "spotify"))
+_SOUNDS_LIKE = (
+    ("vscore", "vscode"), ("vscored", "vscode"), ("viscode", "vscode"), ("visualstudiocore", "visualstudiocode"),
+    ("notepat", "notepad"), ("crom", "chrome"), ("chrom", "chrome"), ("spotifye", "spotify"),
+    ("ituponepid", "wikipedia"), ("uponepid", "wikipedia"), ("onepid", "wikipedia"),
+    ("wickipedia", "wikipedia"), ("wikepedia", "wikipedia"), ("wikiped", "wikipedia"),
+    ("perplexitys", "perplexity"), ("chatgbt", "chatgpt"), ("calclator", "calculator"),
+)
 
 
 def squash(text: str) -> str:

@@ -66,7 +66,7 @@ def init_platform(base_dir: Path | None = None) -> tuple[ConfigManager, LoraUser
     return cfg_mgr, user_cfg
 
 
-def start_gateway_thread(host: str, port: int, queue=None, origin: str = "desktop", token_validator=None) -> uvicorn.Server | None:
+def start_gateway_thread(host: str, port: int, queue=None, origin: str = "desktop", token_validator=None, media_db=None) -> uvicorn.Server | None:
     """Launches the FastAPI Gateway inside a dedicated background thread."""
     import socket
 
@@ -75,7 +75,7 @@ def start_gateway_thread(host: str, port: int, queue=None, origin: str = "deskto
             logger.info("Gateway daemon already active at http://%s:%d", host, port)
             return None
 
-    app = create_gateway_app(origin=origin, queue=queue, token_validator=token_validator)
+    app = create_gateway_app(origin=origin, queue=queue, token_validator=token_validator, media_db=media_db)
     config = uvicorn.Config(
         app=app,
         host=host,
@@ -326,6 +326,7 @@ def run_desktop_app(
         return await asyncio.to_thread(_confirm_blocking, text)
 
     runtime.confirm = _confirm
+    hud.media_updated.connect(runtime.on_sources_changed)
 
     def on_query_submitted(query: str, depth: str = "") -> None:
         """Runs on the GUI thread. Starts one assistant turn in the background."""
@@ -450,9 +451,10 @@ def run_desktop_app(
             wakeword = WakeWordDetector(
                 wake_phrase="Awaken LORA",
                 chat_phrase="Hey LORA",
+                model_path="models/voice/hey_lora.onnx" if Path("models/voice/hey_lora.onnx").is_file() else None,
                 transcriber=transcriber,
             )
-            vad_threshold = float(os.environ.get("LORA_VAD_THRESHOLD", "0.35"))
+            vad_threshold = float(os.environ.get("LORA_VAD_THRESHOLD", "0.22"))
             vad = VoiceActivityDetector(
                 sample_rate=16000,
                 threshold=vad_threshold,
@@ -594,7 +596,7 @@ def run_desktop_app(
                 vad_state, _prob = vad.process_chunk(chunk)
                 if vad_state == SpeechState.ENDED:
                     utterance = vad.get_and_reset_utterance()
-                    if len(utterance) >= 4800:
+                    if len(utterance) >= 3200:
                         _process_utterance_async(utterance)
 
             capture.register_chunk_callback(_on_mic_chunk)
@@ -603,7 +605,7 @@ def run_desktop_app(
                 logger.warning("Microphone is not running: %s", capture.status_text())
 
             def _on_ptt_down() -> None:
-                if hud._current_voice_state in ("thinking", "think", "verify", "sleep", "sleeping") or is_transcribing.is_set():
+                if hud._current_voice_state in ("thinking", "think", "verify", "sleep", "sleeping"):
                     return
                 armed_until[0] = 0.0
                 is_ptt_active.set()
@@ -686,7 +688,7 @@ def run_desktop_app(
     from lora.gateway.queue import JobQueue
 
     job_queue = JobQueue()
-    gateway_server = start_gateway_thread(host=args.host, port=args.port, queue=job_queue)
+    gateway_server = start_gateway_thread(host=args.host, port=args.port, queue=job_queue, media_db=media_db)
 
     def _make_job_runtime(origin: str) -> AgentRuntime:
         # Phone jobs may chat and research, never open apps/files or type; desktop-origin jobs keep full tools.

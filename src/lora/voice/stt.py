@@ -23,7 +23,9 @@ class FasterWhisperTranscriber:
     """Low-latency CPU transcription using faster-whisper (CTranslate2)."""
 
     DEFAULT_VOCABULARY_PROMPT = (
-        "LORA, Awaken LORA, open VS Code, open Chrome, open Notepad, open Spotify, YouTube, Downloads, Documents, Desktop, arXiv, RAG, Ollama, Python, GitHub, Hugging Face"
+        "Hey LORA, Awaken LORA, open Wikipedia, open VS Code, open Chrome, open Notepad, "
+        "open Spotify, open Calculator, open YouTube, open ChatGPT, open Claude, open Gemini, "
+        "open Perplexity, Downloads, Documents, Desktop, arXiv, RAG, Ollama, Python, GitHub, Hugging Face"
     )
 
     def __init__(
@@ -70,17 +72,16 @@ class FasterWhisperTranscriber:
         duration = len(audio) / sample_rate
         start_time = time.monotonic()
 
-        # Normalize audio amplitude if audio is quiet
+        # Normalize moderate speech without amplifying quiet ambient room noise
         peak = float(np.max(np.abs(audio))) if len(audio) > 0 else 0.0
-        norm_audio = (audio / peak * 0.95) if peak > 0.01 else audio
+        norm_audio = (audio / peak * 0.90) if 0.025 < peak < 0.60 else audio
 
         model = self._ensure_model_loaded()
 
-        # faster-whisper accepts float32 numpy arrays directly
-        # vad_filter is False because incoming audio is already gated by our VAD or PTT
+        # Use beam_size=5 to prevent greedy phonetic hallucinations ("open wikipedia" -> "open it up one pid")
         segments, info = model.transcribe(
             norm_audio.astype(np.float32),
-            beam_size=1,
+            beam_size=5,
             initial_prompt=self.initial_prompt,
             vad_filter=False,
             language="en",

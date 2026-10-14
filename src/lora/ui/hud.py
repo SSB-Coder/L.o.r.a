@@ -223,6 +223,7 @@ class LoraDesktopHUD(QMainWindow):
                     lambda res: (f"Removed {res.get('filename', 'the file')}.", True),
                     "Removing…",
                 )
+                self.media_updated.emit()
         elif action == "on_browse_media":
             # Open the chooser after this bridge call returns: a modal dialog inside the web-channel
             # callback can deadlock the page.
