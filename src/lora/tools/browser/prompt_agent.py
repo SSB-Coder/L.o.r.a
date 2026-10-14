@@ -116,7 +116,13 @@ class PromptOptimizerAgent:
         lower = prompt.lower()
         if any(w in lower for w in ["write code", "implement", "script", "function", "class", "bug", "traceback"]):
             return PromptStyle.CODE
-        if any(w in lower for w in ["research", "literature", "paper", "architecture", "mechanism", "state of the art"]):
+        if any(
+            w in lower
+            for w in [
+                "research", "literature", "paper", "architecture", "mechanism", "state of the art",
+                "in depth", "in-depth", "deep", "thorough", "detailed", "comprehensive",
+            ]
+        ):
             return PromptStyle.RESEARCH
         if any(w in lower for w in ["verify", "is it true", "fact check", "controversy", "claim", "debunk"]):
             return PromptStyle.FACT_CHECK
@@ -232,23 +238,27 @@ class PromptOptimizerAgent:
         # 2. Privacy Scrubbing
         scrubbed_text, redactions = self.scrubber.scrub(prompt.strip())
 
-        # 3. LLM Refinement Tier (optional deep optimization)
+        # 3. LLM Refinement Tier (deep prompt engineering via local LLM)
         if deep and self.ollama_client is not None:
             try:
+                from lora.dialogue import strip_think
+
                 meta_system = (
-                    f"You are a prompt engineering specialist optimizing prompts for {target_ai}. "
-                    "Rewrite the user query into an expert-level, highly specific prompt. "
-                    "Do NOT answer the question. Output ONLY the rewritten prompt without preamble."
+                    f"You are an expert prompt engineer writing a high-leverage prompt to send to {target_ai}. "
+                    "Transform the user's request into a clear, specific, well-structured prompt that honors all of "
+                    "the user's constraints (such as depth, tone, examples, or focus areas) without adding unwanted "
+                    "formatting gimmicks. Do NOT answer the question yourself. Output ONLY the engineered prompt text."
                 )
-                refined = await self.ollama_client.generate(
-                    prompt=f"Task query to optimize for {style_enum.value} style:\n{scrubbed_text}",
+                raw_refined = await self.ollama_client.generate(
+                    prompt=f"User request to turn into a prompt ({style_enum.value} mode):\n{scrubbed_text}",
                     system=meta_system,
                     temperature=0.2,
                 )
-                if refined and len(refined.strip()) > 10:
+                refined = strip_think(str(raw_refined or "")).strip().strip('"')
+                if refined and len(refined) > 10:
                     return OptimizedPrompt(
                         original_prompt=prompt,
-                        optimized_prompt=refined.strip(),
+                        optimized_prompt=refined,
                         target_ai=target_ai,
                         style=style_enum,
                         redacted_count=len(redactions),

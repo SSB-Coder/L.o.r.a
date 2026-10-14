@@ -85,14 +85,35 @@ class TtsEngine:
             self.audio_playback_sink(samples, sample_rate)
             return
 
+        duration = len(samples) / sample_rate
+        played_with_sd = False
         try:
             import sounddevice as sd
             sd.play(samples, samplerate=sample_rate)
-            # Check for interrupt during playback
-            duration = len(samples) / sample_rate
+            played_with_sd = True
             self._interrupt_event.wait(timeout=duration)
             if self._interrupt_event.is_set():
                 sd.stop()
         except Exception:
-            # Headless or test environment without audio hardware
-            pass
+            if not played_with_sd:
+                try:
+                    import io
+                    import sys
+                    import wave
+
+                    if sys.platform == "win32":
+                        import winsound
+
+                        pcm16 = (np.clip(samples, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+                        buf = io.BytesIO()
+                        with wave.open(buf, "wb") as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(2)
+                            wf.setframerate(sample_rate)
+                            wf.writeframes(pcm16)
+                        winsound.PlaySound(buf.getvalue(), winsound.SND_MEMORY | winsound.SND_ASYNC)
+                        self._interrupt_event.wait(timeout=duration)
+                        if self._interrupt_event.is_set():
+                            winsound.PlaySound(None, winsound.SND_PURGE)
+                except Exception:
+                    pass

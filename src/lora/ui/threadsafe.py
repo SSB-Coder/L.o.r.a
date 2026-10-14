@@ -36,4 +36,8 @@ class UiDispatcher(QObject):
 
     def post(self, fn: Callable[[], Any]) -> None:
         """Safe to call from any thread. ``fn`` runs later on the GUI thread."""
-        self._call.emit(fn)
+        try:
+            self._call.emit(fn)
+        except RuntimeError:
+            # Qt Signal source already deleted during application shutdown
+            pass

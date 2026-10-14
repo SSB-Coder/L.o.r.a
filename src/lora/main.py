@@ -212,26 +212,62 @@ def run_desktop_app(
         return tts_engine.worker.synthesize(sentence, voice=active_voice[0])
 
     def play_chunk(chunk, stop_event: threading.Event) -> None:
+        import io
+        import wave
         import numpy as np
-        import sounddevice as sd
 
         samples, sample_rate = chunk.samples, chunk.sample_rate
-        if len(samples) == 0 or stop_event.is_set():
+        if len(samples) == 0 or stop_event.is_set() or is_exiting.is_set():
             return
         duration = len(samples) / sample_rate
-        sd.play(samples, samplerate=sample_rate)
+        used_winsound = False
+        try:
+            import sounddevice as sd
+
+            sd.play(samples, samplerate=sample_rate)
+        except Exception:
+            if sys.platform == "win32":
+                import winsound
+
+                pcm16 = (np.clip(samples, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+                buf = io.BytesIO()
+                with wave.open(buf, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(sample_rate)
+                    wf.writeframes(pcm16)
+                winsound.PlaySound(buf.getvalue(), winsound.SND_MEMORY | winsound.SND_ASYNC)
+                used_winsound = True
+            else:
+                raise
+
         num_steps = max(1, int(duration * 25))
         slice_size = max(1, len(samples) // num_steps)
         for step_idx in range(num_steps):
-            if stop_event.is_set():
-                sd.stop()
+            if stop_event.is_set() or is_exiting.is_set():
+                if used_winsound and sys.platform == "win32":
+                    import winsound
+
+                    winsound.PlaySound(None, winsound.SND_PURGE)
+                else:
+                    try:
+                        import sounddevice as sd
+
+                        sd.stop()
+                    except Exception:
+                        pass
                 return
             step = samples[step_idx * slice_size : (step_idx + 1) * slice_size]
             rms = float(np.sqrt(np.mean(step**2))) if len(step) else 0.0
             ui.post(lambda lvl=min(1.0, rms * 8.0): hud.set_audio_level(lvl))  # level only: no per-step pulses
             time.sleep(duration / num_steps)
-        if not stop_event.is_set():
-            sd.wait()
+        if not stop_event.is_set() and not is_exiting.is_set() and not used_winsound:
+            try:
+                import sounddevice as sd
+
+                sd.wait()
+            except Exception:
+                pass
 
     def make_streamer(turn_done: threading.Event):
         """A SpeechStreamer for one turn, or None when audio/voice is off."""
@@ -325,7 +361,15 @@ def run_desktop_app(
     async def _confirm(text: str) -> bool:
         return await asyncio.to_thread(_confirm_blocking, text)
 
+    # Persistent background asyncio event loop so Playwright & HTTP transports never die between turns
+    bg_loop = asyncio.new_event_loop()
+    threading.Thread(target=bg_loop.run_forever, daemon=True, name="lora-async-loop").start()
+
+    def _run_coro(coro):
+        return asyncio.run_coroutine_threadsafe(coro, bg_loop).result()
+
     runtime.confirm = _confirm
+    runtime.on_sources = lambda srcs: ui.post(lambda s=srcs: hud.set_sources(s))
     hud.media_updated.connect(runtime.on_sources_changed)
 
     def on_query_submitted(query: str, depth: str = "") -> None:
@@ -334,6 +378,21 @@ def run_desktop_app(
         if not query:
             return
         if inflight.is_set():
+            # Allow instant desktop launch/open commands to run immediately without waiting for slow LLM turns
+            from lora.agent.commands import parse_command
+
+            fast_cmd = parse_command(query)
+            if fast_cmd is not None and fast_cmd.kind in ("open", "google", "site_search", "list_dir"):
+                def _fast_worker() -> None:
+                    try:
+                        res = _run_coro(runtime._run_command(fast_cmd, query, lambda _s: None, lambda _t, _sp=True: None))
+                        if res and res.text:
+                            ui.post(lambda t=res.text: hud.append_message("L.O.R.A", t))
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_fast_worker, daemon=True).start()
+                return
             logger.info("Ignoring query while another is still running: %r", query)
             return
         inflight.set()
@@ -364,7 +423,7 @@ def run_desktop_app(
                     streamer.feed(full)
 
             try:
-                result = asyncio.run(runtime.run_turn(query, on_status, on_text))
+                result = _run_coro(runtime.run_turn(query, on_status, on_text))
             except Exception as exc:  # never leave the UI waiting
                 logger.exception("Turn crashed")
                 result = TurnResult(text="Something went wrong on my side. Try again in a moment.", kind="error", failure=str(exc))
@@ -433,7 +492,7 @@ def run_desktop_app(
             logger.info("Model %s %s", plan.model, "is loaded and ready" if ready else "warm-up failed")
 
         try:
-            asyncio.run(_go())
+            _run_coro(_go())
         except Exception as exc:
             logger.warning("Model warm-up failed: %s", exc)
 
@@ -465,6 +524,7 @@ def run_desktop_app(
             is_transcribing = threading.Event()
             is_ptt_active = threading.Event()
             ptt_start_time = [0.0]
+            ptt_chunks: list[np.ndarray] = []
             armed_until = [0.0]  # after "Hey LORA" alone, the next utterance is the query
             ARM_SECONDS = 10.0
             stt_error_shown = [False]
@@ -591,6 +651,7 @@ def run_desktop_app(
                     return
 
                 if is_ptt_active.is_set():
+                    ptt_chunks.append(chunk.copy())
                     return
 
                 vad_state, _prob = vad.process_chunk(chunk)
@@ -607,7 +668,10 @@ def run_desktop_app(
             def _on_ptt_down() -> None:
                 if hud._current_voice_state in ("thinking", "think", "verify", "sleep", "sleeping"):
                     return
+                if is_ptt_active.is_set():
+                    return  # Ignore duplicate PTT press events while already holding
                 armed_until[0] = 0.0
+                ptt_chunks.clear()
                 is_ptt_active.set()
                 ptt_start_time[0] = time.monotonic()
                 stop_current_speech(update_ui=False)
@@ -631,9 +695,14 @@ def run_desktop_app(
                         hud.set_voice_state("idle"),
                     ))
                 elif dur >= 0.25:
-                    audio_samples = capture.buffer.read_last_n_seconds(min(15.0, dur + 0.3))
+                    if ptt_chunks:
+                        audio_samples = np.concatenate(ptt_chunks)
+                        ptt_chunks.clear()
+                    else:
+                        audio_samples = capture.buffer.read_last_n_seconds(min(15.0, dur + 0.3))
                     _trigger_transcription(audio_samples)
                 else:
+                    ptt_chunks.clear()
                     ui.post(lambda: hud.set_voice_state("idle"))
 
             hud.ptt_pressed.connect(_on_ptt_down)
@@ -734,7 +803,8 @@ def run_desktop_app(
     hud.show()
     tray.show()
     audio.play_cue(SoundCue.WAKE)
-    threading.Thread(target=_warm_up_model, daemon=True).start()
+    # Defer background model & MCP warm-up slightly so the HUD WebGL window opens smoothly without GIL stutter
+    QTimer.singleShot(400, lambda: threading.Thread(target=_warm_up_model, daemon=True).start())
     logger.info("L.O.R.A Desktop Platform initialized successfully.")
 
     exit_code = app.exec()
@@ -742,6 +812,15 @@ def run_desktop_app(
     # Clean shutdown
     on_exit()
     job_worker.stop()
+    if runtime._registry is not None:
+        try:
+            _run_coro(runtime._registry.browser_driver.close())
+        except Exception:
+            pass
+    try:
+        bg_loop.call_soon_threadsafe(bg_loop.stop)
+    except Exception:
+        pass
     if tts_engine is not None:
         try:
             tts_engine.worker.shutdown()

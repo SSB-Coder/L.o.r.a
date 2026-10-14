@@ -283,16 +283,18 @@ class AgentRuntime:
     async def _collect(self, messages: list[dict[str, str]], plan_pair: Any = None, model: str | None = None, keep_alive: str | None = None, role: str = "writer") -> str:
         """Run the model to completion without showing the text (critic, rewrite, tool loop)."""
         client, plan = plan_pair or await self._plan(role=role)
+        chosen = model or plan.model
+        logger.info("Model (%s): %s (options=%s think=%s)", role, chosen, plan.options, plan.think)
         text = ""
         async for delta in client.stream_chat(
-            model or plan.model, messages, options=plan.options, think=plan.think, keep_alive=keep_alive or plan.keep_alive
+            chosen, messages, options=plan.options, think=plan.think, keep_alive=keep_alive or plan.keep_alive
         ):
             text += delta
         return strip_think(text)
 
-    async def _stream(self, messages: list[dict[str, str]], on_text: TextCb, speak: bool = True, plan_pair: Any = None) -> str:
-        client, plan = plan_pair or await self._plan()
-        logger.info("Model: %s (options=%s think=%s)", plan.model, plan.options, plan.think)
+    async def _stream(self, messages: list[dict[str, str]], on_text: TextCb, speak: bool = True, plan_pair: Any = None, role: str = "writer") -> str:
+        client, plan = plan_pair or await self._plan(role=role)
+        logger.info("Model (%s): %s (options=%s think=%s)", role, plan.model, plan.options, plan.think)
         answer = ""
         for attempt in range(2):
             try:
@@ -335,14 +337,17 @@ class AgentRuntime:
 
     # ------------------------------------------------------------------ chat
     async def _run_chat(self, q: str, on_text: TextCb) -> TurnResult:
+        from lora.models.selection import is_complex_query
+
+        role = "complex" if is_complex_query(q) else "writer"
         mine = await self._user_sources(q)
         if mine:
             block = "\n\n".join(f"[{s.id}] {s.title}\n{s.text}" for s in mine)
             msgs = build_research_messages(q, block, self.history, **self._persona_kwargs(q))
-            text = await self._stream(msgs, on_text)
+            text = await self._stream(msgs, on_text, role=role)
             return TurnResult(text=text, sources=[{"id": s.id, "title": s.title, "url": "", "domain": "your files"} for s in mine], kind="chat")
         msgs = build_messages(q, self.history, self._profile_fn(), **self._persona_kwargs(q))
-        text = await self._stream(msgs, on_text)
+        text = await self._stream(msgs, on_text, role=role)
         return TurnResult(text=text, kind="chat")
 
     # -------------------------------------------------------------- research
@@ -373,8 +378,10 @@ class AgentRuntime:
             from lora.agent.research import research as _research
 
             self._research_fn = _research
+        # Use the writer/reader model for query planning to avoid an extra 20s VRAM swap before searching
+        plan_pair = await self._plan(role="reader" if deep else "writer")
         on_status("Planning the search…")
-        rplan: ResearchPlan = await make_plan(lambda msgs: self._collect(msgs, role="planner"), q, self.history.messages())
+        rplan: ResearchPlan = await make_plan(lambda msgs: self._collect(msgs, plan_pair=plan_pair, role="planner"), q, self.history.messages())
         logger.info("Prompt engineer: %r -> question=%r queries=%s", q, rplan.question, rplan.queries)
         try:
             takes_queries = "queries" in inspect.signature(self._research_fn).parameters
@@ -396,22 +403,36 @@ class AgentRuntime:
             text = await self._stream(msgs, on_text)
             return TurnResult(text=text, kind="chat")
 
-        plan_pair = await self._plan(role="reader" if deep else "writer")
         client, plan = plan_pair
+        sources_ui = [
+            {"id": s.id, "title": s.title, "url": s.url, "domain": s.domain or "your files"} for s in found.sources
+        ]
+        if hasattr(self, "on_sources") and callable(self.on_sources):
+            try:
+                self.on_sources(sources_ui)
+            except Exception:
+                pass
         on_status("Writing it up…")
         msgs = build_research_messages(rplan.question, found.prompt_block(), self.history, **self._persona_kwargs(q))
         draft = await self._stream(msgs, on_text, speak=not deep, plan_pair=plan_pair)
         self._check_abort()
 
         on_status("Checking the facts…")
-        installed_for_ver = await client.installed_models()
-        verifier_model, _ = pick_judge_model(installed_for_ver, plan.model) if installed_for_ver else (plan.model, False)
-        ver = await verify_answer(draft, found.sources, VerifierLLM(client, verifier_model, plan.options))
+        # Standard mode uses the already-loaded model (with max_calls=2) so it never stalls for 2 minutes swapping VRAM;
+        # Deep mode loads the independent cross-family judge model (granite4.2:8b).
+        if deep:
+            installed_for_ver = await client.installed_models()
+            verifier_model, _ = pick_judge_model(installed_for_ver, plan.model) if installed_for_ver else (plan.model, False)
+            ver_llm = VerifierLLM(client, verifier_model, plan.options, max_calls=6)
+        else:
+            verifier_model = plan.model
+            ver_llm = VerifierLLM(client, plan.model, plan.options, max_calls=2)
+        ver = await verify_answer(draft, found.sources, ver_llm)
         meta: dict[str, Any] = {"checked": ver.for_ui()}
         text = draft
 
         async def verify_fn(t: str):
-            return await verify_answer(t, found.sources, VerifierLLM(client, verifier_model, plan.options))
+            return await verify_answer(t, found.sources, VerifierLLM(client, verifier_model, plan.options, max_calls=4 if deep else 2))
 
         async def rewrite_fn(current: str, feedback: str) -> str:
             return await self._collect(build_revise_messages(rplan.question, found.prompt_block(), current, feedback), plan_pair)
@@ -832,15 +853,21 @@ class AgentRuntime:
     async def _do_ask_ai(self, cmd: Command, on_status: Callable[[str], None], on_text: TextCb) -> TurnResult:
         service = cmd.args["service"]
         pretty = {"chatgpt": "ChatGPT", "claude": "Claude", "gemini": "Gemini", "perplexity": "Perplexity"}[service]
-        on_status(f"Asking {pretty}…")
+        on_status(f"Engineering prompt for {pretty}…")
         reg = self._get_registry()
         try:
-            reg.browser_driver.headless = False  # visible window so you can log in once
+            reg.browser_driver.headless = False  # visible window so you can see the conversation
         except Exception:
             pass
         res = await self._tool(
             "ask_other_ai",
-            {"service": service, "prompt": cmd.args["prompt"], "optimize_prompt": True, "style": "general"},
+            {
+                "service": service,
+                "prompt": cmd.args["prompt"],
+                "optimize_prompt": True,
+                "style": "general",
+                "deep_optimize": True,
+            },
         )
         if res.get("status") != "success":
             detail = str(res.get("message") or res.get("reason") or "")
@@ -850,7 +877,8 @@ class AgentRuntime:
                 text = self._failure_text(res, f"reach {pretty}")
             on_text(text, True)
             return TurnResult(text=text, kind="command")
+        sent_prompt = str(res.get("prompt") or cmd.args["prompt"]).strip()
         reply = str(res.get("response") or "").strip() or "(No reply came back.)"
-        text = f"{pretty} replied (unverified):\n\n{reply}"
+        text = f"**Prompt sent to {pretty}:**\n> {sent_prompt}\n\n**{pretty} replied (unverified):**\n\n{reply}"
         on_text(text, False)
         return TurnResult(text=text, kind="command", spoken=f"{pretty} has replied. It's on screen.")

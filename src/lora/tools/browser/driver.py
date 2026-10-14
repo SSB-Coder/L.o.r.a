@@ -29,9 +29,46 @@ class PlaywrightBrowserDriver:
 
         self._playwright = None
         self._context: BrowserContext | None = None
+        self._loop = None
+
+    async def _reset_context(self) -> None:
+        """Safely discard broken or closed Playwright handles."""
+        ctx, pw = self._context, self._playwright
+        self._context = None
+        self._playwright = None
+        self._loop = None
+        if ctx is not None:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+        if pw is not None:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
 
     async def _ensure_context(self) -> BrowserContext:
-        """Initialize or reuse persistent browser context."""
+        """Initialize or reuse persistent browser context, recovering if loop or window closed."""
+        import asyncio
+
+        current_loop = asyncio.get_running_loop()
+        if self._context is not None:
+            if self._loop is not None and self._loop is not current_loop:
+                # Previous asyncio.run() loop was closed; transport pipe is dead
+                self._context = None
+                self._playwright = None
+                self._loop = None
+            else:
+                try:
+                    # Probe whether the browser context / pipe is still alive
+                    _ = self._context.pages
+                    br = getattr(self._context, "browser", None)
+                    if br is not None and hasattr(br, "is_connected") and not br.is_connected():
+                        await self._reset_context()
+                except Exception:
+                    await self._reset_context()
+
         if self._context is None:
             self._playwright = await async_playwright().start()
             self._context = await self._playwright.chromium.launch_persistent_context(
@@ -40,6 +77,7 @@ class PlaywrightBrowserDriver:
                 viewport={"width": 1280, "height": 800},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             )
+            self._loop = current_loop
         return self._context
 
     async def fetch_page(self, url: str) -> dict[str, Any]:
@@ -97,12 +135,7 @@ class PlaywrightBrowserDriver:
 
     async def close(self) -> None:
         """Close browser context and playwright instance."""
-        if self._context:
-            await self._context.close()
-            self._context = None
-        if self._playwright:
-            await self._playwright.stop()
-            self._playwright = None
+        await self._reset_context()
 
     async def __aenter__(self) -> "PlaywrightBrowserDriver":
         await self._ensure_context()

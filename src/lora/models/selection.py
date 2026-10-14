@@ -62,13 +62,35 @@ def load_role(role: str = "writer", config_path: Path | None = None) -> dict[str
     return role_cfg if isinstance(role_cfg, dict) else {}
 
 
+_COMPLEX_QUERY_RE = __import__("re").compile(
+    r"\b(in[- ]?depth|deep(?:ly)?|thorough(?:ly)?|detailed|comprehensive(?:ly)?|compare|contrast|"
+    r"architecture|mechanism|derive|derivation|prove|proof|algorithm|implement|debug|refactor|"
+    r"step[- ]by[- ]step|analyze|analysis|evaluate|trade[- ]?offs?)\b",
+    __import__("re").IGNORECASE,
+)
+
+
+def is_complex_query(query: str) -> bool:
+    """True when the user request warrants scaling up from the 4B writer to an 8B/9B or 32k model."""
+    q = (query or "").strip()
+    if len(q.split()) >= 18:
+        return True
+    return bool(_COMPLEX_QUERY_RE.search(q))
+
+
 def candidate_names(user_default: str | None, role_cfg: dict[str, Any], role: str = "writer") -> list[str]:
     names: list[str] = []
-    if role != "writer":  # planner / verifier / supervisor: that role's own model first, then the usual order
+    if role == "complex":
+        # Complex tasks scale up to 8B-9B models first before falling back to 4B
+        for name in ("granite4.2:8b", "ornith-1.5:9b", "gemma4:e4b", PREFERRED_MODEL):
+            if name and name not in names:
+                names.append(name)
+        return names
+    if role != "writer":  # planner / verifier / supervisor / reader: that role's own model first
         for name in (role_cfg.get("name"), *(role_cfg.get("fallback") or [])):
             if name and name not in names:
                 names.append(name)
-    # Spark first, always. LORA_MODEL overrides; a stale default in the user config comes after it.
+    # Spark first for standard fast writer. LORA_MODEL overrides; a stale default in the user config comes after it.
     for name in (
         os.environ.get("LORA_MODEL"),
         PREFERRED_MODEL,

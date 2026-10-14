@@ -138,6 +138,30 @@ class OllamaClient:
         """Names of installed models (empty list if none)."""
         return [m.get("name", "") for m in await self.list_models() if m.get("name")]
 
+    async def generate(
+        self,
+        prompt: str,
+        system: str = "",
+        temperature: float = 0.2,
+        model: str | None = None,
+    ) -> str:
+        """Convenience single-turn generation method used by PromptOptimizerAgent."""
+        from lora.models.selection import plan_chat
+
+        target_model = model
+        options: dict[str, Any] = {"temperature": temperature, "num_ctx": 4096}
+        if not target_model:
+            plan = await plan_chat(self, role="optimizer")
+            if plan is None:
+                raise OllamaClientError("No Ollama models installed")
+            target_model = plan.model
+            options = {**plan.options, "temperature": temperature}
+        msgs: list[dict[str, str]] = []
+        if system:
+            msgs.append({"role": "system", "content": system})
+        msgs.append({"role": "user", "content": prompt})
+        return await self.generate_chat(model=target_model, messages=msgs, options=options, think=False)
+
     async def is_online(self) -> bool:
         """Check if the Ollama daemon is reachable and responding."""
         try:

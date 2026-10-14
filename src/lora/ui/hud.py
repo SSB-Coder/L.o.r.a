@@ -119,6 +119,9 @@ class LoraDesktopHUD(QMainWindow):
         self._media_report.connect(self._on_media_report)
         self._last_level_time = 0.0
         self.web_view: Any = None
+        self._web_loading = False
+        self._pending_js: list[str] = []
+        self._last_ipc_action: tuple[str, str, float] = ("", "", 0.0)
 
         self._init_ui()
         self._init_shortcuts()
@@ -142,9 +145,10 @@ class LoraDesktopHUD(QMainWindow):
                 self.web_channel.registerObject("pyBridge", self.bridge)
                 self.web_view.page().setWebChannel(self.web_channel)
 
+                self._web_loading = True
+                self.web_view.loadFinished.connect(self._on_web_load_finished)
                 self.web_view.load(QUrl.fromLocalFile(str(html_path.resolve())))
                 self.setCentralWidget(self.web_view)
-                self.sync_media_files()
                 return
             except Exception as e:
                 logger.error("Could not initialize clean droplet WebEngineView: %s", e)
@@ -185,8 +189,23 @@ class LoraDesktopHUD(QMainWindow):
             except Exception as e:
                 logger.warning("Error parsing LORA_MSG: %s", e)
 
+    def _on_web_load_finished(self, ok: bool = True) -> None:
+        """Flush queued JS calls once droplet.html is ready in QWebEngineView."""
+        self._web_loading = False
+        pending = list(self._pending_js)
+        self._pending_js.clear()
+        for script in pending:
+            self._run_js(script)
+        self.sync_media_files()
+
     def _handle_web_action(self, action: str, payload: dict[str, Any]) -> None:
         """Handles actions dispatched from the clean droplet.html interface."""
+        now = time.monotonic()
+        payload_key = json.dumps(payload, sort_keys=True) if isinstance(payload, dict) else str(payload)
+        last_act, last_key, last_t = self._last_ipc_action
+        if action == last_act and payload_key == last_key and (now - last_t) < 0.08:
+            return  # Deduplicate simultaneous titleChanged + iframe fallback events
+        self._last_ipc_action = (action, payload_key, now)
         if action == "on_user_submit":
             text = payload.get("text", "").strip()
             depth = payload.get("depth", self._depth_mode)
@@ -304,14 +323,22 @@ class LoraDesktopHUD(QMainWindow):
         self.present_answer("Summarize my sources", text)
 
     def _run_js(self, script: str) -> None:
-        """Executes JavaScript safely in the droplet page."""
+        """Executes JavaScript safely in the droplet page (queued if page is still loading)."""
         if self.web_view is not None:
+            if getattr(self, "_web_loading", False) and WEB_ENGINE_AVAILABLE and isinstance(self.web_view, QWebEngineView):
+                if len(self._pending_js) < 30:
+                    self._pending_js.append(script)
+                return
             try:
                 # Own function scope: a top-level `const x` would stay declared in the page, and the NEXT call
                 # declaring it again fails with "Identifier 'x' has already been declared".
                 self.web_view.page().runJavaScript("(function(){\n" + script + "\n})();")
             except Exception:
                 pass
+
+    def set_sources(self, sources: list[Any]) -> None:
+        """Attach clickable sources to the currently streaming answer bubble immediately."""
+        self._run_js(f"window.setSources && window.setSources({json.dumps(sources or [])});")
 
     def sync_media_files(self) -> None:
         """Synchronizes active indexed media files to droplet drawer."""

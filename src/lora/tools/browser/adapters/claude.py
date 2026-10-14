@@ -44,7 +44,11 @@ class ClaudeAdapter:
             raise RuntimeError("Could not find Claude input box on page.")
 
         await target_input.click()
-        await target_input.fill(prompt)
+        try:
+            await target_input.fill(prompt)
+        except Exception:
+            if hasattr(page, "keyboard"):
+                await page.keyboard.insert_text(prompt)
         await asyncio.sleep(0.5)
 
         submitted = False

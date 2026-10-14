@@ -4,6 +4,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import warnings
+warnings.filterwarnings("ignore", message=".*fitz.*")
 import fitz
 import httpx
 

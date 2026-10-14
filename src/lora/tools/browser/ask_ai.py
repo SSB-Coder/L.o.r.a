@@ -27,7 +27,14 @@ class AskOtherAiTool:
     ) -> None:
         self.driver = driver or PlaywrightBrowserDriver()
         self.egress_filter = egress_filter or EgressFilter()
-        self.prompt_optimizer = prompt_optimizer or PromptOptimizerAgent()
+        if prompt_optimizer is None:
+            try:
+                from lora.models.ollama_client import OllamaClient
+
+                prompt_optimizer = PromptOptimizerAgent(ollama_client=OllamaClient())
+            except Exception:
+                prompt_optimizer = PromptOptimizerAgent()
+        self.prompt_optimizer = prompt_optimizer
         self.adapters = {
             "chatgpt": ChatGPTAdapter(),
             "claude": ClaudeAdapter(),
@@ -111,13 +118,34 @@ class AskOtherAiTool:
 
             try:
                 context = await self.driver._ensure_context()
-                page = await context.new_page()
                 try:
-                    await page.goto(adapter.url, wait_until="domcontentloaded", timeout=20000)
-                    await asyncio.sleep(1.0)
-                    reply = await adapter.submit_prompt(page, prompt=effective_prompt, timeout_seconds=30.0)
+                    page = await context.new_page()
+                except Exception:
+                    # Recover if user closed the browser window or pipe broke between turns
+                    if hasattr(self.driver, "_reset_context"):
+                        await self.driver._reset_context()
+                    else:
+                        self.driver._context = None
+                        self.driver._playwright = None
+                    context = await self.driver._ensure_context()
+                    page = await context.new_page()
+
+                try:
+                    if hasattr(page, "bring_to_front"):
+                        try:
+                            await page.bring_to_front()
+                        except Exception:
+                            pass
+                    await page.goto(adapter.url, wait_until="domcontentloaded", timeout=25000)
+                    await asyncio.sleep(1.5)
+                    reply = await adapter.submit_prompt(page, prompt=effective_prompt, timeout_seconds=75.0)
                 finally:
-                    await page.close()
+                    # Only close the tab in headless background mode; in visible desktop mode keep ChatGPT open!
+                    if getattr(self.driver, "headless", True):
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
 
                 return {
                     "status": "success",

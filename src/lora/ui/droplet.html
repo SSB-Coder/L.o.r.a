@@ -521,7 +521,7 @@ const typing=()=>{const t=document.activeElement&&document.activeElement.tagName
 const endPTT=()=>{if(pttActive){pttActive=false;stopPTT()}};
 addEventListener('keydown',e=>{
  if(e.code==='Space'){
-  if(typing())return;
+  if(typing()||e.ctrlKey||e.altKey)return;
   e.preventDefault();
   if(e.repeat||pttActive||busy||mode==='think'||mode==='verify'||mode==='sleep'||mode==='off')return;
   pttActive=true;startPTT();return;
@@ -572,6 +572,7 @@ window.setMicStatus=(ok,text)=>{
  m.title=ok?('Microphone: '+text):('Microphone off: '+text);
 };
 window.setStatus=(t)=>{if(cur&&!cur.hasText)setPending(cur,t)};
+window.setSources=(sources)=>{if(cur)renderSources(cur,sources)};
 window.beginStream=(q)=>{
  lastActivity=Date.now();streaming=true;busy=true;
  if(cur&&cur.pending&&lastUser.text===q&&Date.now()-lastUser.t<8000){/* typed here: bubble already shown */}

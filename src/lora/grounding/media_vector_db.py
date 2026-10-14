@@ -75,6 +75,8 @@ class MediaVectorDB:
         if suffix == ".pdf":
             media_type = "pdf"
             try:
+                import warnings
+                warnings.filterwarnings("ignore", message=".*fitz.*")
                 import fitz
 
                 with fitz.open(str(path)) as doc:

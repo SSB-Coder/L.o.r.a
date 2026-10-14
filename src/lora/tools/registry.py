@@ -195,6 +195,7 @@ class ToolRegistry:
                     "prompt": {"type": "string"},
                     "optimize_prompt": {"type": "boolean", "default": True},
                     "style": {"type": "string", "default": "general"},
+                    "deep_optimize": {"type": "boolean", "default": False},
                 },
                 "required": ["service", "prompt"],
             },
