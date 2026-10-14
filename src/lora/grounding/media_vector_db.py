@@ -75,9 +75,10 @@ class MediaVectorDB:
         if suffix == ".pdf":
             media_type = "pdf"
             try:
-                import warnings
-                warnings.filterwarnings("ignore", message=".*fitz.*")
-                import fitz
+                try:
+                    import pymupdf as fitz
+                except ImportError:
+                    import fitz
 
                 with fitz.open(str(path)) as doc:
                     for i in range(len(doc)):

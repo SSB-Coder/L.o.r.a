@@ -24,13 +24,25 @@ import wave
 from pathlib import Path
 
 def _patch_qwen_tts_rope() -> None:
-    """Shim Qwen3TTSTalkerRotaryEmbedding for transformers >= 4.52 where .config is accessed before assignment."""
+    """Shim Qwen3TTSTalkerRotaryEmbedding so self.config always exists across all transformers versions."""
     try:
         import sys
+        import types
         for mod in list(sys.modules.values()):
             cls = getattr(mod, "Qwen3TTSTalkerRotaryEmbedding", None)
-            if cls is not None and not hasattr(cls, "config"):
-                cls.config = None
+            if cls is not None and not getattr(cls, "_lora_patched", False):
+                orig_init = cls.__init__
+                def _wrapped_init(self, *args, **kwargs):
+                    self.__dict__["config"] = kwargs.get("config") or types.SimpleNamespace(
+                        rope_theta=kwargs.get("base", 10000.0),
+                        partial_rotary_factor=1.0,
+                        head_dim=kwargs.get("dim", 64),
+                        max_position_embeddings=kwargs.get("max_position_embeddings", 2048),
+                        rope_scaling=None,
+                    )
+                    return orig_init(self, *args, **kwargs)
+                cls.__init__ = _wrapped_init
+                cls._lora_patched = True
     except Exception:
         pass
 

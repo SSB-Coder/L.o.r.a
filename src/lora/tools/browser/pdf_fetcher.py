@@ -4,9 +4,10 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-import warnings
-warnings.filterwarnings("ignore", message=".*fitz.*")
-import fitz
+try:
+    import pymupdf as fitz
+except ImportError:
+    import fitz
 import httpx
 
 from lora.safety.egress import EgressFilter
