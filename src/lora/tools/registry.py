@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from lora.agent.notes import create_note
+from lora.grounding.media_vector_db import MediaVectorDB
 from lora.safety.gate import ActionGate, DataProvenance
 from lora.safety.policy import ActionRiskTier, PolicyEngine
 from lora.tools.browser.ask_ai import AskOtherAiTool
@@ -14,6 +16,7 @@ from lora.tools.browser.driver import PlaywrightBrowserDriver
 from lora.tools.browser.pdf_fetcher import PdfFetcher
 from lora.tools.control.apps import AppLauncher
 from lora.tools.control.windows import WindowManager
+from lora.tools.files.known import known_folder_roots
 from lora.tools.files.list import list_dir
 from lora.tools.files.paths import open_path
 from lora.tools.files.read import read_file
@@ -32,8 +35,16 @@ class ToolManifest(BaseModel):
 class ToolRegistry:
     """Central registry of executable capabilities bounded by ActionGate."""
 
-    def __init__(self, action_gate: ActionGate | None = None) -> None:
-        self.action_gate = action_gate or ActionGate(policy_engine=PolicyEngine())
+    def __init__(
+        self,
+        action_gate: ActionGate | None = None,
+        media_db: MediaVectorDB | None = None,
+    ) -> None:
+        if action_gate is None:
+            roots = list(PolicyEngine.DEFAULT_ALLOWED_ROOTS)
+            roots += [r for r in known_folder_roots() if r not in roots]
+            action_gate = ActionGate(policy_engine=PolicyEngine(allowed_roots=roots))
+        self.action_gate = action_gate
         self._tools: dict[str, ToolManifest] = {}
         self.app_launcher = AppLauncher()
         self.window_manager = WindowManager()
@@ -41,6 +52,7 @@ class ToolRegistry:
         self.browser_driver = PlaywrightBrowserDriver()
         self.pdf_fetcher = PdfFetcher()
         self.ask_other_ai_tool = AskOtherAiTool(driver=self.browser_driver)
+        self.media_db = media_db or MediaVectorDB()
         self._register_built_in_tools()
 
     def register(
@@ -185,6 +197,96 @@ class ToolRegistry:
                     "style": {"type": "string", "default": "general"},
                 },
                 "required": ["service", "prompt"],
+            },
+        )
+
+        # 12b. Create a note (.md / .txt only, new files only, never overwrites)
+        self.register(
+            name="create_note",
+            description="Create a new .md or .txt file in the LORA documents folder. Never overwrites or deletes.",
+            tier=ActionRiskTier.TIER2,
+            handler=lambda title, content, ext="md": create_note(
+                title, content, ext, policy=self.action_gate.policy_engine
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "content": {"type": "string"},
+                    "ext": {"type": "string", "enum": ["md", "txt"], "default": "md"},
+                },
+                "required": ["title", "content"],
+            },
+        )
+
+        # 13. Add File / Media to FAISS Vector DB
+        self.register(
+            name="add_media_file",
+            description="Ingest a file or media asset (PDF, Markdown, text, image, audio) into the FAISS vector database using EmbeddingGemma-2.",
+            tier=ActionRiskTier.TIER1,
+            handler=lambda path, tags=None: self.media_db.add_file(path, tags=tags),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Local file path to index"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional category tags"},
+                },
+                "required": ["path"],
+            },
+        )
+
+        # 14. Remove File / Media from FAISS Vector DB
+        self.register(
+            name="remove_media_file",
+            description="Remove a file or media asset and rebuild the FAISS vector database.",
+            tier=ActionRiskTier.TIER1,
+            handler=lambda path_or_id: self.media_db.remove_file(path_or_id),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "path_or_id": {"type": "string", "description": "File path, filename, or file_id to remove"},
+                },
+                "required": ["path_or_id"],
+            },
+        )
+
+        # 15. List Indexed Files and Media
+        self.register(
+            name="list_media_files",
+            description="List all indexed files, documents, and media assets in the FAISS vector database.",
+            tier=ActionRiskTier.TIER0,
+            handler=self.media_db.list_files,
+            parameters_schema={"type": "object"},
+        )
+
+        # 16. Search Media Vector DB
+        self.register(
+            name="search_media_db",
+            description="Semantic vector search across indexed user files and media using EmbeddingGemma-2 and FAISS.",
+            tier=ActionRiskTier.TIER0,
+            handler=lambda query, top_k=5: self.media_db.search(query=query, top_k=top_k),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Semantic search query"},
+                    "top_k": {"type": "integer", "default": 5, "description": "Number of passages to return"},
+                },
+                "required": ["query"],
+            },
+        )
+
+        # 17. Report on Files and Media
+        self.register(
+            name="report_on_media",
+            description="Synthesize an evidence-backed research report reading from indexed files and media in the FAISS vector database.",
+            tier=ActionRiskTier.TIER0,
+            handler=lambda query="", top_k=6: self.media_db.report_on_media(query=query, top_k=top_k),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "default": "", "description": "Topic or questions to report on"},
+                    "top_k": {"type": "integer", "default": 6},
+                },
             },
         )
 

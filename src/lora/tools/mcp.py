@@ -158,6 +158,7 @@ class McpClientManager:
                 path_res = self._gate.policy_engine.check_path(
                     path=val,
                     origin=norm_origin,
+                    mode="write" if tool_def.tier >= ActionRiskTier.TIER2 else "read",
                 )
                 if not path_res.allowed:
                     logger.warning(

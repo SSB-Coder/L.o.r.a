@@ -1,5 +1,6 @@
 """Voice Activity Detection (VAD) and endpointing for L.O.R.A Voice Pipeline."""
 
+from collections import deque
 from enum import StrEnum
 from typing import Any
 
@@ -24,6 +25,7 @@ class VoiceActivityDetector:
         silence_duration_seconds: float = 0.6,
         min_speech_duration_seconds: float = 0.25,
         onnx_model_path: str | None = None,
+        preroll_chunks: int = 10,
     ) -> None:
         self.sample_rate = sample_rate
         self.threshold = threshold
@@ -43,6 +45,8 @@ class VoiceActivityDetector:
         self._consecutive_silence_frames = 0
         self._total_speech_samples = 0
         self._recorded_utterance_chunks: list[np.ndarray] = []
+        # Audio just before speech was detected, so the first syllable is not clipped.
+        self._preroll: deque[np.ndarray] = deque(maxlen=max(0, preroll_chunks))
 
     def compute_energy_prob(self, chunk: np.ndarray) -> float:
         """Heuristic fallback RMS energy-based voice activity score (0.0 to 1.0).
@@ -80,6 +84,9 @@ class VoiceActivityDetector:
             self._consecutive_speech_frames += 1
             self._consecutive_silence_frames = 0
             self._total_speech_samples += len(chunk)
+            if self.state == SpeechState.SILENCE and not self._recorded_utterance_chunks:
+                self._recorded_utterance_chunks.extend(self._preroll)
+                self._preroll.clear()
             self._recorded_utterance_chunks.append(chunk)
 
             # Check if speech just started
@@ -88,6 +95,12 @@ class VoiceActivityDetector:
                     self.state = SpeechState.SPEAKING
         else:
             self._consecutive_silence_frames += 1
+            if self.state == SpeechState.SILENCE:
+                # Isolated clicks must not add up across seconds of silence.
+                self._consecutive_speech_frames = 0
+                self._total_speech_samples = 0
+                self._recorded_utterance_chunks.clear()
+                self._preroll.append(chunk)
             if self.state == SpeechState.SPEAKING:
                 self._recorded_utterance_chunks.append(chunk)
                 silence_elapsed = self._consecutive_silence_frames * chunk_duration
@@ -113,3 +126,4 @@ class VoiceActivityDetector:
         self._consecutive_silence_frames = 0
         self._total_speech_samples = 0
         self._recorded_utterance_chunks.clear()
+        self._preroll.clear()

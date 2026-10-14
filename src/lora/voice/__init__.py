@@ -1,28 +1,39 @@
-"""L.O.R.A Voice Pipeline package."""
+"""L.O.R.A Voice Pipeline package.
 
-from lora.voice.capture import AudioBuffer, AudioCapture
-from lora.voice.controller import VoiceController, VoiceState
-from lora.voice.hotkey import PushToTalkListener
-from lora.voice.stt import FasterWhisperTranscriber, TranscriptionResult
-from lora.voice.tts.engine import TtsEngine, split_sentences
-from lora.voice.tts.worker import Qwen3TtsWorkerProcess
-from lora.voice.vad import SpeechState, VoiceActivityDetector
-from lora.voice.wakeword import SpeakerVerifier, WakeWordDetector, WakeWordResult
+Exports are resolved lazily. ``VoiceController`` pulls in the whole tool stack
+(planner, Laya, Playwright, FAISS...); importing it eagerly meant that a single
+missing optional dependency made ``from lora.voice.capture import AudioCapture``
+fail, and main.py swallowed that as a log warning, so mic and TTS never started.
+"""
 
-__all__ = [
-    "AudioBuffer",
-    "AudioCapture",
-    "FasterWhisperTranscriber",
-    "PushToTalkListener",
-    "Qwen3TtsWorkerProcess",
-    "SpeakerVerifier",
-    "SpeechState",
-    "TranscriptionResult",
-    "TtsEngine",
-    "VoiceActivityDetector",
-    "VoiceController",
-    "VoiceState",
-    "WakeWordDetector",
-    "WakeWordResult",
-    "split_sentences",
-]
+from __future__ import annotations
+
+import importlib
+from typing import Any
+
+_EXPORTS = {
+    "AudioBuffer": "lora.voice.capture",
+    "AudioCapture": "lora.voice.capture",
+    "VoiceController": "lora.voice.controller",
+    "VoiceState": "lora.voice.controller",
+    "PushToTalkListener": "lora.voice.hotkey",
+    "FasterWhisperTranscriber": "lora.voice.stt",
+    "TranscriptionResult": "lora.voice.stt",
+    "TtsEngine": "lora.voice.tts.engine",
+    "split_sentences": "lora.voice.tts.engine",
+    "Qwen3TtsWorkerProcess": "lora.voice.tts.worker",
+    "SpeechState": "lora.voice.vad",
+    "VoiceActivityDetector": "lora.voice.vad",
+    "SpeakerVerifier": "lora.voice.wakeword",
+    "WakeWordDetector": "lora.voice.wakeword",
+    "WakeWordResult": "lora.voice.wakeword",
+}
+
+__all__ = sorted(_EXPORTS)
+
+
+def __getattr__(name: str) -> Any:
+    module_name = _EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module 'lora.voice' has no attribute {name!r}")
+    return getattr(importlib.import_module(module_name), name)

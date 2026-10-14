@@ -1,7 +1,9 @@
 import argparse
 import logging
+import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 import uvicorn
@@ -11,7 +13,7 @@ from lora.gateway.server import create_gateway_app
 from lora.ui.audio_cues import AudioCueManager, SoundCue
 from lora.ui.hud import LoraDesktopHUD
 from lora.ui.tray import LoraSystemTray
-from lora.ui.widget import AmbientDropletWidget, WidgetState
+from lora.ui.widget import WidgetState
 
 logger = logging.getLogger("lora")
 
@@ -64,9 +66,16 @@ def init_platform(base_dir: Path | None = None) -> tuple[ConfigManager, LoraUser
     return cfg_mgr, user_cfg
 
 
-def start_gateway_thread(host: str, port: int) -> uvicorn.Server:
+def start_gateway_thread(host: str, port: int, queue=None, origin: str = "desktop", token_validator=None) -> uvicorn.Server | None:
     """Launches the FastAPI Gateway inside a dedicated background thread."""
-    app = create_gateway_app()
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        if s.connect_ex((host, port)) == 0:
+            logger.info("Gateway daemon already active at http://%s:%d", host, port)
+            return None
+
+    app = create_gateway_app(origin=origin, queue=queue, token_validator=token_validator)
     config = uvicorn.Config(
         app=app,
         host=host,
@@ -86,77 +95,96 @@ def run_desktop_app(
     user_cfg: LoraUserConfig,
     args: argparse.Namespace,
 ) -> int:
-    """Launches the PySide6 Ambient Droplet Widget, HUD, System Tray, and Audio Cues."""
+    """Launches the PySide6 holographic HUD, System Tray, and Audio/Voice Pipeline.
+
+    Threading rule: only the GUI thread may touch ``hud``/``tray``. Worker threads (Ollama,
+    Whisper, TTS, the sounddevice callback, the pynput hotkey) hand results over with
+    ``ui.post(fn)``. ``QTimer.singleShot(0, fn)`` from those threads silently never fires.
+    """
+    from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication
+
+    import asyncio
+
+    from lora.agent.runtime import AgentRuntime, TurnResult
+    from lora.dialogue import ConversationHistory
+    from lora.ui.threadsafe import UiDispatcher
 
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(False)
+    app.setQuitOnLastWindowClosed(True)
+    ui = UiDispatcher()  # lives on the GUI thread
 
     # Initialize components
+    from lora.grounding.media_vector_db import MediaVectorDB
+
+    media_db = MediaVectorDB()
     audio = AudioCueManager(enabled=user_cfg.voice.sound_effects_enabled and not args.no_audio)
-    droplet = AmbientDropletWidget(idle_opacity=user_cfg.ui.ghost_mode_opacity)
-    hud = LoraDesktopHUD()
+    hud = LoraDesktopHUD(media_db=media_db)
     tray = LoraSystemTray()
-
-    # Initial position: bottom right corner of primary screen
-    screen = app.primaryScreen().geometry()
-    margin = user_cfg.ui.snap_margin_px
-    init_x = screen.width() - droplet.width() - margin
-    init_y = screen.height() - droplet.height() - margin - 40  # Above Windows taskbar
-    droplet.move(init_x, init_y)
-
-    # Connect interactions
-    droplet.hud_requested.connect(hud.toggle_window)
-    tray.open_hud_requested.connect(hud.toggle_window)
-
-    def on_toggle_droplet() -> None:
-        if droplet.isVisible():
-            droplet.hide()
-        else:
-            droplet.show()
-
-    tray.toggle_widget_requested.connect(on_toggle_droplet)
 
     def on_sleep_toggled(is_sleeping: bool) -> None:
         if is_sleeping:
             audio.play_cue(SoundCue.SLEEP)
             tray.update_state(WidgetState.SLEEPING)
-            hud.status_label.setText("<span style='color:#6b7280;'>● Sleeping (0% CPU)</span>")
+            hud.set_voice_state("sleeping")
         else:
             audio.play_cue(SoundCue.WAKE)
             tray.update_state(WidgetState.IDLE)
-            hud.status_label.setText("<span style='color:#10b981;'>● Active & Grounded</span>")
+            hud.set_voice_state("idle")
 
-    droplet.sleep_toggled.connect(on_sleep_toggled)
+    hud.sleep_toggled.connect(on_sleep_toggled)
+    tray.sleep_toggled.connect(lambda: hud.sleep_toggled.emit(hud._current_voice_state != "sleeping"))
+    tray.open_hud_requested.connect(hud.toggle_window)
 
-    def on_tray_sleep_toggle() -> None:
-        droplet.toggle_sleep()
-
-    tray.sleep_toggled.connect(on_tray_sleep_toggle)
+    # Clean shutdown & microphone release
+    capture = None
+    hotkey = None
+    is_exiting = threading.Event()
 
     def on_exit() -> None:
+        if is_exiting.is_set():
+            return
+        is_exiting.set()
+        logger.info("Exiting L.O.R.A, releasing audio capture stream...")
         audio.play_cue(SoundCue.SLEEP)
-        droplet.close()
+        if capture is not None:
+            try:
+                capture.stop()
+            except Exception:
+                pass
+        if hotkey is not None:
+            try:
+                hotkey.stop()
+            except Exception:
+                pass
+        try:
+            import sounddevice as sd
+            sd.stop()
+        except Exception:
+            pass
         hud.close()
         tray.hide()
         app.quit()
 
     tray.exit_requested.connect(on_exit)
+    hud.exit_requested.connect(on_exit)
+    app.aboutToQuit.connect(on_exit)
 
-    # Voice capture, STT, and Qwen3-TTS setup
-    capture = None
+    # Voice capture, STT, and TTS setup
     transcriber = None
-    hotkey = None
     speech_active = threading.Event()
     active_voice = ["vivian"]
+    voice_enabled = [True]
+    voice_init_error = [""]
 
     def on_voice_changed(new_voice: str) -> None:
         active_voice[0] = new_voice
-        logger.info("Active Qwen3-TTS voice selected: %s", new_voice)
+        logger.info("Active TTS voice selected: %s", new_voice)
 
     hud.voice_changed.connect(on_voice_changed)
+    hud.voice_toggled.connect(lambda enabled: voice_enabled.__setitem__(0, bool(enabled)))
 
     tts_engine = None
     if not args.no_audio:
@@ -171,86 +199,67 @@ def run_desktop_app(
                 spawn_process=False,
             )
             tts_engine = TtsEngine(worker=tts_worker)
-            logger.info("Qwen3-TTS engine initialized with custom voice models.")
+            logger.info("TTS engine initialized.")
         except Exception as e:
-            logger.warning("Could not initialize Qwen3-TTS engine: %s", e)
+            logger.warning("Could not initialize TTS engine: %s", e)
 
-    def speak_briefing_async(text: str) -> None:
-        """Speaks executive summary using Qwen3-TTS with real-time droplet surface ripples."""
-        if args.no_audio or not text.strip():
+    # ---- speech: sentences are spoken while the reply is still being written ----
+    current_streamer: list[object] = [None]
+
+    def synth_sentence(sentence: str):
+        if tts_engine is None:
+            return None
+        return tts_engine.worker.synthesize(sentence, voice=active_voice[0])
+
+    def play_chunk(chunk, stop_event: threading.Event) -> None:
+        import numpy as np
+        import sounddevice as sd
+
+        samples, sample_rate = chunk.samples, chunk.sample_rate
+        if len(samples) == 0 or stop_event.is_set():
             return
+        duration = len(samples) / sample_rate
+        sd.play(samples, samplerate=sample_rate)
+        num_steps = max(1, int(duration * 25))
+        slice_size = max(1, len(samples) // num_steps)
+        for step_idx in range(num_steps):
+            if stop_event.is_set():
+                sd.stop()
+                return
+            step = samples[step_idx * slice_size : (step_idx + 1) * slice_size]
+            rms = float(np.sqrt(np.mean(step**2))) if len(step) else 0.0
+            ui.post(lambda lvl=min(1.0, rms * 8.0): hud.set_audio_level(lvl))  # level only: no per-step pulses
+            time.sleep(duration / num_steps)
+        if not stop_event.is_set():
+            sd.wait()
 
-        def _speak_thread() -> None:
+    def make_streamer(turn_done: threading.Event):
+        """A SpeechStreamer for one turn, or None when audio/voice is off."""
+        if args.no_audio or not voice_enabled[0]:
+            return None
+        from lora.voice.speech_stream import SpeechStreamer
+
+        def _started() -> None:
             speech_active.set()
-            try:
-                import time
+            ui.post(lambda: hud.set_voice_state("speaking"))
 
-                import numpy as np
-                import sounddevice as sd
-                from PySide6.QtCore import QTimer
-
-                from lora.voice.tts.engine import split_sentences
-
-                clean = text.replace("`", "").strip()
-                sentences = split_sentences(clean)
-                if not sentences:
-                    sentences = [clean]
-
-                voice_to_use = active_voice[0]
-                logger.info("Speaking briefing with Qwen3-TTS voice '%s' (%d sentences)...", voice_to_use, len(sentences))
-
-                for sent in sentences[:4]:  # Speak first concise sentences
-                    if not speech_active.is_set():
-                        break
-
-                    chunk = None
-                    if tts_engine is not None:
-                        chunk = tts_engine.worker.synthesize(sent, voice=voice_to_use)
-
-                    if chunk is not None and len(chunk.samples) > 0 and speech_active.is_set():
-                        sample_rate = chunk.sample_rate
-                        samples = chunk.samples
-                        duration = len(samples) / sample_rate
-
-                        # Audio playback through sounddevice
-                        sd.play(samples, samplerate=sample_rate)
-
-                        # Audio visualization loop pulsing the droplet during speech
-                        num_steps = max(1, int(duration * 25))
-                        slice_size = max(1, len(samples) // num_steps)
-                        for step_idx in range(num_steps):
-                            if not speech_active.is_set():
-                                sd.stop()
-                                break
-                            start_s = step_idx * slice_size
-                            end_s = start_s + slice_size
-                            step_samples = samples[start_s:end_s]
-                            step_rms = float(np.sqrt(np.mean(step_samples**2))) if len(step_samples) > 0 else 0.0
-                            lvl = min(1.0, step_rms * 8.0)
-                            QTimer.singleShot(0, lambda cur_lvl=lvl: (
-                                hud.set_audio_level(cur_lvl),
-                                hud.pulse_droplet(cur_lvl * 0.9),
-                            ))
-                            time.sleep(duration / num_steps)
-
-                        if speech_active.is_set():
-                            sd.wait()
-            except Exception as e:
-                logger.warning("TTS playback error: %s", e)
-            finally:
-                speech_active.clear()
-                from PySide6.QtCore import QTimer
-                QTimer.singleShot(0, lambda: (
+        def _done(spoke: bool) -> None:
+            speech_active.clear()
+            if not spoke and turn_done.is_set():
+                logger.warning("Nothing was spoken (TTS produced no audio).")
+            if turn_done.is_set():
+                ui.post(lambda: (
                     hud.set_voice_state("idle"),
-                    droplet.set_state(WidgetState.IDLE),
                     hud.set_audio_level(0.0),
-                    audio.play_cue(SoundCue.COMPLETE),
+                    audio.play_cue(SoundCue.COMPLETE) if spoke else None,
                 ))
 
-        t = threading.Thread(target=_speak_thread, daemon=True)
-        t.start()
+        return SpeechStreamer(synth_sentence, play_chunk, on_start=_started, on_done=_done)
 
-    def stop_current_speech() -> None:
+    def stop_current_speech(update_ui: bool = True) -> None:
+        streamer = current_streamer[0]
+        if streamer is not None:
+            streamer.stop()
         speech_active.clear()
         if tts_engine is not None:
             tts_engine.interrupt()
@@ -259,248 +268,499 @@ def run_desktop_app(
             sd.stop()
         except Exception:
             pass
-        hud.set_voice_state("idle")
-        droplet.set_state(WidgetState.IDLE)
-        hud.set_audio_level(0.0)
+        if update_ui:
+            ui.post(lambda: (hud.set_voice_state("idle"), hud.set_audio_level(0.0)))
 
     hud.stop_audio_requested.connect(stop_current_speech)
+
+    last_query = [""]
+    history = ConversationHistory(max_turns=6)
+    inflight = threading.Event()
+
+    def _profile_text() -> str:
+        try:
+            from lora.storage.memory import MemoryStore
+
+            return MemoryStore(profile_path=cfg_mgr.paths.user_profile_file).get_profile_markdown()
+        except Exception:
+            return ""
+
+    def _make_registry():
+        from lora.tools.registry import ToolRegistry
+
+        return ToolRegistry(media_db=media_db)
+
+    runtime = AgentRuntime(
+        ollama_url=user_cfg.models.ollama_url,
+        user_default_model=user_cfg.models.default_model,
+        history=history,
+        registry_factory=_make_registry,
+        profile_fn=_profile_text,
+        media_db=media_db,
+        mcp_config_path=cfg_mgr.paths.mcp_file,
+        skills_dir=cfg_mgr.paths.skills_dir,
+        agents_dir=cfg_mgr.paths.agents_dir,
+    )
+
+    def _confirm_blocking(text: str) -> bool:
+        """Ask the user (GUI thread dialog) and wait for the answer from the worker thread."""
+        answer = {"ok": False}
+        done = threading.Event()
+
+        def _ask() -> None:
+            from PySide6.QtWidgets import QMessageBox
+
+            box = QMessageBox(hud)
+            box.setWindowTitle("LORA")
+            box.setText(text)
+            box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            box.setDefaultButton(QMessageBox.StandardButton.No)
+            answer["ok"] = box.exec() == QMessageBox.StandardButton.Yes
+            done.set()
+
+        ui.post(_ask)
+        done.wait(90)
+        return answer["ok"]
+
+    async def _confirm(text: str) -> bool:
+        return await asyncio.to_thread(_confirm_blocking, text)
+
+    runtime.confirm = _confirm
+
+    def on_query_submitted(query: str, depth: str = "") -> None:
+        """Runs on the GUI thread. Starts one assistant turn in the background."""
+        query = (query or "").strip()
+        if not query:
+            return
+        if inflight.is_set():
+            logger.info("Ignoring query while another is still running: %r", query)
+            return
+        inflight.set()
+        last_query[0] = query
+        if hud._current_voice_state in ("sleep", "sleeping"):
+            on_sleep_toggled(False)
+
+        stop_current_speech(update_ui=False)
+        hud.set_voice_state("thinking")
+        hud.stream_begin(query, "")
+        turn_done = threading.Event()
+
+        def _worker() -> None:
+            started = time.monotonic()
+            streamer = make_streamer(turn_done)
+            current_streamer[0] = streamer
+            last_push = [0.0]
+
+            def on_status(text: str) -> None:
+                ui.post(lambda t=text: hud.set_status(t))
+
+            def on_text(full: str, speak: bool = True) -> None:
+                now = time.monotonic()
+                if now - last_push[0] >= 0.06:
+                    last_push[0] = now
+                    ui.post(lambda t=full: hud.stream_update(t))
+                if speak and streamer is not None:
+                    streamer.feed(full)
+
+            try:
+                result = asyncio.run(runtime.run_turn(query, on_status, on_text))
+            except Exception as exc:  # never leave the UI waiting
+                logger.exception("Turn crashed")
+                result = TurnResult(text="Something went wrong on my side. Try again in a moment.", kind="error", failure=str(exc))
+            logger.info(
+                "Turn finished: kind=%s in %.1fs, sources=%d%s",
+                result.kind, time.monotonic() - started, len(result.sources),
+                f", failure={result.failure}" if result.failure else "",
+            )
+
+            def _post() -> None:
+                try:
+                    hud.present_answer(
+                        query, result.text, sources=result.sources, confidence=0.0, label="", streamed=True,
+                        meta=result.meta,
+                    )
+                    turn_done.set()
+                    if streamer is None:
+                        hud.set_voice_state("idle")
+                        return
+                    spoken = result.spoken if result.spoken is not None else result.text
+                    if result.spoken is not None:
+                        streamer.feed(spoken)
+                    streamer.finish(spoken)
+                    hud.set_voice_state("speaking" if streamer.has_pending else "idle")
+                finally:
+                    inflight.clear()
+
+            ui.post(_post)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    hud.query_submitted.connect(on_query_submitted)
+    hud.rewrite_requested.connect(lambda dir, depth: on_query_submitted(last_query[0], depth))
+
+    def _preload_voice() -> None:
+        """Load the natural voice first: Ollama sizes its GPU share from what is free when IT loads."""
+        if tts_engine is None or args.no_audio:
+            return
+        try:
+            ok = tts_engine.worker.preload()
+            diag = tts_engine.worker.diagnosis()
+            (logger.info if ok else logger.warning)("Voice: %s %s", diag["summary"], diag.get("fix", "") if not ok else "")
+        except Exception as exc:
+            logger.warning("Voice preload failed: %s", exc)
+
+    def _warm_up_model() -> None:
+        """Load the model in the background at startup so the first greeting is instant."""
+        _preload_voice()
+        threading.Thread(target=runtime.start_mcp, daemon=True, name="lora-mcp").start()  # ~/.lora/mcp.json servers
+        async def _go() -> None:
+            from lora.models.ollama_client import OllamaClient
+            from lora.models.selection import plan_chat
+
+            client = OllamaClient(base_url=user_cfg.models.ollama_url)
+            plan = None
+            for _ in range(30):  # Ollama may still be starting: wait up to ~1 minute
+                try:
+                    plan = await plan_chat(client, user_default=user_cfg.models.default_model)
+                    break
+                except Exception:
+                    await asyncio.sleep(2.0)
+            if plan is None:
+                logger.warning("Warm-up skipped: no model available from Ollama.")
+                return
+            ready = await client.warm_up(plan.model, options=plan.options, keep_alive=plan.keep_alive)
+            logger.info("Model %s %s", plan.model, "is loaded and ready" if ready else "warm-up failed")
+
+        try:
+            asyncio.run(_go())
+        except Exception as exc:
+            logger.warning("Model warm-up failed: %s", exc)
 
     if not args.no_audio:
         try:
             import numpy as np
-            from PySide6.QtCore import QTimer
 
             from lora.voice.capture import AudioCapture
-            from lora.voice.hotkey import PushToTalkListener
             from lora.voice.stt import FasterWhisperTranscriber
             from lora.voice.vad import SpeechState, VoiceActivityDetector
+            from lora.voice.wakeword import WakeWordDetector
 
             capture = AudioCapture(sample_rate=16000)
             transcriber = FasterWhisperTranscriber(lazy_load=True)
+            wakeword = WakeWordDetector(
+                wake_phrase="Awaken LORA",
+                chat_phrase="Hey LORA",
+                transcriber=transcriber,
+            )
+            vad_threshold = float(os.environ.get("LORA_VAD_THRESHOLD", "0.35"))
             vad = VoiceActivityDetector(
                 sample_rate=16000,
-                threshold=0.35,
+                threshold=vad_threshold,
                 silence_duration_seconds=0.7,
                 min_speech_duration_seconds=0.25,
             )
 
             is_transcribing = threading.Event()
+            is_ptt_active = threading.Event()
+            ptt_start_time = [0.0]
+            armed_until = [0.0]  # after "Hey LORA" alone, the next utterance is the query
+            ARM_SECONDS = 10.0
+            stt_error_shown = [False]
+
+            def _stt_failed(ex: Exception) -> None:
+                logger.warning("Speech recognition error: %s", ex, exc_info=True)
+                if not stt_error_shown[0]:
+                    stt_error_shown[0] = True
+                    msg = (
+                        f"Speech recognition failed: {type(ex).__name__}: {ex}. "
+                        "The first run downloads the 'distil-small.en' model, so it needs internet once."
+                    )
+                    ui.post(lambda: hud.append_message("L.O.R.A", msg))
+
+            def _submit_voice_query(q: str) -> None:
+                """GUI thread."""
+                hud.append_message("You", q)
+                hud.set_input_text(q)
+                on_query_submitted(q, active_voice[0])
 
             def _trigger_transcription(audio_samples: np.ndarray) -> None:
                 if is_transcribing.is_set():
+                    logger.info("Push-to-talk ignored: still transcribing the previous clip.")
                     return
                 is_transcribing.set()
-
-                QTimer.singleShot(0, lambda: (
-                    hud.set_voice_state("thinking"),
-                    droplet.set_state(WidgetState.THINKING),
-                ))
+                logger.info("Transcribing %.1fs of push-to-talk audio.", len(audio_samples) / 16000)
+                ui.post(lambda: hud.set_voice_state("thinking"))
 
                 def _worker() -> None:
+                    submitted = False
                     try:
-                        if len(audio_samples) < 3200:  # < 0.2 sec
+                        peak = float(np.max(np.abs(audio_samples))) if len(audio_samples) else 0.0
+                        if len(audio_samples) < 3200 or peak < 0.005:
+                            logger.info("Push-to-talk audio was silent (peak=%.4f).", peak)
+                            ui.post(lambda: hud.append_message(
+                                "L.O.R.A",
+                                "I couldn't hear anything. Check that the right microphone is selected and not muted.",
+                            ))
                             return
                         res = transcriber.transcribe(audio_samples)
                         query_text = res.text.strip()
                         if query_text:
                             logger.info("Transcribed voice input: '%s'", query_text)
-                            QTimer.singleShot(0, lambda q=query_text: hud.append_message("You", q))
-                            QTimer.singleShot(0, lambda q=query_text: on_query_submitted(q, active_voice[0]))
+                            submitted = True
+                            ui.post(lambda q=query_text: _submit_voice_query(q))
                         else:
                             logger.info("No speech detected in audio segment.")
+                            ui.post(lambda: hud.append_message("L.O.R.A", "I didn't catch that. Try again?"))
                     except Exception as ex:
-                        logger.warning("Transcription worker error: %s", ex)
+                        _stt_failed(ex)
                     finally:
                         is_transcribing.clear()
-                        if not speech_active.is_set():
-                            QTimer.singleShot(0, lambda: (
-                                hud.set_voice_state("idle"),
-                                droplet.set_state(WidgetState.IDLE),
-                            ))
+                        if not submitted and not speech_active.is_set():
+                            ui.post(lambda: hud.set_voice_state("idle"))
 
-                t = threading.Thread(target=_worker, daemon=True)
-                t.start()
+                threading.Thread(target=_worker, daemon=True).start()
+
+            def _process_utterance_async(audio_clip: np.ndarray) -> None:
+                """Hands-free path: transcribe ONCE, then decide wake word vs query vs ignore."""
+                if is_transcribing.is_set() or is_ptt_active.is_set():
+                    return
+                is_transcribing.set()
+
+                def _bg() -> None:
+                    try:
+                        current_st = hud._current_voice_state
+                        sleeping = current_st in ("sleep", "sleeping")
+                        text = transcriber.transcribe(audio_clip).text.strip()
+                        if not text:
+                            return
+                        logger.info("Heard: '%s' (state=%s)", text, current_st)
+
+                        if not sleeping and time.monotonic() < armed_until[0]:
+                            armed_until[0] = 0.0
+                            ui.post(lambda q=text: _submit_voice_query(q))
+                            return
+
+                        wake = wakeword.evaluate_text(text, audio_clip, current_state=current_st)
+                        if not wake.detected:
+                            return  # ordinary conversation in the room: ignore it
+                        audio.play_cue(SoundCue.WAKE)
+                        if sleeping:
+                            logger.info("Wake word detected while sleeping. Waking up.")
+                            ui.post(lambda: on_sleep_toggled(False))
+                        elif wake.extracted_query:
+                            logger.info("Wake word with trailing query: '%s'", wake.extracted_query)
+                            ui.post(lambda q=wake.extracted_query: _submit_voice_query(q))
+                        else:
+                            logger.info("Wake word detected. Listening for the query...")
+                            armed_until[0] = time.monotonic() + ARM_SECONDS
+                            ui.post(lambda: hud.set_voice_state("listening"))
+                    except Exception as ex:
+                        _stt_failed(ex)
+                    finally:
+                        is_transcribing.clear()
+
+                threading.Thread(target=_bg, daemon=True).start()
+
+            _last_ui_update_time = [0.0]
 
             def _on_mic_chunk(chunk: np.ndarray) -> None:
+                """Runs on the sounddevice thread: no Qt calls except via ui.post."""
                 if len(chunk) == 0:
                     return
 
                 rms = float(np.sqrt(np.mean(chunk**2)))
                 level = min(1.0, rms * 8.0)
-                QTimer.singleShot(0, lambda: (
-                    hud.set_audio_level(level),
-                    droplet.set_audio_level(level),
-                ))
+                now = time.monotonic()
+                if now - _last_ui_update_time[0] >= 0.04:
+                    _last_ui_update_time[0] = now
+                    ui.post(lambda lvl=level: hud.set_audio_level(lvl))
 
-                if speech_active.is_set() or is_transcribing.is_set():
+                if armed_until[0] and now > armed_until[0]:
+                    armed_until[0] = 0.0
+                    if hud._current_voice_state == "listening" and not is_ptt_active.is_set():
+                        ui.post(lambda: hud.set_voice_state("idle"))
+
+                if speech_active.is_set():
+                    if rms > 0.15:
+                        stop_current_speech()
                     return
 
-                vad_state, prob = vad.process_chunk(chunk)
-                if vad_state == SpeechState.SPEAKING:
-                    if droplet.state != WidgetState.SPEAKING:
-                        QTimer.singleShot(0, lambda: (
-                            hud.set_voice_state("listening"),
-                            droplet.set_state(WidgetState.SPEAKING),
-                        ))
-                elif vad_state == SpeechState.ENDED:
+                if is_transcribing.is_set() or hud._current_voice_state in ("thinking", "think", "verify"):
+                    return
+
+                if is_ptt_active.is_set():
+                    return
+
+                vad_state, _prob = vad.process_chunk(chunk)
+                if vad_state == SpeechState.ENDED:
                     utterance = vad.get_and_reset_utterance()
-                    if len(utterance) > 3200:
-                        _trigger_transcription(utterance)
+                    if len(utterance) >= 4800:
+                        _process_utterance_async(utterance)
 
             capture.register_chunk_callback(_on_mic_chunk)
             capture.start()
+            if not capture.is_streaming:
+                logger.warning("Microphone is not running: %s", capture.status_text())
 
             def _on_ptt_down() -> None:
-                stop_current_speech()
+                if hud._current_voice_state in ("thinking", "think", "verify", "sleep", "sleeping") or is_transcribing.is_set():
+                    return
+                armed_until[0] = 0.0
+                is_ptt_active.set()
+                ptt_start_time[0] = time.monotonic()
+                stop_current_speech(update_ui=False)
                 vad.reset()
-                QTimer.singleShot(0, lambda: (
-                    hud.set_voice_state("listening"),
-                    droplet.set_state(WidgetState.SPEAKING),
-                ))
+                ui.post(lambda: hud.set_voice_state("listening"))
                 if capture:
                     capture.buffer.clear()
 
             def _on_ptt_up() -> None:
-                if capture:
-                    audio_samples = capture.buffer.read_last_n_seconds(8.0)
+                if not is_ptt_active.is_set():
+                    if hud._current_voice_state in ("listening", "listen"):
+                        ui.post(lambda: hud.set_voice_state("idle"))
+                    return
+                is_ptt_active.clear()
+                dur = time.monotonic() - ptt_start_time[0]
+                logger.info("Push-to-talk released after %.1fs (mic streaming: %s)", dur, capture.is_streaming)
+                if not capture.is_streaming:
+                    reason = capture.status_text()
+                    ui.post(lambda: (
+                        hud.append_message("L.O.R.A", f"My microphone isn't running: {reason}"),
+                        hud.set_voice_state("idle"),
+                    ))
+                elif dur >= 0.25:
+                    audio_samples = capture.buffer.read_last_n_seconds(min(15.0, dur + 0.3))
                     _trigger_transcription(audio_samples)
+                else:
+                    ui.post(lambda: hud.set_voice_state("idle"))
 
             hud.ptt_pressed.connect(_on_ptt_down)
             hud.ptt_released.connect(_on_ptt_up)
 
-            hotkey = PushToTalkListener(on_activate=_on_ptt_down, on_deactivate=_on_ptt_up)
-            hotkey.start()
-        except Exception as e:
-            logger.warning("Voice capture could not be initialized: %s", e)
-
-    def on_query_submitted(query: str, depth: str) -> None:
-        if droplet.state == WidgetState.SLEEPING:
-            droplet.toggle_sleep()
-
-        stop_current_speech()
-        droplet.set_state(WidgetState.THINKING)
-        hud.set_voice_state("thinking")
-        hud.status_label.setText("<span style='color:#38bdf8;'>● Researching & Grounding...</span>")
-
-        def _worker() -> None:
-            evidence_hits = []
             try:
-                import asyncio
+                from lora.voice.hotkey import PushToTalkListener
 
-                from lora.models.ollama_client import OllamaClient
-                from lora.storage.memory import MemoryStore
-
-                # Build simulated grounded evidence cards for verified research HUD
-                lower_q = query.lower()
-                evidence_hits.append({
-                    "title": f"Grounded Research Synthesis: {query[:60]}",
-                    "source": "arXiv" if "model" in lower_q or "quantum" in lower_q or "ai" in lower_q else "PubMed" if "bio" in lower_q or "health" in lower_q else "CrossRef",
-                    "snippet": f"Empirical analysis and structured verification data pertaining to '{query}'. Verified across domain literature.",
-                    "confidence": 0.96,
-                    "url": "https://arxiv.org/abs/2403.05530" if "ai" in lower_q else "https://doi.org/10.1038/s41586-024",
-                })
-                evidence_hits.append({
-                    "title": f"Domain Baseline Reference: {query[:45]}",
-                    "source": "Wikipedia",
-                    "snippet": f"Authoritative consensus summary and reference definitions for research inquiry: {query}.",
-                    "confidence": 0.91,
-                    "url": "https://en.wikipedia.org/wiki/Special:Search?search=" + query.replace(" ", "+"),
-                })
-
-                ollama = OllamaClient(base_url=user_cfg.models.ollama_url)
-                is_online = asyncio.run(ollama.is_online())
-                if is_online:
-                    models_list = asyncio.run(ollama.list_models())
-                    available_tags = [m.get("name", "") for m in models_list]
-                    model_to_use = user_cfg.models.default_model
-                    if model_to_use not in available_tags:
-                        for candidate in (
-                            "spark-x25-4b-8k:latest",
-                            "spark-x25-4b-32k:latest",
-                            "granite4.2:8b",
-                            "gemma4:e4b",
-                            "ornith-1.5:9b",
-                        ):
-                            if candidate in available_tags:
-                                model_to_use = candidate
-                                break
-                        else:
-                            if available_tags:
-                                model_to_use = available_tags[0]
-
-                    memory_store = MemoryStore(profile_path=cfg_mgr.paths.user_profile_file)
-                    profile_ctx = memory_store.get_profile_markdown()
-
-                    sys_prompt = (
-                        "You are L.O.R.A (Layer Oriented Research Assistant), a sovereign, "
-                        "grounded local AI research peer running entirely on the user's laptop. "
-                        "Present concise, factual executive briefings with clear citations and zero filler."
-                    )
-                    if profile_ctx:
-                        sys_prompt += f"\nUser Context & Preferences:\n{profile_ctx[:600]}"
-
-                    messages = [
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": query},
-                    ]
-                    response_text = asyncio.run(
-                        ollama.generate_chat(model=model_to_use, messages=messages)
-                    )
-                else:
-                    response_text = (
-                        f"⚠️ Local Ollama service is offline at {user_cfg.models.ollama_url}. "
-                        "Please start Ollama (`ollama serve`) to activate local model generation."
-                    )
+                hotkey = PushToTalkListener(on_activate=_on_ptt_down, on_deactivate=_on_ptt_up)
+                hotkey.start()
             except Exception as e:
-                response_text = f"Error processing query: {e}"
+                logger.warning("Global push-to-talk hotkey unavailable: %s", e)
+        except Exception as e:
+            voice_init_error[0] = f"{type(e).__name__}: {e}"
+            logger.warning("Voice capture could not be initialized: %s", e, exc_info=True)
 
-            from PySide6.QtCore import QTimer
+    # Tell the user the truth about the microphone (name, or why it is off) and watch it.
+    def _refresh_mic_status() -> None:
+        if args.no_audio:
+            hud.set_mic_status(False, "disabled (--no-audio)")
+        elif capture is None:
+            hud.set_mic_status(False, f"voice pipeline failed to start ({voice_init_error[0] or 'see log'})")
+        elif not capture.is_streaming:
+            hud.set_mic_status(False, capture.status_text())
+        else:
+            age = capture.seconds_since_audio()
+            if age is None or age > 3.0:
+                hud.set_mic_status(False, f"{capture.device_name}: no audio arriving")
+            else:
+                hud.set_mic_status(True, capture.device_name)
 
-            def _post() -> None:
-                hud.clear_evidence_cards()
-                for hit in evidence_hits:
-                    hud.add_evidence_card(
-                        title=hit["title"],
-                        source=hit["source"],
-                        snippet=hit["snippet"],
-                        confidence=hit["confidence"],
-                        url=hit["url"],
-                    )
-                hud.append_message("L.O.R.A", response_text)
-                hud.set_truthfulness_score(0.95, verified=8, total=8)
-                hud.set_voice_state("speaking")
-                droplet.set_state(WidgetState.SPEAKING)
-                speak_briefing_async(response_text)
+    def _diag_extras() -> dict:
+        extras: dict = {}
+        if capture is not None:
+            extras["mic"] = (capture.is_streaming and (capture.seconds_since_audio() or 99) < 3.0, capture.status_text())
+        if tts_engine is not None:
+            try:
+                extras["tts"] = tts_engine.worker.diagnosis()
+            except Exception as exc:
+                extras["tts"] = {"ok": False, "summary": f"voice check failed ({exc})"}
+        return extras
 
-            QTimer.singleShot(0, _post)
+    runtime.diag_extras = _diag_extras
 
-        worker_thread = threading.Thread(target=_worker, daemon=True)
-        worker_thread.start()
-
-    hud.query_submitted.connect(on_query_submitted)
+    mic_timer = QTimer(hud)  # parented to the HUD so it stays alive; runs on the GUI thread
+    mic_timer.setInterval(2000)
+    mic_timer.timeout.connect(_refresh_mic_status)
+    mic_timer.start()
 
     # Start Gateway background server
-    gateway_server = start_gateway_thread(host=args.host, port=args.port)
+    from lora.agent.jobs import JobWorker
+    from lora.gateway.queue import JobQueue
 
-    # Show ambient UI
-    droplet.show()
+    job_queue = JobQueue()
+    gateway_server = start_gateway_thread(host=args.host, port=args.port, queue=job_queue)
+
+    def _make_job_runtime(origin: str) -> AgentRuntime:
+        # Phone jobs may chat and research, never open apps/files or type; desktop-origin jobs keep full tools.
+        return AgentRuntime(
+            ollama_url=user_cfg.models.ollama_url,
+            user_default_model=user_cfg.models.default_model,
+            history=ConversationHistory(max_turns=4),
+            registry_factory=_make_registry,
+            profile_fn=_profile_text,
+            media_db=media_db,
+            allow_actions=(origin == "desktop"),
+        )
+
+    job_worker = JobWorker(job_queue, _make_job_runtime, desktop_busy=inflight.is_set)
+    job_worker.start()
+
+    mobile_server = None
+    if getattr(args, "mobile_bind", None):
+        try:
+            import secrets as _secrets
+
+            from lora.gateway.auth import TokenValidator
+
+            m_host, _, m_port = args.mobile_bind.rpartition(":")
+            token_file = Path(cfg_mgr.paths.user_profile_file).parent / "mobile_token.txt"
+            token = os.environ.get("LORA_MOBILE_TOKEN") or (
+                token_file.read_text(encoding="utf-8").strip() if token_file.exists() else _secrets.token_urlsafe(32)
+            )
+            token_file.write_text(token, encoding="utf-8")
+            mobile_server = start_gateway_thread(
+                m_host, int(m_port), queue=job_queue, origin="mobile", token_validator=TokenValidator(mobile_token=token)
+            )
+            logger.info("Mobile gateway on http://%s:%s. Pairing token saved in %s", m_host, m_port, token_file)
+        except Exception as exc:
+            logger.warning("Could not start the mobile gateway: %s", exc)
+
+    # Show holographic HUD centered
+    screen_geo = app.primaryScreen().geometry()
+    hud.move(
+        max(0, (screen_geo.width() - hud.width()) // 2),
+        max(0, (screen_geo.height() - hud.height()) // 2),
+    )
+    hud.show()
     tray.show()
     audio.play_cue(SoundCue.WAKE)
+    threading.Thread(target=_warm_up_model, daemon=True).start()
     logger.info("L.O.R.A Desktop Platform initialized successfully.")
 
     exit_code = app.exec()
 
     # Clean shutdown
-    if capture:
-        capture.stop()
-    if hotkey:
-        hotkey.stop()
-    gateway_server.should_exit = True
+    on_exit()
+    job_worker.stop()
+    if tts_engine is not None:
+        try:
+            tts_engine.worker.shutdown()
+        except Exception:
+            pass
+    if runtime.mcp_hub is not None:
+        runtime.mcp_hub.close()
+    for server in (gateway_server, mobile_server):
+        if server is not None:
+            server.should_exit = True
     return exit_code
 
 
 def main() -> int:
     parser = build_argument_parser()
+    parser.add_argument(
+        "--mobile-bind",
+        default=None,
+        metavar="HOST:PORT",
+        help="Also listen for phone requests on this LAN address (token-protected). Off by default.",
+    )
     args = parser.parse_args()
 
     # Configure logging

@@ -18,6 +18,7 @@ class WakeWordResult(BaseModel):
     score: float = 0.0
     speaker_verified: bool = True
     speaker_similarity: float = 1.0
+    extracted_query: str = ""
 
 
 class SpeakerVerifier:
@@ -100,18 +101,30 @@ class SpeakerVerifier:
 
 
 class WakeWordDetector:
-    """Detects 'Awaken LORA' with optional openWakeWord ONNX model or acoustic pattern matcher."""
+    """Detects 'Awaken LORA' (wake from sleep) and 'Hey LORA' (chat from idle).
+
+    Features:
+    - Dual activation states:
+      1. From SLEEP: 'Awaken LORA' (or 'Wake up LORA') wakes the system into IDLE.
+      2. From IDLE: 'Hey LORA' activates listening to chat.
+    - Real-time keyword transcription verification via FasterWhisperTranscriber.
+    - Integrated speaker acoustic verification.
+    """
 
     def __init__(
         self,
         wake_phrase: str = "Awaken LORA",
+        chat_phrase: str = "Hey LORA",
         threshold: float = 0.65,
         model_path: str | None = None,
         speaker_verifier: SpeakerVerifier | None = None,
+        transcriber: Any = None,
     ) -> None:
         self.wake_phrase = wake_phrase
+        self.chat_phrase = chat_phrase
         self.threshold = threshold
         self.speaker_verifier = speaker_verifier or SpeakerVerifier()
+        self.transcriber = transcriber
         self._oww_model: Any = None
 
         if model_path:
@@ -121,46 +134,122 @@ class WakeWordDetector:
             except Exception:
                 self._oww_model = None
 
-    def process_audio(self, audio: np.ndarray, sample_rate: int = 16000) -> WakeWordResult:
-        """Evaluate audio buffer for wake phrase and enrolled speaker verification."""
+    SLEEP_KEYWORDS = (
+        "awaken lora", "awaken laura", "awaken lola", "awaken",
+        "wake up lora", "wake up laura", "wake up", "wake lora",
+    )
+    IDLE_KEYWORDS = (
+        "hey lora", "hey laura", "hi lora", "hi laura",
+        "hello lora", "hello laura", "awaken lora", "awaken laura",
+        "ok lora", "lora", "laura",
+    )
+
+    def match_text(self, text: str, is_sleeping: bool) -> tuple[bool, str]:
+        """Check an already-transcribed utterance for the activation phrase.
+
+        Returns (matched, query_after_the_phrase). Lets callers transcribe once
+        instead of once for the wake check and again for the query.
+        """
+        txt = (text or "").strip().lower()
+        if not txt:
+            return False, ""
+        if is_sleeping:
+            return any(kw in txt for kw in self.SLEEP_KEYWORDS), ""
+        for kw in self.IDLE_KEYWORDS:
+            if kw in txt:
+                after = txt[txt.find(kw) + len(kw):].strip(" ,.:;!?")
+                return True, after
+        return False, ""
+
+    def evaluate_text(
+        self,
+        text: str,
+        audio: np.ndarray,
+        sample_rate: int = 16000,
+        current_state: str = "idle",
+    ) -> WakeWordResult:
+        """Like process_audio, but for text that was already transcribed."""
+        is_sleeping = current_state.lower() in ("sleep", "sleeping")
+        target = self.wake_phrase if is_sleeping else self.chat_phrase
+        matched, query = self.match_text(text, is_sleeping)
+        if not matched:
+            return WakeWordResult(detected=False, phrase=target, score=0.0)
+        is_verified, sim = self.speaker_verifier.verify(audio, sample_rate)
+        return WakeWordResult(
+            detected=is_verified,
+            phrase=target,
+            score=0.95,
+            speaker_verified=is_verified,
+            speaker_similarity=sim,
+            extracted_query=query,
+        )
+
+    def process_audio(
+        self,
+        audio: np.ndarray,
+        sample_rate: int = 16000,
+        current_state: str = "idle",
+    ) -> WakeWordResult:
+        """Evaluate audio buffer for activation phrase matching current state."""
         if len(audio) < 1600:  # less than 100ms
-            return WakeWordResult(detected=False, phrase=self.wake_phrase, score=0.0)
+            target = self.wake_phrase if current_state.lower() in ("sleep", "sleeping") else self.chat_phrase
+            return WakeWordResult(detected=False, phrase=target, score=0.0)
 
+        is_sleeping = current_state.lower() in ("sleep", "sleeping")
+        target_phrase = self.wake_phrase if is_sleeping else self.chat_phrase
+        detected = False
         wake_score = 0.0
+        extracted_query = ""
 
-        if self._oww_model is not None:
+        # 1. Live Faster-Whisper keyword transcription pass if transcriber present
+        if self.transcriber is not None:
             try:
-                # openWakeWord expects 16-bit PCM integer chunks
+                res = self.transcriber.transcribe(audio, sample_rate=sample_rate)
+                matched, query = self.match_text(res.text, is_sleeping)
+                if matched:
+                    detected = True
+                    wake_score = 0.95
+                    target_phrase = self.wake_phrase if is_sleeping else self.chat_phrase
+                    extracted_query = query
+            except Exception:
+                pass
+
+        # 2. openWakeWord model if configured
+        if not detected and self._oww_model is not None:
+            try:
                 pcm_int16 = (audio * 32767).astype(np.int16)
                 prediction = self._oww_model.predict(pcm_int16)
                 for k, score in prediction.items():
                     if score > wake_score:
                         wake_score = float(score)
+                detected = wake_score >= self.threshold
             except Exception:
                 wake_score = 0.0
-        else:
-            # Acoustic envelope & energy check for wake activity
+
+        # 3. Energy & Acoustic envelope check fallback (supports unit tests and energy triggers)
+        if not detected and self.transcriber is None and self._oww_model is None:
             rms = float(np.sqrt(np.mean(audio**2)))
             if rms > 0.03:
-                # Scale RMS into a surrogate activation score
                 wake_score = float(min(1.0, rms * 10))
-
-        detected = wake_score >= self.threshold
+            detected = wake_score >= self.threshold
 
         if detected:
             is_verified, sim = self.speaker_verifier.verify(audio, sample_rate)
             return WakeWordResult(
                 detected=is_verified,
-                phrase=self.wake_phrase,
+                phrase=target_phrase,
                 score=wake_score,
                 speaker_verified=is_verified,
                 speaker_similarity=sim,
+                extracted_query=extracted_query,
             )
 
         return WakeWordResult(
             detected=False,
-            phrase=self.wake_phrase,
+            phrase=target_phrase,
             score=wake_score,
             speaker_verified=True,
             speaker_similarity=0.0,
+            extracted_query="",
         )
+

@@ -1,8 +1,11 @@
 """Desktop Application and Web App Launching Tools for L.O.R.A."""
 
 import ipaddress
+import os
+import shutil
 import socket
 import subprocess
+import sys
 import webbrowser
 from pathlib import Path
 from typing import Any
@@ -109,7 +112,19 @@ class AppLauncher:
         command = app_info["command"]
         try:
             # shell=False to prevent shell injection
-            subprocess.Popen([command], shell=False)
+            try:
+                subprocess.Popen([command], shell=False)
+            except FileNotFoundError:
+                # 1) shutil.which honours PATHEXT, so the allowlisted "code" finds code.cmd.
+                # 2) Windows apps like chrome.exe live under "App Paths", which CreateProcess (Popen) ignores
+                #    but ShellExecute (os.startfile) honours. The name is allowlisted either way.
+                resolved = shutil.which(command)
+                if resolved:
+                    subprocess.Popen([resolved], shell=False)
+                elif sys.platform == "win32":
+                    os.startfile(command)  # noqa: S606
+                else:
+                    raise
             return {
                 "status": "success",
                 "message": f"Successfully launched {app_info['name']}.",

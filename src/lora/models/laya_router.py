@@ -9,7 +9,11 @@ Provides fast, non-autoregressive, calibrated decision routing on CPU:
 
 from typing import Any
 
-import laya
+try:
+    import laya
+except ImportError:  # optional until the Laya router is actually used
+    laya = None  # type: ignore[assignment]
+
 from pydantic import BaseModel, Field
 
 
@@ -37,6 +41,10 @@ class LayaDecisionRouter:
         self.confidence_threshold = confidence_threshold
         self.risky_threshold = risky_threshold
         self.model_variant = model_variant
+        if laya is None:
+            raise ImportError(
+                "The 'laya' package is not installed. Install it before using LayaDecisionRouter."
+            )
         self.router = laya.Router(default=model_variant)
         self._setup_questions()
 

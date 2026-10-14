@@ -1,6 +1,8 @@
 """Async HTTP client for local Ollama service with structured output validation."""
 
 import json
+import re
+from collections.abc import AsyncIterator, Sequence
 from typing import Any, TypeVar
 
 import httpx
@@ -16,6 +18,82 @@ class OllamaClientError(Exception):
     pass
 
 
+def describe_exception(exc: BaseException) -> str:
+    """Readable text for an exception. httpx timeouts stringify to '' otherwise."""
+    text = str(exc).strip()
+    name = type(exc).__name__
+    if isinstance(exc, httpx.TimeoutException):
+        return (
+            f"{name}: Ollama did not answer in time. The model may still be loading "
+            "(large models take a while on first use) or the GPU is busy."
+        )
+    return f"{name}: {text}" if text else name
+
+
+def _normalize_model_name(name: str) -> tuple[str, str]:
+    base = name.strip().lower().split("/")[-1]
+    tag = ""
+    if ":" in base:
+        base, tag = base.split(":", 1)
+    return re.sub(r"[^a-z0-9]", "", base), tag
+
+
+def match_models(wanted: str, available: Sequence[str]) -> list[str]:
+    """All installed tags that satisfy ``wanted`` (exact first, then fuzzy)."""
+    if not wanted:
+        return []
+    exact = [a for a in available if a == wanted or a.lower() == wanted.lower()]
+    if exact:
+        return exact
+    want_base, want_tag = _normalize_model_name(wanted)
+    if not want_base:
+        return []
+    found: list[str] = []
+    for cand in available:
+        cand_base, cand_tag = _normalize_model_name(cand)
+        close = cand_base == want_base or (
+            min(len(cand_base), len(want_base)) >= 8
+            and (cand_base.startswith(want_base) or want_base.startswith(cand_base))
+        )
+        if not close:
+            continue
+        if want_tag and cand_tag and want_tag != cand_tag and "latest" not in (want_tag, cand_tag):
+            continue
+        found.append(cand)
+    return found
+
+
+def match_model(wanted: str, available: Sequence[str]) -> str | None:
+    """Map a configured model name onto an installed Ollama tag.
+
+    Exact match first, then case-insensitive, then a namespace/punctuation-insensitive
+    prefix match, so ``spark-x25-4b-q4`` finds ``SparkLLM/Spark-X2.5-4B:latest``.
+    """
+    if not wanted:
+        return None
+    if wanted in available:
+        return wanted
+    lowered = {a.lower(): a for a in available}
+    if wanted.lower() in lowered:
+        return lowered[wanted.lower()]
+
+    want_base, want_tag = _normalize_model_name(wanted)
+    if not want_base:
+        return None
+    for cand in available:
+        cand_base, cand_tag = _normalize_model_name(cand)
+        close = cand_base == want_base or (
+            min(len(cand_base), len(want_base)) >= 8
+            and (cand_base.startswith(want_base) or want_base.startswith(cand_base))
+        )
+        if not close:
+            continue
+        if want_tag and cand_tag and want_tag != cand_tag and "latest" not in (want_tag, cand_tag):
+            continue
+        return cand
+    return None
+
+
 class OllamaClient:
     """Async client interfacing with the local Ollama daemon."""
 
@@ -24,10 +102,41 @@ class OllamaClient:
         base_url: str = "http://127.0.0.1:11434",
         timeout: float = 60.0,
         max_retries: int = 2,
+        chat_timeout: float = 300.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.max_retries = max_retries
+        # Cold-loading a multi-GB model into 6 GB of VRAM can take well over a minute.
+        self.chat_timeout = max(chat_timeout, timeout)
+
+    def _chat_timeout(self) -> httpx.Timeout:
+        return httpx.Timeout(self.chat_timeout, connect=5.0)
+
+    async def warm_up(
+        self,
+        model: str,
+        options: dict[str, Any] | None = None,
+        keep_alive: str | int = "24h",
+        timeout: float = 240.0,
+    ) -> bool:
+        """Load ``model`` into memory now (empty prompt) so the first real request is fast.
+
+        Pass the same ``options`` (notably num_ctx) the chat uses, otherwise Ollama reloads.
+        """
+        payload: dict[str, Any] = {"model": model, "keep_alive": keep_alive, "stream": False}
+        if options:
+            payload["options"] = options
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=5.0)) as client:
+                res = await client.post(f"{self.base_url}/api/generate", json=payload)
+                return res.status_code == 200
+        except httpx.HTTPError:
+            return False
+
+    async def installed_models(self) -> list[str]:
+        """Names of installed models (empty list if none)."""
+        return [m.get("name", "") for m in await self.list_models() if m.get("name")]
 
     async def is_online(self) -> bool:
         """Check if the Ollama daemon is reachable and responding."""
@@ -53,6 +162,8 @@ class OllamaClient:
         messages: list[ChatMessage | dict[str, str]],
         format: str | dict[str, Any] | None = None,
         options: dict[str, Any] | None = None,
+        think: bool | str | None = None,
+        keep_alive: str | int | None = None,
     ) -> str:
         """Send chat request and return assistant message content."""
         normalized_messages = []
@@ -71,17 +182,78 @@ class OllamaClient:
             payload["format"] = format
         if options:
             payload["options"] = options
+        if think is not None:
+            payload["think"] = think
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self._chat_timeout()) as client:
             try:
                 res = await client.post(f"{self.base_url}/api/chat", json=payload)
+                if res.status_code == 400 and think is not None and "think" in res.text.lower():
+                    # Model does not support the think flag: retry without it.
+                    payload.pop("think", None)
+                    res = await client.post(f"{self.base_url}/api/chat", json=payload)
                 if res.status_code != 200:
                     raise OllamaClientError(f"Ollama chat error: HTTP {res.status_code} - {res.text}")
                 data = res.json()
                 response = OllamaChatResponse.model_validate(data)
                 return response.message.content
             except httpx.HTTPError as e:
-                raise OllamaClientError(f"Network error communicating with Ollama: {e}") from e
+                raise OllamaClientError(
+                    f"Network error communicating with Ollama: {describe_exception(e)}"
+                ) from e
+
+    async def stream_chat(
+        self,
+        model: str,
+        messages: list[ChatMessage | dict[str, str]],
+        options: dict[str, Any] | None = None,
+        think: bool | str | None = None,
+        keep_alive: str | int | None = None,
+    ) -> AsyncIterator[str]:
+        """Yield assistant text deltas as Ollama produces them (thinking tokens are skipped)."""
+        normalized = [m.model_dump() if isinstance(m, ChatMessage) else m for m in messages]
+        payload: dict[str, Any] = {"model": model, "messages": normalized, "stream": True}
+        if options:
+            payload["options"] = options
+        if think is not None:
+            payload["think"] = think
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
+
+        url = f"{self.base_url}/api/chat"
+        async with httpx.AsyncClient(timeout=self._chat_timeout()) as client:
+            try:
+                for attempt in range(2):
+                    async with client.stream("POST", url, json=payload) as res:
+                        if res.status_code != 200:
+                            body = (await res.aread()).decode("utf-8", "replace")
+                            if attempt == 0 and "think" in payload and "think" in body.lower():
+                                payload.pop("think")  # model does not support the think flag
+                                continue
+                            raise OllamaClientError(
+                                f"Ollama chat error: HTTP {res.status_code} - {body.strip()}"
+                            )
+                        async for line in res.aiter_lines():
+                            if not line.strip():
+                                continue
+                            try:
+                                chunk = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if chunk.get("error"):
+                                raise OllamaClientError(f"Ollama error: {chunk['error']}")
+                            delta = (chunk.get("message") or {}).get("content") or ""
+                            if delta:
+                                yield delta
+                            if chunk.get("done"):
+                                return
+                        return
+            except httpx.HTTPError as e:
+                raise OllamaClientError(
+                    f"Network error communicating with Ollama: {describe_exception(e)}"
+                ) from e
 
     async def generate_structured(
         self,

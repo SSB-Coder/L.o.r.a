@@ -54,7 +54,7 @@ def test_wake_word_detector_with_verifier(tmp_path: Path):
     assert res_quiet.detected is False
 
     # 3. Energetic audio matching owner -> detected and speaker verified
-    res_wake = detector.process_audio(audio1)
+    res_wake = detector.process_audio(audio1, current_state="sleep")
     assert res_wake.detected is True
     assert res_wake.phrase == "Awaken LORA"
     assert res_wake.speaker_verified is True
@@ -74,3 +74,37 @@ def test_enrollment_session_from_clips(tmp_path: Path):
     saved_path = session.enroll_from_audio_clips(clips, speaker_name="owner")
     assert saved_path.exists()
     assert len(verifier.reference_embeddings) == 3
+
+
+def test_dual_activation_sleep_and_idle():
+    from unittest.mock import MagicMock
+    from lora.voice.stt import TranscriptionResult
+
+    mock_stt = MagicMock()
+
+    detector = WakeWordDetector(
+        wake_phrase="Awaken LORA",
+        chat_phrase="Hey LORA",
+        transcriber=mock_stt,
+    )
+
+    audio_clip = np.ones(16000, dtype=np.float32) * 0.05
+
+    # 1. State SLEEP: user says "Awaken LORA"
+    mock_stt.transcribe.return_value = TranscriptionResult(text="Awaken LORA please", duration_seconds=1.0)
+    res_sleep = detector.process_audio(audio_clip, current_state="sleep")
+    assert res_sleep.detected is True
+    assert res_sleep.phrase == "Awaken LORA"
+
+    # 2. State IDLE: user says "Hey LORA, what is quantum computing?"
+    mock_stt.transcribe.return_value = TranscriptionResult(text="Hey LORA what is quantum computing?", duration_seconds=1.5)
+    res_idle = detector.process_audio(audio_clip, current_state="idle")
+    assert res_idle.detected is True
+    assert res_idle.phrase == "Hey LORA"
+    assert "quantum computing" in res_idle.extracted_query
+
+    # 3. State SLEEP: user says "Hey LORA" -> should NOT wake from sleep!
+    mock_stt.transcribe.return_value = TranscriptionResult(text="Hey LORA", duration_seconds=1.0)
+    res_sleep_ignore = detector.process_audio(audio_clip, current_state="sleep")
+    assert res_sleep_ignore.detected is False
+

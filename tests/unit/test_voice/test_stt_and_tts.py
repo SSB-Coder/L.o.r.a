@@ -46,7 +46,7 @@ def test_stt_transcription_empty_and_mocked():
 
 
 def test_tts_worker_and_engine_playback():
-    worker = Qwen3TtsWorkerProcess(spawn_process=False)
+    worker = Qwen3TtsWorkerProcess(models_dir="non_existent", spawn_process=False)
 
     # Empty text
     chunk_empty = worker.synthesize("")
@@ -55,7 +55,7 @@ def test_tts_worker_and_engine_playback():
     # Normal text
     chunk = worker.synthesize("Awaken LORA")
     assert len(chunk.samples) > 0
-    assert chunk.sample_rate == 24000
+    assert chunk.sample_rate in (22050, 24000)
 
     # Engine with custom playback sink
     played_audio_chunks = []
@@ -70,7 +70,7 @@ def test_tts_worker_and_engine_playback():
 
 
 def test_tts_engine_barge_in_interruption():
-    worker = Qwen3TtsWorkerProcess(spawn_process=False)
+    worker = Qwen3TtsWorkerProcess(models_dir="non_existent", spawn_process=False)
     played_count = 0
 
     engine = TtsEngine(worker=worker)

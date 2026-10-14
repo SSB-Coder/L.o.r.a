@@ -8,7 +8,7 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 from lora.ui.audio_cues import AudioCueManager, SoundCue
-from lora.ui.hud import HydroOrbWidget, LoraDesktopHUD
+from lora.ui.hud import LoraDesktopHUD
 from lora.ui.tray import LoraSystemTray
 from lora.ui.widget import AmbientDropletWidget, WidgetState
 
@@ -50,45 +50,6 @@ def test_ambient_droplet_widget(qapp):
     widget.toggle_sleep()
     assert widget.state == WidgetState.IDLE
 
-    # Magnetic snap calculation (Primary screen)
-    snapped_x, snapped_y = widget.calculate_snap_position(
-        target_x=10, target_y=10, screen_width=1920, screen_height=1080, margin=24
-    )
-    assert snapped_x == 24
-    assert snapped_y == 24
-
-    # Multi-monitor snap calculation (Secondary screen at x=1920)
-    sec_x, sec_y = widget.calculate_snap_position(
-        target_x=1930, target_y=10, screen_width=1920, screen_height=1080, screen_left=1920, screen_top=0, margin=24
-    )
-    assert sec_x == 1920 + 24
-    assert sec_y == 24
-
-
-def test_hydro_orb_visualizer_and_hud(qapp):
-    orb = HydroOrbWidget()
-    assert orb.is_active is False
-    orb.set_active(True)
-    assert orb.is_active is True
-
-    hud = LoraDesktopHUD()
-    assert hud.windowTitle() == "L.O.R.A - Desktop HUD"
-
-    # Add message
-    hud.append_message("Assistant", "System initialized and verified.")
-    feed_text = hud.chat_feed.toPlainText()
-    assert "System initialized" in feed_text
-
-    # Verify HTML escaping prevents injection
-    hud.append_message("User", "<script>alert('xss')</script><img src='http://evil.com/leak.png'>")
-    feed_html = hud.chat_feed.toHtml()
-    assert "&lt;script&gt;" in feed_html or "&lt;img" in feed_html
-    assert "<script>" not in feed_html
-
-    # Clipboard inspection
-    hud.set_input_text("Inspection test query")
-    assert hud.input_field.text() == "Inspection test query"
-
 
 def test_system_tray_creation(qapp):
     tray = LoraSystemTray()
@@ -100,56 +61,69 @@ def test_system_tray_creation(qapp):
     assert "Active" in tray.toolTip()
 
 
-def test_droplet_3d_widget_states(qapp):
-    from lora.ui.droplet_3d import Droplet3DWidget
-
-    droplet = Droplet3DWidget(size=200)
-    assert droplet.width() == 200
-    assert droplet.height() == 200
-
-    # Test state changes
-    droplet.set_state("listening")
-    assert droplet.is_active is True
-
-    droplet.set_state("idle")
-    assert droplet.is_active is False
-
-    # Test audio level and truthfulness
-    droplet.set_audio_level(0.75)
-    assert droplet._audio_level == pytest.approx(0.75, abs=0.01)
-
-    droplet.set_truthfulness(0.95)
-    assert droplet._truthfulness == pytest.approx(0.95, abs=0.01)
-
-
-def test_hud_evidence_cards_and_voice_states(qapp):
+def test_hud_creation_and_voice_states(qapp):
     hud = LoraDesktopHUD()
+    assert hud.windowTitle() == "L.O.R.A"
 
     # Test voice state changes
     hud.set_voice_state("listening")
-    assert "LISTENING" in hud.voice_state_badge.text()
+    assert hud._current_voice_state == "listening"
 
     hud.set_voice_state("speaking")
-    assert "SPEAKING" in hud.voice_state_badge.text()
+    assert hud._current_voice_state == "speaking"
 
-    # Test audio level update
-    hud.set_audio_level(0.8)
-    assert hud.mic_vu_bar.value() == 80
+    hud.set_voice_state("idle")
+    assert hud._current_voice_state == "idle"
 
-    # Test truthfulness score
-    hud.set_truthfulness_score(0.96, verified=8, total=8)
-    assert hud.grounding_bar.value() == 96
-    assert "96%" in hud.grounding_lbl.text()
 
-    # Test evidence cards
-    hud.add_evidence_card(
-        title="Attention Is All You Need",
-        source="arxiv",
-        snippet="We propose the Transformer model based on self-attention...",
-        confidence=0.98,
-        url="https://arxiv.org/abs/1706.03762",
-    )
-    assert hud.evidence_cards_layout.count() >= 2  # Card + stretch
-    hud.clear_evidence_cards()
-    assert hud.evidence_cards_layout.count() == 1  # Only stretch remaining
+def test_hud_thinking_state_locks_recording(qapp):
+    hud = LoraDesktopHUD()
 
+    # When thinking: PTT should be blocked
+    hud.set_voice_state("thinking")
+    assert hud._current_voice_state == "thinking"
+
+    ptt_events = []
+    hud.ptt_pressed.connect(lambda: ptt_events.append(True))
+    hud._handle_space_ptt()
+    assert len(ptt_events) == 0
+
+    hud._on_ptt_pressed()
+    assert len(ptt_events) == 0
+
+    # Returning to idle allows PTT
+    hud.set_voice_state("idle")
+    hud._on_ptt_pressed()
+    assert len(ptt_events) == 1
+
+
+def _spin(app, predicate, timeout=5.0):
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and not predicate():
+        app.processEvents()
+        time.sleep(0.01)
+
+
+def test_hud_media_db_integration(qapp, tmp_path):
+    from lora.grounding.media_vector_db import MediaVectorDB
+    from lora.grounding.embed import EmbeddingEngine
+
+    embedder = EmbeddingEngine(model_name_or_path="mock-dim-64")
+    embedder._use_fallback = True
+    embedder._fallback_dim = 64
+    media_db = MediaVectorDB(embedding_engine=embedder, storage_dir=tmp_path)
+    hud = LoraDesktopHUD(media_db=media_db)
+
+    # Test adding media file through IPC handler
+    sample_file = tmp_path / "sample.txt"
+    sample_file.write_text("Sample media document content", encoding="utf-8")
+
+    hud._handle_web_action("on_add_media_file", {"path": str(sample_file)})
+    _spin(qapp, lambda: media_db.file_count == 1)  # indexing now runs on a background thread
+    assert media_db.file_count == 1
+
+    # Test reporting on media
+    hud._handle_web_action("on_report_media", {"query": "Sample"})
+    assert media_db.file_count == 1

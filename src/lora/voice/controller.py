@@ -86,7 +86,11 @@ class VoiceController:
                 pass
 
     def _on_ptt_activate(self) -> None:
-        """Push-to-talk pressed: interrupt TTS and start listening immediately."""
+        """Push-to-talk pressed: interrupt TTS and start listening immediately (unless thinking/acting)."""
+        with self._lock:
+            curr_state = self.state
+        if curr_state in (VoiceState.THINKING, VoiceState.ACTING):
+            return
         self._ptt_active = True
         self.tts.interrupt()
         with self._lock:
@@ -110,11 +114,11 @@ class VoiceController:
         with self._lock:
             curr_state = self.state
 
-        # 1. When IDLE: check for wake word
+        # 1. When IDLE: check for wake word / chat activation
         if curr_state == VoiceState.IDLE:
             # Check last 1.5 seconds of audio in ring buffer
             recent_audio = self.capture.buffer.read_last_n_seconds(1.5)
-            wake_res = self.wakeword.process_audio(recent_audio)
+            wake_res = self.wakeword.process_audio(recent_audio, current_state="idle")
             if wake_res.detected and wake_res.speaker_verified:
                 logger.info(f"Wake word '{wake_res.phrase}' detected! Score: {wake_res.score:.2f}")
                 self.tts.interrupt()

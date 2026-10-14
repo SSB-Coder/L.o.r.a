@@ -2,6 +2,8 @@
 
 import logging
 import multiprocessing as mp
+import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -54,27 +56,269 @@ def _fallback_synth(text: str, sample_rate: int = 24000) -> np.ndarray:
     return samples
 
 
+def _windows_speech_synth(text: str, voice: str = "vivian") -> tuple[np.ndarray, int] | None:
+    """Ultra-fast native Windows Speech synthesis fallback generating real human spoken audio."""
+    import subprocess
+    import tempfile
+    import wave
+    from pathlib import Path
+
+    clean = text.replace('"', '""').replace("`", "").replace("'", "")
+    if not clean.strip():
+        return None
+
+    # Map voice names to installed Windows desktop voices
+    win_voice = "Microsoft Zira Desktop"
+    if voice.lower() in ("aiden", "dylan", "eric", "ryan", "uncle_fu", "david"):
+        win_voice = "Microsoft David Desktop"
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_wav = f.name
+
+        cmd = [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            f"Add-Type -AssemblyName System.Speech; "
+            f"$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            f"try {{ $s.SelectVoice('{win_voice}') }} catch {{}}; "
+            f"$s.SetOutputToWaveFile('{tmp_wav}'); "
+            f"$s.Speak('{clean[:400]}'); "
+            f"$s.Dispose()"
+        ]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=8.0)
+        p = Path(tmp_wav)
+        if p.exists() and p.stat().st_size > 100:
+            with wave.open(tmp_wav, "rb") as wf:
+                sr = wf.getframerate()
+                n = wf.getnframes()
+                data = wf.readframes(n)
+                samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+            p.unlink(missing_ok=True)
+            return samples, sr
+        p.unlink(missing_ok=True)
+    except Exception as e:
+        logger.debug("Windows speech synthesis fallback failed: %s", e)
+    return None
+
+
 _CACHED_QWEN_MODEL: Any = None
+_QWEN_STATUS: dict[str, str] = {"state": "unloaded", "reason": "", "fix": "", "dir": ""}
+_QWEN_LOAD_LOCK = threading.Lock()
+SMALL_MODEL_NAME = "Qwen3-TTS-12Hz-0.6B-CustomVoice"
+FIX_TORCH = r"run scripts\install_tts.ps1 (sets up a separate GPU environment just for the voice; nothing else changes)"
+
+
+def _has_weights(p: Path) -> bool:
+    return p.is_dir() and (
+        (p / "model.safetensors").exists()
+        or (p / "model.safetensors.index.json").exists()
+        or any(p.glob("model-*.safetensors"))
+    )
+
+
+def _weights_gb(p: Path) -> float:
+    return sum(f.stat().st_size for f in p.glob("*.safetensors")) / 1e9
+
+
+def candidate_model_dirs(models_dir: str) -> list[Path]:
+    """Model folders worth trying, in preference order (env override, configured, 0.6B sibling)."""
+    cands: list[Path] = []
+    env = os.environ.get("LORA_TTS_MODEL_DIR")
+    if env:
+        cands.append(Path(env))
+    base = Path(models_dir)
+    cands += [base, base.parent / SMALL_MODEL_NAME]
+    seen: set[str] = set()
+    out = []
+    for c in cands:
+        key = str(c).lower()
+        if key not in seen and _has_weights(c):
+            seen.add(key)
+            out.append(c)
+    return out
+
+
+def _need_gb(p: Path) -> float:
+    """VRAM a bf16 Qwen3-TTS folder needs: the weights, a little overhead, plus working memory."""
+    return _weights_gb(p) * 1.1 + 0.6
+
+
+def pick_model_dir(candidates: list[Path], free_gb: float | None) -> Path | None:
+    """The biggest model that fits in the free VRAM (all unknown -> the first/preferred one)."""
+    if not candidates:
+        return None
+    if free_gb is None:
+        return candidates[0]
+    fitting = [c for c in candidates if _need_gb(c) <= free_gb]
+    if not fitting:
+        return None
+    return max(fitting, key=_weights_gb)
+
+
+_EXTERNAL: Any = None
+_EXTERNAL_LOCK = threading.Lock()
+
+
+def get_external_server(models_dir: str) -> Any:
+    """The voice server in the separate GPU environment (.venv-tts), started once. None if not set up or failed."""
+    global _EXTERNAL
+    from lora.voice.tts.external import ExternalVoiceServer, find_tts_python
+
+    py = find_tts_python()
+    if py is None or os.environ.get("LORA_TTS_ENGINE", "auto").lower() == "windows":
+        return None
+    with _EXTERNAL_LOCK:
+        if _EXTERNAL is None:
+            _EXTERNAL = ExternalVoiceServer(py, models_dir)
+            _EXTERNAL.start()
+        return _EXTERNAL if _EXTERNAL.state == "ready" else None
+
+
+def _set_status(state: str, reason: str = "", fix: str = "", dir_: str = "") -> None:
+    _QWEN_STATUS.update({"state": state, "reason": reason, "fix": fix, "dir": dir_})
+    if state == "failed":
+        logger.warning("Qwen3-TTS unavailable, using the Windows voice: %s. Fix: %s", reason, fix or "see docs")
 
 
 def get_qwen_model(models_dir: str = r"C:\Models\Qwen3-TTS-12Hz-1.7B-CustomVoice") -> Any:
-    """Lazy loads and caches the local Qwen3TTSModel."""
+    """Load (once) and cache the Qwen3-TTS model on the GPU. Returns None, with a logged reason, if it cannot."""
     global _CACHED_QWEN_MODEL
     if _CACHED_QWEN_MODEL is not None:
         return _CACHED_QWEN_MODEL
-
-    try:
-        p = Path(models_dir)
-        if p.exists() and (p / "model.safetensors").exists():
-            from qwen_tts import Qwen3TTSModel
-
-            logger.info("Loading Qwen3-TTS model from %s on CPU...", models_dir)
-            _CACHED_QWEN_MODEL = Qwen3TTSModel.from_pretrained(str(p), device_map="cpu")
-            logger.info("Qwen3-TTS model successfully loaded.")
+    if os.environ.get("LORA_TTS_ENGINE", "auto").lower() == "windows":
+        _set_status("failed", "disabled by LORA_TTS_ENGINE=windows", "unset LORA_TTS_ENGINE")
+        return None
+    with _QWEN_LOAD_LOCK:
+        if _CACHED_QWEN_MODEL is not None:
             return _CACHED_QWEN_MODEL
-    except Exception as e:
-        logger.warning("Could not load Qwen3-TTS model: %s", e)
-    return None
+        if _QWEN_STATUS["state"] == "failed":
+            return None  # do not retry (and re-log) on every sentence
+        try:
+            import torch
+        except Exception as exc:
+            _set_status("failed", f"PyTorch is not installed ({exc})", FIX_TORCH)
+            return None
+        if not torch.cuda.is_available():
+            _set_status("failed", f"this PyTorch ({torch.__version__}) has no GPU support", FIX_TORCH)
+            return None
+        try:
+            from qwen_tts import Qwen3TTSModel
+        except Exception as exc:
+            _set_status("failed", f"the qwen-tts package is missing ({exc})", FIX_TORCH)
+            return None
+
+        candidates = candidate_model_dirs(models_dir)
+        if not candidates:
+            _set_status(
+                "failed",
+                f"no Qwen3-TTS model files found in {models_dir}",
+                f"download the model to that folder (or set LORA_TTS_MODEL_DIR); the smaller {SMALL_MODEL_NAME} also works",
+            )
+            return None
+        try:
+            free_gb = torch.cuda.mem_get_info()[0] / 1e9
+        except Exception:
+            free_gb = None
+        chosen = pick_model_dir(candidates, free_gb)
+        if chosen is None:
+            need = min(_need_gb(c) for c in candidates)
+            _set_status(
+                "failed",
+                f"not enough free GPU memory ({free_gb:.1f} GB free, {need:.1f} GB needed)",
+                f"download the smaller {SMALL_MODEL_NAME} next to the other model, or close other GPU programs",
+            )
+            return None
+        try:
+            logger.info("Loading Qwen3-TTS from %s (bf16, %.1f GB free VRAM)...", chosen, free_gb or -1)
+            try:
+                model = Qwen3TTSModel.from_pretrained(str(chosen), device_map="cuda:0", dtype=torch.bfloat16)
+            except TypeError:  # older transformers call it torch_dtype
+                model = Qwen3TTSModel.from_pretrained(str(chosen), device_map="cuda:0", torch_dtype=torch.bfloat16)
+            _CACHED_QWEN_MODEL = model
+            _set_status("loaded", dir_=str(chosen))
+            logger.info("Qwen3-TTS loaded on the GPU from %s.", chosen)
+            return model
+        except Exception as exc:
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            oom = "out of memory" in str(exc).lower()
+            _set_status(
+                "failed",
+                "ran out of GPU memory while loading" if oom else f"loading failed ({type(exc).__name__}: {exc})",
+                f"download the smaller {SMALL_MODEL_NAME}, or close other GPU programs" if oom else "see the terminal log",
+                str(chosen),
+            )
+            return None
+
+
+def _canonical_speaker(model: Any, voice: str) -> str:
+    """Qwen3-TTS speaker names are capitalised ('Vivian', 'Uncle_Fu'); ask the model when it can tell us."""
+    try:
+        supported = model.get_supported_speakers()
+        names = list(supported.keys()) if isinstance(supported, dict) else list(supported)
+        lookup = {n.lower(): n for n in names}
+        if voice.lower() in lookup:
+            return lookup[voice.lower()]
+        if names:
+            return lookup.get("vivian", names[0])
+    except Exception:
+        pass
+    return "_".join(part.capitalize() for part in voice.split("_"))
+
+
+def _qwen_generate(model: Any, text: str, voice: str) -> tuple[np.ndarray, int]:
+    wavs, sr = model.generate_custom_voice(text=text, language="English", speaker=_canonical_speaker(model, voice))
+    wav = wavs[0]
+    if hasattr(wav, "detach"):
+        wav = wav.detach().cpu().float().numpy()
+    return np.asarray(wav, dtype=np.float32).reshape(-1), int(sr)
+
+
+def tts_diagnosis(models_dir: str = r"C:\Models\Qwen3-TTS-12Hz-1.7B-CustomVoice") -> dict[str, Any]:
+    """Plain-language status of the natural voice, for 'run diagnostics' and the startup log."""
+    from lora.voice.tts.external import find_tts_python
+
+    if find_tts_python() is not None:
+        ext = _EXTERNAL
+        if ext is not None and ext.state == "ready":
+            return {"ok": True, "summary": "natural voice ready.", "detail": f"Qwen3-TTS in the voice environment: {ext.dir}"}
+        if ext is not None and ext.state == "failed":
+            return {
+                "ok": False,
+                "summary": f"using the Windows voice instead of the natural one ({ext.reason}).",
+                "fix": ext.fix,
+                "detail": ext.reason,
+            }
+        return {"ok": True, "summary": "natural voice will start with the app.", "detail": "voice environment found"}
+    state = _QWEN_STATUS["state"]
+    if state == "loaded":
+        return {"ok": True, "summary": "natural voice ready.", "detail": f"Qwen3-TTS loaded from {_QWEN_STATUS['dir']}"}
+    if state == "failed":
+        return {
+            "ok": False,
+            "summary": f"using the Windows voice instead of the natural one ({_QWEN_STATUS['reason']}).",
+            "fix": _QWEN_STATUS["fix"],
+            "detail": _QWEN_STATUS["reason"],
+        }
+    # not tried yet: report what we can see without loading anything
+    try:
+        import torch
+    except Exception as exc:
+        return {"ok": False, "summary": "natural voice unavailable: PyTorch is not installed.", "fix": FIX_TORCH, "detail": str(exc)}
+    if not torch.cuda.is_available():
+        return {"ok": False, "summary": "natural voice unavailable: PyTorch has no GPU support.", "fix": FIX_TORCH, "detail": f"torch {torch.__version__}"}
+    try:
+        import qwen_tts  # noqa: F401
+    except Exception as exc:
+        return {"ok": False, "summary": "natural voice unavailable: qwen-tts is not installed.", "fix": FIX_TORCH, "detail": str(exc)}
+    cands = candidate_model_dirs(models_dir)
+    if not cands:
+        return {"ok": False, "summary": "natural voice unavailable: model files not found.", "fix": f"download the model to {models_dir}", "detail": models_dir}
+    return {"ok": True, "summary": "natural voice will load on first use.", "detail": ", ".join(str(c) for c in cands)}
 
 
 def _run_tts_worker_loop(
@@ -93,21 +337,20 @@ def _run_tts_worker_loop(
 
         try:
             sample_rate = 24000
+            samples = None
             if qwen_model is not None:
                 try:
                     speaker = job.voice if job.voice in SUPPORTED_VOICES else "vivian"
-                    wavs, sr = qwen_model.generate_custom_voice(
-                        text=job.text,
-                        speaker=speaker,
-                        language="English",
-                    )
-                    samples = wavs[0].astype(np.float32)
-                    sample_rate = sr
+                    samples, sample_rate = _qwen_generate(qwen_model, job.text, speaker)
                 except Exception as ex:
-                    logger.warning("Qwen3 synthesis error in loop, using fallback: %s", ex)
+                    logger.warning("Qwen3 synthesis error in loop: %s", ex)
+
+            if samples is None:
+                win_res = _windows_speech_synth(job.text, voice=job.voice)
+                if win_res is not None:
+                    samples, sample_rate = win_res
+                else:
                     samples = _fallback_synth(job.text)
-            else:
-                samples = _fallback_synth(job.text)
 
             chunk = TtsAudioChunk(
                 job_id=job.job_id,
@@ -151,6 +394,24 @@ class Qwen3TtsWorkerProcess:
         if self.spawn_process:
             self.start()
 
+    def preload(self) -> bool:
+        """Load the natural voice now (call before the language model is loaded so both fit in VRAM)."""
+        if get_external_server(self.models_dir) is not None:
+            return True
+        if _EXTERNAL is not None and _EXTERNAL.state == "failed":
+            return False  # the separate environment exists but could not load: do not also try in-process
+        return get_qwen_model(self.models_dir) is not None
+
+    def diagnosis(self) -> dict[str, Any]:
+        return tts_diagnosis(self.models_dir)
+
+    def shutdown(self) -> None:
+        """Stop the separate voice process (frees its GPU memory)."""
+        global _EXTERNAL
+        if _EXTERNAL is not None:
+            _EXTERNAL.stop()
+            _EXTERNAL = None
+
     def get_supported_voices(self) -> list[str]:
         return list(SUPPORTED_VOICES)
 
@@ -179,17 +440,22 @@ class Qwen3TtsWorkerProcess:
 
         target_voice = voice if voice in SUPPORTED_VOICES else self.default_voice
 
+        # 0. The separate GPU voice environment (.venv-tts), if it has been set up
+        ext = get_external_server(self.models_dir)
+        if ext is not None:
+            audio = ext.synthesize(text, target_voice)
+            if audio is not None:
+                samples, sr = audio
+                return TtsAudioChunk(
+                    job_id=job_id, text=text, samples=samples, sample_rate=sr, duration=len(samples) / sr, is_last=True
+                )
+
         # 1. Direct in-process execution if not running separate subprocess
         if not self.spawn_process or self._process is None or not self._process.is_alive():
-            model = get_qwen_model(self.models_dir)
+            model = None if (_EXTERNAL is not None and _EXTERNAL.state == "failed") else get_qwen_model(self.models_dir)
             if model is not None:
                 try:
-                    wavs, sr = model.generate_custom_voice(
-                        text=text,
-                        speaker=target_voice,
-                        language="English",
-                    )
-                    samples = wavs[0].astype(np.float32)
+                    samples, sr = _qwen_generate(model, text, target_voice)
                     return TtsAudioChunk(
                         job_id=job_id,
                         text=text,
@@ -200,6 +466,19 @@ class Qwen3TtsWorkerProcess:
                     )
                 except Exception as e:
                     logger.warning("In-process Qwen3 generation failed: %s", e)
+
+            # Fast Windows speech synthesis fallback for natural vocal articulation
+            win_res = _windows_speech_synth(text, voice=target_voice)
+            if win_res is not None:
+                samples, sr = win_res
+                return TtsAudioChunk(
+                    job_id=job_id,
+                    text=text,
+                    samples=samples,
+                    sample_rate=sr,
+                    duration=len(samples) / sr,
+                    is_last=True,
+                )
 
             # Fallback for tests or missing model
             samples = _fallback_synth(text)

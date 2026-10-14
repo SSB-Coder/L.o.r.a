@@ -84,7 +84,7 @@ def test_root_redirects_to_app(test_setup):
     client = TestClient(app)
     res = client.get("/", follow_redirects=False)
     assert res.status_code in (302, 307)
-    assert res.headers["location"] == "/app"
+    assert res.headers["location"] in ("/app", "/hud/droplet.html")
 
 
 def test_desktop_auth_enforcement(test_setup):

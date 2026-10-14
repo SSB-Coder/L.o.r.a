@@ -23,7 +23,7 @@ class FasterWhisperTranscriber:
     """Low-latency CPU transcription using faster-whisper (CTranslate2)."""
 
     DEFAULT_VOCABULARY_PROMPT = (
-        "LORA, Awaken LORA, arXiv, RAG, Ollama, Python, VS Code, GitHub, Hugging Face, Gemma, Granite"
+        "LORA, Awaken LORA, open VS Code, open Chrome, open Notepad, open Spotify, YouTube, Downloads, Documents, Desktop, arXiv, RAG, Ollama, Python, GitHub, Hugging Face"
     )
 
     def __init__(
@@ -47,11 +47,19 @@ class FasterWhisperTranscriber:
         """Instantiate WhisperModel if not already loaded."""
         if self._model is None:
             from faster_whisper import WhisperModel
-            self._model = WhisperModel(
-                self.model_size_or_path,
-                device=self.device,
-                compute_type=self.compute_type,
-            )
+            try:
+                self._model = WhisperModel(
+                    self.model_size_or_path,
+                    device=self.device,
+                    compute_type=self.compute_type,
+                    local_files_only=True,
+                )
+            except Exception:
+                self._model = WhisperModel(
+                    self.model_size_or_path,
+                    device=self.device,
+                    compute_type=self.compute_type,
+                )
         return self._model
 
     def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> TranscriptionResult:
@@ -62,14 +70,19 @@ class FasterWhisperTranscriber:
         duration = len(audio) / sample_rate
         start_time = time.monotonic()
 
+        # Normalize audio amplitude if audio is quiet
+        peak = float(np.max(np.abs(audio))) if len(audio) > 0 else 0.0
+        norm_audio = (audio / peak * 0.95) if peak > 0.01 else audio
+
         model = self._ensure_model_loaded()
 
         # faster-whisper accepts float32 numpy arrays directly
+        # vad_filter is False because incoming audio is already gated by our VAD or PTT
         segments, info = model.transcribe(
-            audio.astype(np.float32),
+            norm_audio.astype(np.float32),
             beam_size=1,
             initial_prompt=self.initial_prompt,
-            vad_filter=True,
+            vad_filter=False,
             language="en",
         )
 

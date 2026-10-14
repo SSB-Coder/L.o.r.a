@@ -2,12 +2,30 @@
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
+
+
+class _ThreadLock:
+    """``async with``-able lock that works from any thread or event loop.
+
+    asyncio.Lock is tied to one loop; the queue is shared by the desktop listener, the mobile
+    listener and the job-worker thread. Critical sections never await, so a plain lock is enough.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    async def __aenter__(self) -> _ThreadLock:
+        self._lock.acquire()
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        self._lock.release()
 
 
 class JobStatus(StrEnum):
@@ -53,7 +71,7 @@ class JobQueue:
         self._queue: list[JobItem] = []
         self._jobs: dict[str, JobItem] = {}
         self._active_job: JobItem | None = None
-        self._lock = asyncio.Lock()
+        self._lock = _ThreadLock()
 
     async def enqueue(self, job: JobItem) -> int:
         """Enqueue a job with priority rules: Desktop jobs jump ahead of mobile jobs."""

@@ -77,8 +77,6 @@ class AmbientDropletWidget(QWidget):
     def set_audio_level(self, level: float) -> None:
         """Sets mic audio level to trigger liquid ripples."""
         self._audio_level = max(0.0, min(1.0, level))
-        if self._audio_level > 0.05 and self._state != WidgetState.SLEEPING:
-            self.setWindowOpacity(0.95)
         self.update()
 
     def toggle_sleep(self) -> None:

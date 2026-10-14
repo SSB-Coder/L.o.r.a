@@ -118,3 +118,15 @@ def test_voice_controller_start_and_stop():
     assert controller._running is False
     assert controller.capture.is_recording is False
     assert controller.state == VoiceState.IDLE
+
+
+def test_voice_controller_ptt_blocked_when_thinking():
+    controller = VoiceController()
+    controller.state = VoiceState.THINKING
+
+    # Attempt to activate PTT while thinking
+    controller._on_ptt_activate()
+    # Must remain in THINKING, not change to LISTENING
+    assert controller.state == VoiceState.THINKING
+    assert controller._ptt_active is False
+
