@@ -4,7 +4,8 @@
 [CmdletBinding()]
 param (
     [switch]$SkipShortcuts,
-    [switch]$SkipAcl
+    [switch]$SkipAcl,
+    [switch]$SkipModels
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,7 +18,7 @@ Write-Host "============================================================" -Foreg
 Write-Host "Project Root: $ProjectRoot" -ForegroundColor Gray
 
 # 1. Check Python
-Write-Host "`n[1/5] Checking Python runtime..." -ForegroundColor Yellow
+Write-Host "`n[1/6] Checking Python runtime..." -ForegroundColor Yellow
 $PythonCmd = Get-Command python -ErrorAction SilentlyContinue
 if (-not $PythonCmd) {
     Write-Error "Python is not installed or not in system PATH. Please install Python 3.11 or higher."
@@ -27,7 +28,7 @@ $PythonVersion = & python --version 2>&1
 Write-Host "Found: $PythonVersion" -ForegroundColor Green
 
 # 2. Virtual Environment Setup
-Write-Host "`n[2/5] Setting up virtual environment (.venv)..." -ForegroundColor Yellow
+Write-Host "`n[2/6] Setting up virtual environment (.venv)..." -ForegroundColor Yellow
 $VenvPython = "$ProjectRoot\.venv\Scripts\python.exe"
 if (-not (Test-Path $VenvPython)) {
     Write-Host "Creating virtual environment at .venv..." -ForegroundColor Gray
@@ -37,7 +38,7 @@ if (-not (Test-Path $VenvPython)) {
 }
 
 # 3. Installing Dependencies
-Write-Host "`n[3/5] Installing package and dependencies..." -ForegroundColor Yellow
+Write-Host "`n[3/6] Installing package and dependencies..." -ForegroundColor Yellow
 $UvCmd = Get-Command uv -ErrorAction SilentlyContinue
 if ($UvCmd) {
     Write-Host "Using uv for fast dependency installation..." -ForegroundColor Gray
@@ -47,15 +48,23 @@ if ($UvCmd) {
     & "$ProjectRoot\.venv\Scripts\pip.exe" install -e .
 }
 
-# 4. Initialize ~/.lora/ and lock NTFS ACLs
-Write-Host "`n[4/5] Initializing ~/.lora/ ecosystem & securing NTFS permissions..." -ForegroundColor Yellow
+# 4. Setup Models in models/
+if (-not $SkipModels) {
+    Write-Host "`n[4/6] Setting up models in models/ (Kokoro TTS, Laya Router, Embedding Gemma 2)..." -ForegroundColor Yellow
+    & "$VenvPython" "$ProjectRoot\scripts\download_models.py"
+} else {
+    Write-Host "`n[4/6] Skipping models setup (-SkipModels specified)." -ForegroundColor Gray
+}
+
+# 5. Initialize ~/.lora/ and lock NTFS ACLs
+Write-Host "`n[5/6] Initializing ~/.lora/ ecosystem & securing NTFS permissions..." -ForegroundColor Yellow
 $InitCmd = "from lora.config.manager import ConfigManager; mgr = ConfigManager(); mgr.ensure_ecosystem(apply_acls=$(-not $SkipAcl))"
 & "$VenvPython" -c "$InitCmd"
 Write-Host "User ecosystem initialized at: $env:USERPROFILE\.lora" -ForegroundColor Green
 
-# 5. Create Windows Desktop & Start Menu Shortcuts
+# 6. Create Windows Desktop & Start Menu Shortcuts
 if (-not $SkipShortcuts) {
-    Write-Host "`n[5/5] Creating Windows Desktop and Start Menu shortcuts..." -ForegroundColor Yellow
+    Write-Host "`n[6/6] Creating Windows Desktop and Start Menu shortcuts..." -ForegroundColor Yellow
     $WshShell = New-Object -ComObject WScript.Shell
     
     $RunnerBat = "$ProjectRoot\run_lora.bat"

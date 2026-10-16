@@ -9,7 +9,21 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL_PATH = os.getenv("LORA_EMBEDDING_MODEL_PATH", "C:/Models/embeddinggemma-2")
+def _resolve_default_embedding_path() -> str:
+    env_path = os.getenv("LORA_EMBEDDING_MODEL_PATH")
+    if env_path and Path(env_path).exists():
+        return env_path
+    for cand in (
+        Path("models/embeddinggemma-2"),
+        Path("models/embedding-gemma-2"),
+        Path(r"C:\Models\embeddinggemma-2"),
+    ):
+        if cand.exists():
+            return str(cand.resolve())
+    return env_path or str(Path("models/embeddinggemma-2").resolve())
+
+
+DEFAULT_MODEL_PATH = _resolve_default_embedding_path()
 
 
 class EmbeddingEngine:

@@ -91,6 +91,7 @@ class LoraDesktopHUD(QMainWindow):
     stop_audio_requested = Signal()
     sleep_toggled = Signal(bool)
     voice_toggled = Signal(bool)  # spoken replies on/off
+    mobile_qr_requested = Signal()
     _media_notice = Signal(str, bool)  # (message, refresh the list) from a worker thread
     _media_report = Signal(str)  # report text from a worker thread
     exit_requested = Signal()
@@ -225,6 +226,8 @@ class LoraDesktopHUD(QMainWindow):
         elif action == "on_sleep_toggle":
             is_sleeping = payload.get("is_sleeping", False)
             self.sleep_toggled.emit(is_sleeping)
+        elif action == "on_show_mobile_qr":
+            self.mobile_qr_requested.emit()
         elif action == "on_open_url":
             self._open_external_url(str(payload.get("url", "")))
         elif action == "on_open_path":
@@ -357,6 +360,10 @@ class LoraDesktopHUD(QMainWindow):
     def set_sources(self, sources: list[Any]) -> None:
         """Attach clickable sources to the currently streaming answer bubble immediately."""
         self._run_js(f"window.setSources && window.setSources({json.dumps(sources or [])});")
+
+    def set_verification(self, meta: dict[str, Any]) -> None:
+        """Attach or update the 8-Way Verification Scorecard & Laya trace immediately."""
+        self._run_js(f"window.setVerification && window.setVerification({json.dumps(meta or {})});")
 
     def update_model_list(self, models: list[str], active_model: str = "auto") -> None:
         """Populate the top-bar Model Selector dropdown with installed Ollama models."""

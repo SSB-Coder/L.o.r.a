@@ -79,6 +79,7 @@ body.empty #chat{display:none}
 sup.c{color:var(--ac);cursor:pointer;font-size:.68em;padding:0 1px}
 .dots{color:var(--dm)}.dots::after{content:"";animation:dots 1.4s steps(4) infinite}
 @keyframes dots{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}
+.live-st{margin-top:8px;padding:5px 10px;border-radius:8px;background:var(--bubble);border:1px solid var(--line);color:var(--ac);font-size:12.5px;display:inline-block}
 details.src,details.ver{margin-top:8px;font-size:13px;color:var(--dm);border:1px solid var(--line);border-radius:10px;padding:6px 11px;background:var(--panel)}
 details.src summary,details.ver summary{cursor:pointer;font-weight:500;color:var(--tx);padding:2px 0}
 details.src .s{display:flex;gap:8px;align-items:baseline;padding:3px 0}
@@ -99,6 +100,7 @@ details.src a:hover{text-decoration:underline}
 .chk .s{padding:2px 0 2px 14px}
 .agent-trace{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;font-size:11.8px;color:var(--dm)}
 .agent-chip{background:var(--bubble);border:1px solid var(--line);border-radius:99px;padding:2px 9px}
+.agent-chip.laya{border-color:var(--ac);color:var(--ac)}
 .artifacts{display:flex;flex-direction:column;gap:8px;margin-top:10px}
 .art-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 12px;display:flex;flex-direction:column;gap:8px}
 .art-card img{max-width:100%;max-height:320px;border-radius:8px;object-fit:contain;background:#071018}
@@ -182,8 +184,9 @@ body.empty #hint{bottom:78px}
      <option value="bm_lewis">bm_lewis (UK Male Lewis)</option>
      <option value="bm_daniel">bm_daniel (UK Male Daniel)</option>
     </select>
-    <div class="mh">Specialist Sub-Agents (6 Active)</div>
+    <div class="mh">Specialist Sub-Agents (6 Active + Laya Router)</div>
     <div id="subagent-list">
+     <div class="ag-pill"><b>Laya Decision Router</b><span>CPU intent, depth, risk &amp; topic classification</span></div>
      <div class="ag-pill"><b>Supervisor &amp; Planner</b><span>Intent routing, skill selection &amp; model scaling</span></div>
      <div class="ag-pill"><b>System &amp; Web Navigator</b><span>Apps, site topic pages &amp; external AI delegation</span></div>
      <div class="ag-pill"><b>Deep Research Agent</b><span>Multi-query web retrieval &amp; cited synthesis</span></div>
@@ -210,6 +213,7 @@ body.empty #hint{bottom:78px}
    <button class="tl" id="morebtn" aria-haspopup="true" aria-expanded="false" aria-label="More">⋯</button>
    <div class="menu small" id="moremenu" hidden>
     <button class="mi" id="vo">Voice on</button>
+    <button class="mi" id="qr">Pair Mobile (QR)</button>
     <button class="mi" id="sl">Sleep</button>
     <button class="mi" id="off">Quit</button>
    </div>
@@ -353,7 +357,7 @@ const HINT={
  idle:'',
  listen:'Listening…',
  think:'',
- verify:'',
+ verify:'Verifying claims (V1–V8)…',
  speak:'Speaking',
  sleep:'Sleeping · say “Awaken LORA” or tap the droplet',
  off:'Off · tap the droplet to start'
@@ -448,7 +452,10 @@ function inline(t){
   .replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,;:!?]|$)/g,'$1<em>$2</em>')
   .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,(m,a,u)=>'<a href="#" data-url="'+u+'">'+a+'</a>')
   .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g,(m,p,u)=>p+'<a href="#" data-url="'+u+'">'+u+'</a>')
-  .replace(/\[S(\d+)\]/g,'<sup class="c" data-i="$1">$1</sup>');
+  .replace(/\[((?:S\d+[\s,;p.\d]*)+)\]/gi,(m,inner)=>{
+   const ids=[...inner.matchAll(/S(\d+)/gi)].map(x=>x[1]);
+   return ids.length?ids.map(n=>'<sup class="c" data-i="'+n+'">'+n+'</sup>').join(' '):m;
+  });
 }
 function md(src){
  const parts=String(src).split(/```/);let out='';
@@ -544,6 +551,12 @@ function addBot(){
  return {el:d,body,sources:[],hasText:false};
 }
 function setPending(m,text){m.body.innerHTML='<span class="dots">'+esc((text||'Thinking').replace(/[\u2026.]+$/,''))+'</span>'}
+function setLiveStatus(m,text){
+ let pill=m.el.querySelector('.live-st');
+ if(!text){if(pill)pill.remove();return}
+ if(!pill){pill=document.createElement('div');pill.className='live-st';m.el.appendChild(pill)}
+ pill.textContent='⟳ '+text;
+}
 function normSources(src){
  return (src||[]).map((s,i)=>Array.isArray(s)?{id:s[0],title:s[1],url:'',domain:s[2]||''}:{id:s.id||('S'+(i+1)),title:s.title||s.url||'',url:s.url||'',domain:s.domain||''});
 }
@@ -582,8 +595,14 @@ function renderVerificationDropdown(m,meta){
  const pct=Math.round((vl.score||0)*100);
  const stages=vl.stages||[];
  const iters=vl.iterations||[];
+ const laya=(meta&&meta.laya_decision)||(meta&&meta.agent_trace&&meta.agent_trace.laya)||null;
  const det=document.createElement('details');det.className='ver';
  let html='<summary>Verification Scorecard · '+pct+'% ('+(vl.passed_checks||stages.length)+'/'+(vl.total_checks||8)+' checks · '+iters.length+' iteration'+(iters.length===1?'':'s')+')</summary>';
+ if(laya&&laya.intent){
+  const lconf=Math.round((laya.intent_confidence||0.95)*100);
+  html+='<div class="v-sec"><div class="v-title">Laya Decision Router ('+esc(laya.backend||'CPU')+')</div>';
+  html+='<div class="v-iter"><span><b>Intent: '+esc(laya.intent)+'</b> ('+lconf+'%) · Topic: '+esc(laya.topic_type||'background')+'</span><span>Depth: <b>'+esc(laya.depth_mode||'standard')+'</b> · Mode: <b>'+esc(laya.run_mode||'standard')+'</b> · Risk: <b>'+esc(laya.action_risk||'tier0')+'</b></span></div></div>';
+ }
  if(iters.length){
   html+='<div class="v-sec"><div class="v-title">Prompt &amp; Score Iterations</div>';
   iters.forEach(it=>{
@@ -608,11 +627,17 @@ function renderVerificationDropdown(m,meta){
 function renderAgentTrace(m,meta){
  const old=m.el.querySelector('.agent-trace');if(old)old.remove();
  const tr=meta&&meta.agent_trace;
- if(!tr||!tr.agents||!tr.agents.length)return;
+ const laya=(meta&&meta.laya_decision)||(tr&&tr.laya)||null;
+ if((!tr||!tr.agents||!tr.agents.length)&&!laya)return;
  const d=document.createElement('div');d.className='agent-trace';
  const chips=[];
- if(tr.active_skill&&tr.active_skill!=='auto')chips.push('<span class="agent-chip">Skill: '+esc(tr.active_skill)+'</span>');
- tr.agents.forEach(a=>{chips.push('<span class="agent-chip">'+esc(a.name)+'</span>')});
+ if(laya&&laya.intent){
+  chips.push('<span class="agent-chip laya">Laya Router: '+esc(laya.intent)+' · '+esc(laya.depth_mode||'standard')+' · '+esc(laya.action_risk||'tier0')+'</span>');
+ }
+ if(tr&&tr.active_skill&&tr.active_skill!=='auto')chips.push('<span class="agent-chip">Skill: '+esc(tr.active_skill)+'</span>');
+ if(tr&&tr.agents){
+  tr.agents.forEach(a=>{chips.push('<span class="agent-chip">'+esc(a.name)+'</span>')});
+ }
  d.innerHTML=chips.join('');
  m.el.appendChild(d);
 }
@@ -711,6 +736,7 @@ $('#hit').onmousedown=()=>{
 };
 $('#mic').onmousedown=()=>{pttActive=true;startPTT()};
 $('#sl').onclick=()=>{closeMenu();toggleSleep()};
+$('#qr').onclick=()=>{closeMenu();notifyPython('on_show_mobile_qr',{})};
 $('#off').onclick=()=>{closeMenu();busy=false;setState('off');notifyPython('on_turn_off',{})};
 $('#vo').onclick=()=>{voice=!voice;$('#vo').textContent='Voice '+(voice?'on':'off');closeMenu();notifyPython('on_voice_toggle',{enabled:voice})};
 
@@ -790,8 +816,21 @@ window.setMicStatus=(ok,text)=>{
  $('#mictx').textContent=ok?'':('Microphone off: '+text);
  m.title=ok?('Microphone: '+text):('Microphone off: '+text);
 };
-window.setStatus=(t)=>{if(cur&&!cur.hasText)setPending(cur,t)};
-window.setSources=(sources)=>{if(cur)renderSources(cur,sources)};
+window.setStatus=(t)=>{
+ lastActivity=Date.now();
+ if(!cur)return;
+ if(!cur.hasText){setPending(cur,t)}
+ else{
+  setLiveStatus(cur,t);
+  if(/check|verif|opinion|improv|refin/i.test(t||''))setState('verify');
+ }
+};
+window.setSources=(sources)=>{lastActivity=Date.now();if(cur)renderSources(cur,sources)};
+window.setVerification=(meta)=>{
+ lastActivity=Date.now();
+ const target=cur||(()=>{const bots=$msgs.querySelectorAll('.msg.bot');const lastEl=bots[bots.length-1];return lastEl?{el:lastEl,sources:lastEl._src||[]}:null})();
+ if(target)renderMeta(target,meta);
+};
 window.updateModelList=(models,activeModel)=>{
  const box=$('#model-list');if(!box)return;
  const act=activeModel||'auto';
@@ -826,9 +865,10 @@ window.streamUpdate=(text)=>{
  if(stick)toBottom();
 };
 window.finishTurn=async(q,text,sources,conf,label,streamed,meta)=>{
- busy=false;streaming=false;
+ busy=false;streaming=false;lastActivity=Date.now();
  const stick=nearBottom();
  if(!cur||!streamed){ if(!cur||!(cur.pending&&lastUser.text===q)){if(q)addUser(q);cur=addBot()} }
+ setLiveStatus(cur,'');
  cur.pending=false;cur.hasText=true;cur.body.innerHTML=md(text);
  renderSources(cur,sources);
  renderMeta(cur,meta);
@@ -863,7 +903,7 @@ window.updateMediaList=(files)=>{
 setInterval(()=>{
  if((mode==='think'||mode==='verify')&&Date.now()-lastActivity>240000){
   busy=false;streaming=false;
-  if(cur){cur.body.innerHTML='';const n=document.createElement('div');n.className='notice';n.textContent='I didn\u2019t get an answer. Please try again.';cur.body.appendChild(n);cur=null}
+  if(cur){setLiveStatus(cur,'');cur.body.innerHTML='';const n=document.createElement('div');n.className='notice';n.textContent='I didn\u2019t get an answer. Please try again.';cur.body.appendChild(n);cur=null}
   setState('idle');
  }
 },5000);

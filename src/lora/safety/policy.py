@@ -49,7 +49,7 @@ class PolicyEngine:
         str(Path.home() / "Documents"),
         str(Path.home() / "Downloads"),
         str(Path.home() / "Desktop"),
-        str(Path("C:/Thought/Projects")),
+        str(Path.cwd().resolve()),
     ]
 
     DEFAULT_BLOCKED_EXTENSIONS = [

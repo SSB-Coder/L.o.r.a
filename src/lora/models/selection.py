@@ -4,6 +4,7 @@ Supports:
 - Manual model selection (`manual_model` override from UI or voice/text command)
 - Automatic complexity & modality routing (`writer` -> 4B fast, `complex`/`agent` -> 8B/9B, `vision` -> multimodal)
 - Runtime auto-escalation (`pick_escalation_model`) when a task is too complex for the current model
+- Strict 6 GB VRAM KV-cache protection (`num_ctx` capped to 8192 for `-8k` models and interactive roles)
 """
 
 from __future__ import annotations
@@ -163,12 +164,25 @@ def candidate_names(
     return names
 
 
-def build_options(role_cfg: dict[str, Any], role: str = "writer") -> tuple[dict[str, Any], bool | str | None]:
+def build_options(
+    role_cfg: dict[str, Any],
+    role: str = "writer",
+    model_name: str = "",
+) -> tuple[dict[str, Any], bool | str | None]:
     options: dict[str, Any] = {}
     if "temperature" in role_cfg:
         options["temperature"] = float(role_cfg["temperature"])
     num_ctx = int(role_cfg.get("num_ctx") or 4096)
-    ctx_cap = 32768 if role == "reader" else MAX_INTERACTIVE_CTX
+    m_low = (model_name or "").lower()
+    # Never allocate a 32k KV cache on an -8k model or on interactive 6 GB VRAM turns unless explicitly using a 32k tag
+    if "8k" in m_low:
+        ctx_cap = 8192
+    elif role == "reader" and "32k" in m_low:
+        ctx_cap = 32768
+    elif role in ("planner", "verifier", "supervisor", "optimizer"):
+        ctx_cap = 6144
+    else:
+        ctx_cap = MAX_INTERACTIVE_CTX
     options["num_ctx"] = min(num_ctx, ctx_cap)
     think = role_cfg.get("think", False)
     if isinstance(think, bool) or isinstance(think, str):
@@ -205,7 +219,7 @@ async def plan_chat(
     model, configured = choose_model(cands, installed)
     if model is None:
         return None
-    options, think = build_options(role_cfg, role=role)
+    options, think = build_options(role_cfg, role=role, model_name=model)
     note = "" if configured else "No configured model is installed; using the first available one."
     if note:
         logger.warning("%s (%s)", note, model)

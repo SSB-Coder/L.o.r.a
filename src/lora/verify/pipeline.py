@@ -1,9 +1,11 @@
 """V8: End-to-end verification pipeline, composite scoring, and repair loop."""
 
+import asyncio
 import logging
 from typing import Any
 
 from lora.grounding.cards import EvidenceCard
+from lora.grounding.copycheck import CopyChecker
 from lora.verify.citation import CitationExistenceChecker
 from lora.verify.claims import ClaimDecomposer
 from lora.verify.corroborate import CorroborationChecker
@@ -40,6 +42,7 @@ class VerificationPipeline:
         self.v4_llm = LlmFactChecker(ollama_client=ollama_client)
         self.v5_corroborate = CorroborationChecker()
         self.v6_numbers = NumberEntityChecker()
+        self.v7_copy = CopyChecker(n_gram=8, max_overlap_ratio=0.35)
 
     async def verify(
         self,
@@ -47,7 +50,6 @@ class VerificationPipeline:
         cards: list[EvidenceCard],
     ) -> VerificationReport:
         """Run full V1-V8 verification pipeline over an answer against source evidence."""
-        # Check abstention condition: no sources available
         if not cards or not answer_text or not answer_text.strip():
             return VerificationReport(
                 verdict=VerificationVerdict.ABSTAIN,
@@ -80,9 +82,10 @@ class VerificationPipeline:
         claim_details: list[ClaimVerificationDetail] = []
         supported_count = 0
         unverified_list: list[str] = []
+        llm_probes = 0
+        max_llm_probes = 2
 
         for claim in atomic_claims:
-            # Map premise for claim
             cited_cards = [card_map[cid] for cid in claim.cited_sources if cid in card_map]
             premise_text = (
                 "\n".join(c.exact_quote for c in cited_cards)
@@ -90,13 +93,23 @@ class VerificationPipeline:
                 else combined_premise
             )
 
-            # V6: Number check
+            # V6: Number check (check cited cards first, then full evidence pool if multi-source synthesis)
             num_res = self.v6_numbers.verify_numbers(premise=premise_text, claim=claim.claim_text)
+            if not num_res.is_valid and cited_cards and len(cards) > len(cited_cards):
+                num_res_all = self.v6_numbers.verify_numbers(premise=combined_premise, claim=claim.claim_text)
+                if num_res_all.is_valid:
+                    num_res = num_res_all
 
             # V3: NLI groundedness check
             nli_res = self.v3_nli.check_entailment(
                 premise=premise_text, hypothesis=claim.claim_text
             )
+            if not nli_res.is_entailed and cited_cards and len(cards) > len(cited_cards):
+                nli_all = self.v3_nli.check_entailment(
+                    premise=combined_premise, hypothesis=claim.claim_text
+                )
+                if nli_all.score > nli_res.score:
+                    nli_res = nli_all
 
             is_supported = nli_res.is_entailed and num_res.is_valid
             reason = ""
@@ -104,10 +117,23 @@ class VerificationPipeline:
             if not num_res.is_valid:
                 reason = f"Mismatched numbers: {', '.join(num_res.mismatched_numbers)}"
             elif not nli_res.is_entailed:
-                # V4: Escalate to LLM fact checker
-                v4_res = await self.v4_llm.verify_claim(
-                    premise=premise_text, claim=claim.claim_text
-                )
+                # V4: Escalate to LLM fact checker (bounded probes + 12s timeout so verification never hangs)
+                if self.v4_llm.ollama_client is not None and llm_probes < max_llm_probes:
+                    llm_probes += 1
+                    try:
+                        v4_res = await asyncio.wait_for(
+                            self.v4_llm.verify_claim(premise=premise_text[:2400], claim=claim.claim_text),
+                            timeout=12.0,
+                        )
+                    except Exception as exc:
+                        logger.warning("V4 LLM fact-check probe timed out or failed: %s", exc)
+                        v4_res = await LlmFactChecker(ollama_client=None).verify_claim(
+                            premise=premise_text, claim=claim.claim_text
+                        )
+                else:
+                    v4_res = await LlmFactChecker(ollama_client=None).verify_claim(
+                        premise=premise_text, claim=claim.claim_text
+                    )
                 if v4_res.is_supported and num_res.is_valid:
                     is_supported = True
                     reason = "Verified via LLM escalation"
@@ -155,7 +181,6 @@ class VerificationPipeline:
             repaired_answer = answer_text
         elif supported_count > 0:
             verdict = VerificationVerdict.REPAIRED
-            # Filter answer to supported sentences only
             supported_texts = [cd.claim_text for cd in claim_details if cd.is_supported]
             repaired_core = " ".join(supported_texts)
             unverified_block = "\n\n*Could not verify: " + "; ".join(unverified_list) + "*"

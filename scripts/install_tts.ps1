@@ -12,11 +12,19 @@ if (-not $LegacyQwen) {
     $MainPy = Join-Path ".venv" "Scripts\python.exe"
     uv pip install --python $MainPy -U kokoro-onnx soundfile
 
-    $KokoroDir = "C:\Models\kokoro"
+    $KokoroDir = Join-Path (Get-Location) "models\kokoro"
     New-Item -ItemType Directory -Force -Path $KokoroDir | Out-Null
 
     $OnnxFile = Join-Path $KokoroDir "kokoro-v1.0.onnx"
     $VoicesFile = Join-Path $KokoroDir "voices-v1.0.bin"
+
+    # Fast cache check from global C:\Models\kokoro if present
+    if (Test-Path "C:\Models\kokoro\kokoro-v1.0.onnx" -and (-not (Test-Path $OnnxFile))) {
+        Copy-Item -Path "C:\Models\kokoro\kokoro-v1.0.onnx" -Destination $OnnxFile -Force
+    }
+    if (Test-Path "C:\Models\kokoro\voices-v1.0.bin" -and (-not (Test-Path $VoicesFile))) {
+        Copy-Item -Path "C:\Models\kokoro\voices-v1.0.bin" -Destination $VoicesFile -Force
+    }
 
     if (-not (Test-Path $OnnxFile)) {
         Write-Host "==> Downloading kokoro-v1.0.onnx (~310 MB) to $KokoroDir..." -ForegroundColor Cyan

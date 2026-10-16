@@ -28,7 +28,7 @@
       </div>
     </header>
 
-    <!-- Controls Bar: Depth Selector & Notebooks -->
+    <!-- Controls Bar: Depth Selector, Notebooks & Voice -->
     <div id="controls-bar">
       <div class="depth-selector" role="radiogroup" aria-label="Research Depth">
         <button class="depth-chip" data-depth="eli5">ELI5</button>
@@ -37,7 +37,8 @@
         <button class="depth-chip" data-depth="detailed">Detailed</button>
         <button class="depth-chip" data-depth="expert">Expert</button>
       </div>
-      <div class="audio-toggle-container">
+      <div class="audio-toggle-container" style="display:flex;gap:6px;align-items:center">
+        <button id="nb-toggle" class="depth-chip" type="button" title="Saved Notebooks">Notebooks</button>
         <button id="tts-toggle" class="icon-btn active" title="Toggle Voice Readout" aria-label="Voice Readout">
           <svg class="icon" viewBox="0 0 24 24" width="20" height="20">
             <path fill="currentColor" d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
@@ -51,7 +52,7 @@
       <div class="message system-message">
         <div class="msg-bubble">
           <strong>L.O.R.A Mobile Gateway</strong><br>
-          Connected to isolated LAN research environment. Ask any question to trigger verified research.
+          Connected to isolated LAN research environment (Tier 0 read-only). Ask any question to trigger verified research.
         </div>
       </div>
     </main>

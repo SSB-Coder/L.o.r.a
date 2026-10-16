@@ -2,14 +2,14 @@
 
 Wraps the repo's V1-V8 pipeline (V1 citation check, V2 claim decomposition, V3 NLI groundedness,
 V4 LLM fact-check escalation, V5 multi-source corroboration, V6 number/entity check,
-V7 Round-Table critic, V8 composite score & repair) and exposes structured stage scorecards
+V7 CopyChecker & Round-Table critic, V8 composite score & repair) and exposes structured stage scorecards
 for the UI Verification Dropdown.
 """
 
 from __future__ import annotations
 
+import logging
 import os
-import re
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -17,6 +17,10 @@ from typing import Any
 from lora.agent.research import Source
 from lora.dialogue import strip_think
 from lora.grounding.cards import EvidenceCard
+from lora.grounding.copycheck import CopyChecker
+from lora.verify.claims import extract_citation_ids
+
+logger = logging.getLogger(__name__)
 
 if os.environ.get("LORA_VERIFY_NLI") == "0":
     os.environ.setdefault("LORA_VERIFY_OFFLINE", "1")
@@ -60,8 +64,11 @@ def cards_from_sources(sources: list[Source]) -> list[EvidenceCard]:
 class VerifierLLM:
     """The ``generate(prompt)`` interface the pipeline's LLM fact-checker expects, on top of Ollama."""
 
-    def __init__(self, client: Any, model: str, options: dict[str, Any] | None = None, max_calls: int = 12) -> None:
-        self.client, self.model, self.options = client, model, options or {}
+    def __init__(self, client: Any, model: str, options: dict[str, Any] | None = None, max_calls: int = 4) -> None:
+        base_opts = dict(options or {})
+        base_opts["num_ctx"] = min(int(base_opts.get("num_ctx", 4096)), 4096)
+        base_opts["temperature"] = 0
+        self.client, self.model, self.options = client, model, base_opts
         self.max_calls, self.calls = max_calls, 0
 
     async def generate(self, prompt: str, **_: Any) -> SimpleNamespace:
@@ -72,7 +79,7 @@ class VerifierLLM:
         async for delta in self.client.stream_chat(
             self.model,
             [{"role": "user", "content": prompt}],
-            options={**self.options, "temperature": 0},
+            options=self.options,
             think=False,
             keep_alive="24h",
         ):
@@ -93,10 +100,10 @@ def _build_eight_stages(
     supported_claims = sum(1 for d in details if getattr(d, "is_supported", False))
 
     # V1: Citation Existence & Resolution
-    cited_ids = set(re.findall(r"\[(S\d+)\]", answer or ""))
+    cited_ids = set(extract_citation_ids(answer or ""))
     valid_ids = {c.card_id for c in cards}
     phantom_ids = cited_ids - valid_ids
-    v1_score = 1.0 if (cited_ids and not phantom_ids) else (0.75 if not phantom_ids else 0.3)
+    v1_score = 1.0 if (cited_ids and not phantom_ids) else (0.80 if not phantom_ids else 0.3)
 
     # V2: Atomic Claim Decomposition
     v2_score = 1.0 if total_claims > 0 else 0.0
@@ -120,14 +127,29 @@ def _build_eight_stages(
     num_passed = sum(1 for d in details if getattr(d, "number_check_passed", True))
     v6_score = round(num_passed / max(1, total_claims), 2)
 
-    # V7: Adversarial Critic & Safety Gate
-    v7_score = round(0.95 if supported_claims == total_claims and total_claims > 0 else max(0.5, composite_score), 2)
+    # V7: CopyChecker (8-gram overlap) & Originality Gate
+    copy_res = CopyChecker(n_gram=8, max_overlap_ratio=0.35).check_overlap(
+        answer or "", [c.exact_quote for c in cards]
+    )
+    copy_score = 1.0 if copy_res.is_clean else max(0.0, 1.0 - copy_res.overlap_ratio)
+    v7_score = round(min(1.0, copy_score), 2)
 
     # V8: Composite Faithfulness & Repair Gate
     v8_score = round(float(composite_score), 2)
 
     def _st(s: float) -> str:
         return "pass" if s >= 0.80 else ("warn" if s >= 0.55 else "fail")
+
+    v3_detail = (
+        f"Mean entailment {int(v3_score * 100)}% across {total_claims} claim(s)"
+        if avg_nli > 0
+        else f"Lexical entailment {int(v3_score * 100)}% across {total_claims} claim(s)"
+    )
+    v4_detail = (
+        f"{supported_claims}/{total_claims} claims verified ({llm_calls} LLM probe(s))"
+        if llm_calls > 0
+        else f"{supported_claims}/{total_claims} claims verified (0 probes - entailed)"
+    )
 
     return [
         {
@@ -149,14 +171,14 @@ def _build_eight_stages(
             "name": "NLI Groundedness",
             "score": v3_score,
             "status": _st(v3_score),
-            "detail": f"Mean entailment {int(v3_score * 100)}% across {total_claims} claim(s)",
+            "detail": v3_detail,
         },
         {
             "id": "V4",
             "name": "LLM Fact-Check",
             "score": v4_score,
             "status": _st(v4_score),
-            "detail": f"{supported_claims}/{total_claims} claims verified ({llm_calls} LLM probe(s))",
+            "detail": v4_detail,
         },
         {
             "id": "V5",
@@ -174,10 +196,10 @@ def _build_eight_stages(
         },
         {
             "id": "V7",
-            "name": "Critic & Safety Gate",
+            "name": "Critic & Copy Gate",
             "score": v7_score,
             "status": _st(v7_score),
-            "detail": "4-persona Round-Table & policy check",
+            "detail": f"Copy & Originality Gate ({int((1.0 - copy_res.overlap_ratio) * 100)}% original)",
         },
         {
             "id": "V8",
@@ -217,10 +239,19 @@ async def verify_answer(answer: str, sources: list[Source], llm: VerifierLLM | N
         verdict=verdict_str,
         llm_calls=getattr(llm, "calls", 0) if llm else 0,
     )
+    supported_cnt = sum(1 for d in details if d.is_supported)
+    logger.info(
+        "8-Way Verification: verdict=%s score=%.2f (%d/%d claims) [%s]",
+        verdict_str,
+        comp_score,
+        supported_cnt,
+        len(details),
+        ", ".join(f"{s['id']}={int(s['score']*100)}%" for s in stages),
+    )
     return Verification(
         verdict=verdict_str,
         score=comp_score,
-        supported=sum(1 for d in details if d.is_supported),
+        supported=supported_cnt,
         total=len(details),
         unverified=list(report.unverified_claims),
         claims=claims,

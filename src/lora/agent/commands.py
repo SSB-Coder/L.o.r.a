@@ -1,7 +1,7 @@
 """Deterministic parser for imperative requests ("open Chrome", "open wikipedia on ...", "open chatgpt and ask ...").
 
-Handles unambiguous desktop, web-app, site-topic, external-AI, model-switch, and skill-switch intents
-while allowing compound or multi-step requests to flow into the multi-agent harness instead of dead-ending.
+Handles unambiguous desktop, web-app, site-topic, external-AI, model-switch, skill-switch, depth-rewrite,
+notebook, and power/stop intents while allowing compound or multi-step requests to flow into the multi-agent harness.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from pathlib import Path
 _POLITE = r"^(?:(?:(?:hey|hi|hello|ok|okay)[, ]+)?(?:lora|laura|lara|lola|lorra)[, ]+)?(?:please |kindly )?(?:(?:can|could|would|will) you (?:please )?|i (?:want|need|'d like) you to )?"
 
 _OPEN = re.compile(
-    _POLITE + r"(?P<verb>open|launch|start|run|fire up|bring up|pull up|show me|go to|visit|browse(?: to)?|navigate to|take me to)\s+(?:up\s+)?(?:the\s+|my\s+)?(?P<target>.+?)[\s.!?]*$",
+    _POLITE + r"(?P<verb>open|launch|start|run|activate|fire up|bring up|pull up|show me|go to|visit|browse(?: to)?|navigate to|take me to)\s+(?:up\s+)?(?:the\s+|my\s+)?(?P<target>.+?)[\s.!?]*$",
     re.IGNORECASE,
 )
 _NOTE = re.compile(
@@ -27,6 +27,27 @@ _IMAGE_GEN = re.compile(
     _POLITE + r"(?:create|make|generate|draw|plot|render|design)\s+(?:me\s+)?(?:a\s+|an\s+|the\s+|new\s+)*"
     r"(?P<kind>image|picture|diagram|chart|plot|graphic|svg|illustration|poster|visual)\s+(?:of|for|about|showing|titled|called)?\s*(?P<prompt>.+)$",
     re.IGNORECASE | re.DOTALL,
+)
+_SAVE_NOTEBOOK = re.compile(
+    _POLITE + r"(?:save|promote|store|add)\s+(?:this|that|it|the\s+(?:research|answer|session))\s+(?:to|in|into|as)\s+(?:my\s+|a\s+)?notebook(?:\s+(?:called|named|titled)\s+(?P<title>.+?))?[\s.!?]*$",
+    re.IGNORECASE,
+)
+_LIST_NOTEBOOKS = re.compile(
+    _POLITE + r"(?:list|show)\s+(?:me\s+)?(?:my\s+|all\s+)?(?:saved\s+)?notebooks[\s.!?]*$",
+    re.IGNORECASE,
+)
+_REWRITE_DEPTH = re.compile(
+    _POLITE + r"(?:(?:make|explain|rewrite|rephrase)\s+(?:it|that|this|the\s+answer)\s+(?:more\s+)?(?P<depth1>eli5|like\s+i'?m\s+5|simpler|simple|standard|detailed|in\s+detail|expert|at\s+expert\s+level)|"
+    r"(?:explain\s+like\s+i'?m\s+5|eli5))[\s.!?]*$",
+    re.IGNORECASE,
+)
+_POWER_SLEEP = re.compile(
+    _POLITE + r"(?:go\s+to\s+sleep|sleep(?:\s+mode)?|stand\s*by)[\s.!?]*$",
+    re.IGNORECASE,
+)
+_POWER_OFF = re.compile(
+    _POLITE + r"(?:turn\s+off|shut\s*down(?:\s+lora)?|exit\s+lora|quit\s+lora)[\s.!?]*$",
+    re.IGNORECASE,
 )
 _SAVE_LAST = re.compile(
     _POLITE + r"(?:save|put|store|write|export)\s+(?:that|this|it|the (?:answer|reply|response|above|last (?:answer|reply)))\s*"
@@ -57,18 +78,18 @@ _SITE_NAMES = r"youtube|you ?tube|amazon|wikipedia|wikimedia|wiki ?pedia|wiki|ar
 
 # Matches: "open youtube and search for lofi beats", "open wikipedia and look up alan turing"
 _SITE_SEARCH_A = re.compile(
-    _POLITE + r"(?:open|launch|go to|visit)\s+(?:the\s+)?(?P<site>[\w .-]{2,30}?)\s+and\s+(?:then\s+)?(?:search|look(?:\s+up)?|find|query)(?:\s+(?:for|about|on))?\s+(?P<q>.+?)[\s.!?]*$",
+    _POLITE + r"(?:open|launch|start|activate|go to|visit)\s+(?:the\s+)?(?P<site>[\w .-]{2,30}?)\s+and\s+(?:then\s+)?(?:search|look(?:\s+up)?|find|query)(?:\s+(?:for|about|on))?\s+(?P<q>.+?)[\s.!?]*$",
     re.IGNORECASE,
 )
 # Matches: "open wikipedia on <page>", "open wikipedia about <topic>", "open youtube for <query>", "open arxiv on <paper>"
 _SITE_OPEN_ON = re.compile(
-    _POLITE + r"(?:open|launch|go to|visit|pull up|bring up|show me)\s+(?:up\s+)?(?:the\s+)?(?P<site>" + _SITE_NAMES + r")\s+"
+    _POLITE + r"(?:open|launch|start|activate|go to|visit|pull up|bring up|show me)\s+(?:up\s+)?(?:the\s+)?(?P<site>" + _SITE_NAMES + r")\s+"
     r"(?:(?:page|article|video|entry|repo|paper|results?)\s+)?(?:on|about|for|in|regarding|titled|called)\s+(?P<q>.+?)[\s.!?]*$",
     re.IGNORECASE,
 )
 # Matches: "open <page/topic> on wikipedia", "open <video> on youtube", "open <paper> on arxiv"
 _SITE_OPEN_REVERSE = re.compile(
-    _POLITE + r"(?:open|launch|go to|visit|pull up|bring up|show me)\s+(?:up\s+)?(?:the\s+)?(?:(?:page|article|video|entry|paper)\s+(?:on|about|for)\s+)?(?P<q>.+?)\s+"
+    _POLITE + r"(?:open|launch|start|activate|go to|visit|pull up|bring up|show me)\s+(?:up\s+)?(?:the\s+)?(?:(?:page|article|video|entry|paper)\s+(?:on|about|for)\s+)?(?P<q>.+?)\s+"
     r"(?:on|in)\s+(?P<site>" + _SITE_NAMES + r")(?:\s+(?:page|site|website|app))?[\s.!?]*$",
     re.IGNORECASE,
 )
@@ -110,7 +131,7 @@ _TYPE_INTO = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _DEEP = re.compile(
-    r"\b(deep(?:ly)?|thorough(?:ly)?|in[- ]depth|comprehensive(?:ly)?|really dig|double[- ]check|fact[- ]check|verify)\b", re.IGNORECASE
+    r"\b(deep(?:ly)?|thorough(?:ly)?|in[- ]depth|comprehensive(?:ly)?|really dig|double[- ]check|fact[- ]?check|verify|8[- ]?way|outer[- ]?loop)\b", re.IGNORECASE
 )
 _DOC_EXT = re.compile(r"\.(?:pdf|docx?|txt|md|xlsx?|pptx?|csv|png|jpe?g|gif|svg|zip|mp3|mp4|py|html|json|ipynb)$", re.IGNORECASE)
 _URL = re.compile(r"^(?:https?://)?(?:[\w-]+\.)+[a-z]{2,}(?:[/?#]\S*)?$", re.IGNORECASE)
@@ -131,7 +152,7 @@ _EXT = {
 
 _RESEARCH_STRONG = re.compile(
     r"\b(research|look\s?up|look into|search(?: the web| online| for| up)|search\b|find (?:out|information|info|sources)|"
-    r"browse|on the web|online|sources? (?:on|for)|cite|citations?|with sources)\b",
+    r"browse|on the web|online|sources? (?:on|for)|cite|citations?|with sources|fact[- ]?check|verify|8[- ]?way|outer[- ]?loop)\b",
     re.IGNORECASE,
 )
 _RESEARCH_WEAK = re.compile(
@@ -154,7 +175,7 @@ _THANKS = re.compile(r"^(?:thanks|thank you|thx|cheers|ty|nice one|great job|awe
 
 @dataclass
 class Command:
-    kind: str  # open | list_dir | note | save_last | ask_ai | google | site_search | switch_model | switch_voice | switch_skill | generate_image
+    kind: str  # open | list_dir | note | save_last | ask_ai | google | site_search | switch_model | switch_voice | switch_skill | generate_image | rewrite_depth | save_notebook | list_notebooks | sleep | turn_off
     target: str = ""
     args: dict = field(default_factory=dict)
 
@@ -207,6 +228,34 @@ def _parse(text: str) -> Command | None:
 
     if _DIAG.match(q):
         return Command("diagnose")
+
+    if _POWER_SLEEP.match(q):
+        return Command("sleep")
+
+    if _POWER_OFF.match(q):
+        return Command("turn_off")
+
+    m = _REWRITE_DEPTH.match(q)
+    if m:
+        raw_d = (m.group("depth1") or "eli5").strip().lower()
+        if "5" in raw_d or "eli5" in raw_d:
+            d = "eli5"
+        elif "simpl" in raw_d:
+            d = "simple"
+        elif "detail" in raw_d:
+            d = "detailed"
+        elif "expert" in raw_d:
+            d = "expert"
+        else:
+            d = "standard"
+        return Command("rewrite_depth", target=d)
+
+    m = _SAVE_NOTEBOOK.match(q)
+    if m:
+        return Command("save_notebook", target=(m.group("title") or "").strip())
+
+    if _LIST_NOTEBOOKS.match(q):
+        return Command("list_notebooks")
 
     m = _SWITCH_MODEL.match(q)
     if m:
@@ -384,11 +433,11 @@ _WHAT_CAN = re.compile(
 )
 CAPABILITIES = (
     "Here's what I can do:\n"
-    "- **Multi-Agent Research & 8-Way Verification:** ask me to research anything. I search the web, read pages, run an 8-stage verification & self-correction loop, and show my sources and verification scorecard.\n"
+    "- **Laya Decision Router & Multi-Agent Research:** ask me to research anything. Laya routes your intent on CPU, fetches web & scholarly sources, runs an 8-stage verification & self-correction loop (V1–V8), and displays the Verification Scorecard.\n"
     "- **Smart Navigation & External AI:** open apps, folders, files, specific site pages (\"open Wikipedia on Alan Turing\"), or delegate to external AIs (\"open ChatGPT and ask...\").\n"
     "- **Files & Visual Studio:** paste or attach images and files directly in chat, or ask me to generate code, notes, SVG diagrams, charts, and edited images.\n"
-    "- **Skills & Models:** switch models manually or use Auto smart routing, and activate specialized skills from the top bar.\n"
-    "- **Voice (Kokoro TTS `af_sky`):** hold Space, press the mic, or say \"Hey LORA\"."
+    "- **Depth Rewrite & Notebooks:** say \"explain like I'm 5\", \"make it more detailed\", or \"save this to my notebook\".\n"
+    "- **Skills, Models & Voice (Kokoro TTS `af_sky`):** switch models manually or use Auto smart routing, activate skills from the top bar, and use voice or mobile LAN pairing."
 )
 _VERB_REPLY = {
     "browse": "Yes. Ask me to research something and I'll search the web, read the pages, check the facts and show you my sources. I can also open a site or topic for you, like \"open Wikipedia on quantum computing\".",

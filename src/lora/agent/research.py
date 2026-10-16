@@ -1,6 +1,7 @@
-"""Web research: search -> fetch pages -> numbered sources for a cited answer.
+"""Web research: search -> fetch pages -> chunk & rank passages -> numbered sources for a cited answer.
 
-No browser needed: DuckDuckGo's HTML endpoint for search, httpx + trafilatura to read pages.
+No browser needed: DuckDuckGo's HTML endpoint for search (+ Wikipedia/arXiv/PubMed/Crossref fallbacks),
+httpx + trafilatura to read pages, and semantic/lexical chunk selection for long articles.
 All fetches go through the egress filter (http/https only, no private/loopback hosts).
 """
 
@@ -22,9 +23,10 @@ NO_TEXT_DOMAINS = {
     "youtube.com", "youtu.be", "m.youtube.com", "tiktok.com", "instagram.com", "facebook.com", "x.com", "twitter.com",
     "pinterest.com", "linkedin.com",
 }  # video / login-walled sites: nothing readable to cite
+PREPRINT_DOMAINS = {"arxiv.org", "biorxiv.org", "medrxiv.org", "chemrxiv.org", "ssrn.com"}
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LORA/0.1 (+local research assistant)"
 MAX_BYTES = 1_500_000
-PAGE_CHARS = 2200
+PAGE_CHARS = 2400
 
 
 @dataclass
@@ -39,6 +41,10 @@ class Source:
     def domain(self) -> str:
         return (urlparse(self.url).hostname or "").removeprefix("www.")
 
+    @property
+    def is_preprint(self) -> bool:
+        return self.domain in PREPRINT_DOMAINS
+
 
 @dataclass
 class ResearchResult:
@@ -49,11 +55,20 @@ class ResearchResult:
         parts = []
         for s in self.sources:
             body = (s.text or s.snippet).strip()
-            parts.append(f"[{s.id}] {s.title} ({s.domain})\n{body}")
+            tier_tag = " [T1-P Preprint]" if s.is_preprint else ""
+            parts.append(f"[{s.id}] {s.title} ({s.domain}{tier_tag})\n{body}")
         return "\n\n".join(parts)
 
     def for_ui(self) -> list[dict[str, str]]:
-        return [{"id": s.id, "title": s.title, "url": s.url, "domain": s.domain} for s in self.sources]
+        return [
+            {
+                "id": s.id,
+                "title": s.title,
+                "url": s.url,
+                "domain": f"{s.domain} · T1-P" if s.is_preprint else s.domain,
+            }
+            for s in self.sources
+        ]
 
 
 def _egress_ok(url: str) -> bool:
@@ -244,7 +259,42 @@ def extract_text(html: str) -> str:
         return ""
 
 
-async def fetch_text(url: str, client: httpx.AsyncClient) -> str:
+def select_best_passages(full_text: str, query: str = "", max_chars: int = PAGE_CHARS) -> str:
+    """Select the most query-relevant semantic chunks from a long article instead of blindly truncating."""
+    if len(full_text) <= max_chars or not query.strip():
+        return full_text[:max_chars]
+    try:
+        from lora.grounding.chunk import DocumentChunker
+
+        chunks = DocumentChunker(target_chunk_tokens=180, overlap_tokens=25).chunk_text(
+            full_text[:18000], source_url="", title=""
+        )
+        if len(chunks) <= 2:
+            return full_text[:max_chars]
+        q_words = {w for w in re.sub(r"[^\w\s]", " ", query.lower()).split() if len(w) > 2}
+        scored = []
+        for idx, c in enumerate(chunks):
+            c_words = set(re.sub(r"[^\w\s]", " ", c.text.lower()).split())
+            overlap = len(q_words & c_words) / max(1, len(q_words)) if q_words else 0.0
+            lead_bonus = 0.15 if idx == 0 else (0.05 if idx == 1 else 0.0)
+            scored.append((overlap + lead_bonus, idx, c.text))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        chosen: list[tuple[int, str]] = []
+        total_len = 0
+        for _sc, idx, txt in scored:
+            if total_len + len(txt) + 2 > max_chars and chosen:
+                continue
+            chosen.append((idx, txt))
+            total_len += len(txt) + 2
+            if total_len >= max_chars - 200:
+                break
+        chosen.sort(key=lambda x: x[0])
+        return "\n".join(t for _i, t in chosen)[:max_chars]
+    except Exception:
+        return full_text[:max_chars]
+
+
+async def fetch_text(url: str, client: httpx.AsyncClient, query: str = "") -> str:
     if not _egress_ok(url):
         return ""
     try:
@@ -261,11 +311,15 @@ async def fetch_text(url: str, client: httpx.AsyncClient) -> str:
     except Exception as exc:
         logger.info("Fetch failed for %s: %s", url, exc)
         return ""
-    return extract_text(html)[:PAGE_CHARS]
+    raw_text = extract_text(html)
+    return select_best_passages(raw_text, query=query, max_chars=PAGE_CHARS)
 
 
 async def research(
-    query: str, status=lambda _t: None, max_pages: int = 4, queries: list[str] | None = None
+    query: str,
+    status=lambda _t: None,
+    max_pages: int = 4,
+    queries: list[str] | None = None,
 ) -> ResearchResult:
     """Search the web and read the best few pages. ``queries`` are the prompt engineer's search phrases."""
     phrases = list(dict.fromkeys(q.strip() for q in (queries or [query]) if q and q.strip()))[:2] or [query]
@@ -291,7 +345,7 @@ async def research(
         if not picked:
             return ResearchResult(query)
         status(f"Reading {len(picked)} pages…")
-        texts = await asyncio.gather(*(fetch_text(s.url, client) for s in picked), return_exceptions=True)
+        texts = await asyncio.gather(*(fetch_text(s.url, client, query=query) for s in picked), return_exceptions=True)
         for s, t in zip(picked, texts, strict=True):
             s.text = t if isinstance(t, str) else ""
         usable = [s for s in picked if len(s.text) >= 200 or s.snippet]

@@ -76,12 +76,6 @@ class ChatGPTAdapter:
                 break
 
         if not submitted:
-            if hasattr(page, "keyboard"):
-                try:
-                    await page.keyboard.insert_text(prompt)
-                    await asyncio.sleep(0.3)
-                except Exception:
-                    pass
             await target_input.press("Enter")
 
         # 3. Wait for assistant message to appear and finish streaming

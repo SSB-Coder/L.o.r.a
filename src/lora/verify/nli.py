@@ -59,37 +59,59 @@ class NliGroundednessChecker:
         "more", "most", "some", "many", "much", "very", "just", "only", "both", "each", "other", "another",
     }
 
-    def _heuristic_entailment_score(self, premise: str, hypothesis: str) -> float:
-        """Fast content-word and stem containment score on CPU (handles natural paraphrasing)."""
-        p_clean = re.sub(r"[^\w\s]", "", premise.lower())
-        h_clean = re.sub(r"[^\w\s]", "", hypothesis.lower())
+    _NEGATIONS = {"not", "never", "no", "neither", "nor", "cannot", "isnt", "arent", "wasnt", "werent"}
 
-        # Detect negation mismatch to avoid false positives on contradictory claims
-        negations = {"not", "never", "no", "neither", "nor", "cannot", "isnt", "arent", "wasnt", "werent"}
-        p_has_neg = bool(set(p_clean.split()) & negations)
-        h_has_neg = bool(set(h_clean.split()) & negations)
-        if p_has_neg != h_has_neg:
-            return 0.20
+    def _score_window(self, window_text: str, h_words: list[str], h_has_neg: bool, check_neg: bool) -> float:
+        w_clean = re.sub(r"[^\w\s]", " ", window_text.lower())
+        w_tokens = w_clean.split()
+        if not w_tokens:
+            return 0.0
+        w_set = set(w_tokens)
+        w_stems = {w[:5] for w in w_set if len(w) >= 5}
 
-        p_words = set(p_clean.split())
-        p_stems = {w[:5] for w in p_words if len(w) >= 5}
-        h_words = [w for w in h_clean.split() if len(w) > 2 and w not in self._STOPWORDS]
-
-        if not h_words:
-            return 1.0 if not p_words else 0.5
-
+        # Deduplicate hypothesis words so repeating one shared noun cannot mask missing predicate words
+        unique_h = list(dict.fromkeys(h_words))
         matched = sum(
-            1 for w in h_words
-            if w in p_words or (len(w) >= 5 and w[:5] in p_stems)
+            1 for w in unique_h
+            if w in w_set or (len(w) >= 5 and w[:5] in w_stems)
         )
-        ratio = matched / len(h_words)
+        ratio = matched / len(unique_h)
 
-        # Scale semantic alignment: content-word/stem overlap >= 55% maps to >= 0.80 entailment
+        # Only penalize negation polarity mismatch when comparing against a short single-sentence premise
+        # (prevents long multi-paragraph web articles containing "not" in an unrelated sentence from failing all claims)
+        if check_neg and len(w_tokens) <= 28:
+            w_has_neg = bool(w_set & self._NEGATIONS)
+            if w_has_neg != h_has_neg:
+                return 0.20
+
         if ratio >= 0.55:
             score = 0.80 + 0.20 * ((ratio - 0.55) / 0.45)
         else:
             score = (ratio / 0.55) * 0.70
         return min(1.0, max(0.0, float(score)))
+
+    def _heuristic_entailment_score(self, premise: str, hypothesis: str) -> float:
+        """Sentence-window & full-premise semantic containment score on CPU (handles long web articles & paraphrasing)."""
+        h_clean = re.sub(r"[^\w\s]", " ", hypothesis.lower())
+        h_tokens = h_clean.split()
+        h_has_neg = bool(set(h_tokens) & self._NEGATIONS)
+        h_words = [w for w in h_tokens if len(w) > 2 and w not in self._STOPWORDS]
+
+        if not h_words:
+            return 1.0 if premise.strip() else 0.5
+
+        sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", premise) if len(s.strip()) > 8]
+        best = self._score_window(premise, h_words, h_has_neg, check_neg=(len(sents) <= 1))
+        for i, s in enumerate(sents):
+            sc = self._score_window(s, h_words, h_has_neg, check_neg=True)
+            if sc > best:
+                best = sc
+            if i + 1 < len(sents):
+                pair = f"{s} {sents[i + 1]}"
+                sc2 = self._score_window(pair, h_words, h_has_neg, check_neg=False)
+                if sc2 > best:
+                    best = sc2
+        return best
 
     def check_entailment(
         self,
@@ -108,11 +130,11 @@ class NliGroundednessChecker:
 
         if model is not None:
             try:
-                scores = model.predict([[premise, hypothesis]])
+                scores = model.predict([[premise[:1800], hypothesis]])
                 score = float(scores[0])
-                # Sigmoid normalization if logits
                 if score < 0.0 or score > 1.0:
                     import math
+
                     score = 1.0 / (1.0 + math.exp(-score))
                 return NliScoreResult(
                     score=score,

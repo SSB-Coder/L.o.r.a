@@ -1,4 +1,4 @@
-"""L.O.R.A Multi-Agent Runtime: coordinates Supervisor, Specialist Sub-Agents, Skills, 8-Way Verification, and Artifacts.
+"""L.O.R.A Multi-Agent Runtime: coordinates Laya Decision Router, Supervisor, Specialist Sub-Agents, Skills, 8-Way Verification, and Artifacts.
 
 Qt-free so it can be tested on its own. The UI and TTS hang off the callbacks:
   on_status(text)        short progress line ("Searching the web…")
@@ -44,7 +44,7 @@ from lora.agent.notes import create_artifact, generate_visual, process_attachmen
 from lora.agent.prompting import ResearchPlan, make_plan
 from lora.agent.research import Source
 from lora.agent.toolloop import ToolLoop, looks_agentic
-from lora.agent.verification import VerifierLLM, verify_answer
+from lora.agent.verification import VerifierLLM, cards_from_sources, verify_answer
 from lora.dialogue import (
     ConversationHistory,
     build_messages,
@@ -54,6 +54,7 @@ from lora.dialogue import (
     strip_footnote,
     strip_think,
 )
+from lora.models.laya_router import LayaDecision, LayaDecisionRouter
 from lora.net import async_client
 from lora.safety.gate import DataProvenance
 
@@ -85,9 +86,9 @@ class SubAgentSpec:
 SUBAGENTS: dict[str, SubAgentSpec] = {
     "supervisor": SubAgentSpec(
         id="supervisor",
-        name="Supervisor & Planner Agent",
-        role="Orchestrator",
-        description="Decomposes user intent, selects the optimal model & skill, and coordinates specialist sub-agents.",
+        name="Supervisor & Laya Router Agent",
+        role="Orchestrator & Decision Router",
+        description="Classifies intent, depth, and risk via Laya on CPU, selects the optimal model & skill, and coordinates specialist sub-agents.",
         default_model_role="planner",
     ),
     "system_navigator": SubAgentSpec(
@@ -102,7 +103,7 @@ SUBAGENTS: dict[str, SubAgentSpec] = {
         name="Deep Research & Retrieval Agent",
         role="Web & Local RAG",
         description="Plans search queries, fetches web & scholarly sources, and synthesizes cited answers with [S1] grounding.",
-        default_model_role="reader",
+        default_model_role="writer",
     ),
     "workspace_code": SubAgentSpec(
         id="workspace_code",
@@ -130,12 +131,13 @@ SUBAGENTS: dict[str, SubAgentSpec] = {
 
 @dataclass
 class AgentExecutionTrace:
-    """Tracks which specialist sub-agents and skills participated in a turn for UI visibility."""
+    """Tracks Laya routing, specialist sub-agents, and skills that participated in a turn for UI visibility."""
 
     active_skill: str | None = None
     model_used: str = ""
     model_mode: str = "auto"
     escalated: bool = False
+    laya_decision: dict[str, Any] = field(default_factory=dict)
     agents_invoked: list[dict[str, str]] = field(default_factory=list)
 
     def record(self, agent_id: str, action: str, status: str = "completed") -> None:
@@ -154,6 +156,7 @@ class AgentExecutionTrace:
             "model_used": self.model_used,
             "model_mode": self.model_mode,
             "escalated": self.escalated,
+            "laya": self.laya_decision,
             "agents": list(self.agents_invoked),
         }
 
@@ -219,6 +222,7 @@ class AgentRuntime:
         mcp_config_path: Any = None,
         skills_dir: Any = None,
         agents_dir: Any = None,
+        notebook_db_path: Path | None = None,
     ) -> None:
         self.ollama_url = ollama_url
         self.user_default_model = user_default_model
@@ -241,20 +245,27 @@ class AgentRuntime:
         self.mcp_hub: Any = None
         self._mcp_config_path = mcp_config_path
         self._mcp_lock = __import__("threading").Lock()
+        self.laya_router = LayaDecisionRouter()
+        self.last_laya_decision: LayaDecision | None = None
+        self._notebook_db_path = notebook_db_path
         self._load_personalization(skills_dir, agents_dir)
         self.retry_delay = float(os.environ.get("LORA_RETRY_DELAY", "1.5"))  # seconds
         self.last_answer = ""
         self.last_question = ""
         self.last_sources: list[dict[str, str]] = []
+        self.last_raw_sources: list[Source] = []
         self.last_model_used = ""
         self.on_model_changed: Callable[[str, list[str]], None] | None = None
         self.on_skill_changed: Callable[[str], None] | None = None
         self.on_voice_changed_cb: Callable[[str], None] | None = None
+        self.on_verification: Callable[[dict[str, Any]], None] | None = None
+        self.on_power_command: Callable[[str], None] | None = None
 
     def on_sources_changed(self) -> None:
         """Clear cached conversation context when a FAISS media source is removed so deleted sources are never echoed."""
         self.history.clear()
         self.last_sources.clear()
+        self.last_raw_sources.clear()
 
     # ------------------------------------------------------- model & skill controls
     def set_model(self, model_name: str | None) -> str:
@@ -385,11 +396,20 @@ class AgentRuntime:
 
         images_b64, attachment_context, image_paths = process_attachments(attachments)
         skill = self._skill_for(q)
+
+        # 1. Route every utterance through Laya Decision Router on CPU (0 MB GPU VRAM)
+        decision = self.laya_router.predict(q)
+        self.last_laya_decision = decision
+
         trace = AgentExecutionTrace(
             active_skill=skill.name if skill else None,
             model_mode=self.manual_model or "auto",
+            laya_decision=decision.model_dump(),
         )
-        trace.record("supervisor", f"Routing intent (skill={skill.name if skill else 'auto'})")
+        trace.record(
+            "supervisor",
+            f"Laya ({decision.intent} · {decision.depth_mode} · {decision.action_risk})",
+        )
 
         try:
             if not attachments:
@@ -399,7 +419,7 @@ class AgentRuntime:
                     return TurnResult(text=canned, kind="smalltalk")
 
             cmd = parse_command(q) if not attachments else None
-            if cmd is not None and not self.allow_actions:
+            if cmd is not None and not self.allow_actions and cmd.kind not in ("rewrite_depth", "list_notebooks"):
                 msg = "That kind of request only works from the desktop app."
                 on_text(msg, True)
                 return TurnResult(text=msg, kind="command")
@@ -407,11 +427,16 @@ class AgentRuntime:
             result = await self._run_command(cmd, q, on_status, on_text, trace=trace) if cmd is not None else None
             if result is not None:
                 pass
-            elif is_research(q) or (is_deep(q) and len(q.split()) >= 5) or (skill and skill.agent == "research"):
-                trace.record("research", "Multi-source web & local FAISS retrieval")
+            elif (
+                is_research(q)
+                or (is_deep(q) and len(q.split()) >= 5)
+                or (skill and skill.agent == "research")
+                or (decision.intent == "research" and decision.topic_type in ("scholarly", "biomedical", "physics_astro"))
+            ):
+                trace.record("research", f"Multi-source retrieval (topic={decision.topic_type})")
                 skill_mode = skill.default_depth if skill and skill.default_depth in ("quick", "deep", "deep_with_refinement") else None
-                run_mode = mode or skill_mode or ("deep" if is_deep(q) else "standard")
-                result = await self._run_research(q, on_status, on_text, run_mode, trace=trace)
+                run_mode = mode or skill_mode or ("deep" if (is_deep(q) or decision.run_mode == "deep") else "standard")
+                result = await self._run_research(q, on_status, on_text, run_mode, trace=trace, decision=decision)
             elif self.allow_actions and (
                 looks_agentic(q)
                 or self._mentions_mcp(q)
@@ -448,6 +473,7 @@ class AgentRuntime:
             trace.model_used = self.last_model_used
             if result.meta:
                 result.meta.setdefault("agent_trace", trace.to_meta())
+                result.meta.setdefault("laya_decision", decision.model_dump())
         return result
 
     async def run_job(self, text: str, run_mode: str, should_abort: Callable[[], str | None]) -> dict[str, Any]:
@@ -461,6 +487,14 @@ class AgentRuntime:
         return {"answer": res.text, "sources": res.sources, "verification": res.meta, "kind": res.kind, "run_mode": run_mode}
 
     def _check_abort(self) -> None:
+        from lora.safety.killswitch import KillSwitch
+
+        if KillSwitch.get_global().is_halted():
+            reason = KillSwitch.get_global().halt_reason or "Emergency kill switch activated"
+            exc = getattr(self, "_abort_exc", None)
+            if exc is None:
+                from lora.agent.jobs import JobAborted as exc
+            raise exc(reason)
         reason = self._should_abort()
         if reason:
             exc = getattr(self, "_abort_exc", None)
@@ -502,15 +536,19 @@ class AgentRuntime:
         model: str | None = None,
         keep_alive: str | None = None,
         role: str = "writer",
+        options_override: dict[str, Any] | None = None,
     ) -> str:
         """Run the model to completion without showing the text (critic, rewrite, tool loop)."""
         client, plan = plan_pair or await self._plan(role=role)
         chosen = model or plan.model
+        opts = dict(plan.options)
+        if options_override:
+            opts.update(options_override)
         self.last_model_used = chosen
-        logger.info("Model (%s): %s (options=%s think=%s)", role, chosen, plan.options, plan.think)
+        logger.info("Model (%s): %s (options=%s think=%s)", role, chosen, opts, plan.think)
         text = ""
         async for delta in client.stream_chat(
-            chosen, messages, options=plan.options, think=plan.think, keep_alive=keep_alive or plan.keep_alive
+            chosen, messages, options=opts, think=plan.think, keep_alive=keep_alive or plan.keep_alive
         ):
             text += delta
         return strip_think(text)
@@ -602,6 +640,7 @@ class AgentRuntime:
 
         mine = await self._user_sources(q)
         if mine:
+            self.last_raw_sources = list(mine)
             block = "\n\n".join(f"[{s.id}] {s.title}\n{s.text}" for s in mine)
             if attachment_context:
                 block = f"{block}\n\nAttached Context:\n{attachment_context}"
@@ -609,10 +648,16 @@ class AgentRuntime:
             if images:
                 msgs[-1]["images"] = images
             text = await self._stream(msgs, on_text, role=role)
+            ver = await verify_answer(text, mine, llm=None)
+            meta: dict[str, Any] = {
+                "checked": ver.for_ui(),
+                "verification_loop": build_verification_dropdown_meta(ver=ver, baseline_score=ver.score, final_score=ver.score),
+            }
             return TurnResult(
                 text=text,
                 sources=[{"id": s.id, "title": s.title, "url": "", "domain": "your files"} for s in mine],
                 kind="chat",
+                meta=meta,
             )
         msgs = build_messages(
             q,
@@ -645,6 +690,15 @@ class AgentRuntime:
 
         threading.Thread(target=_go, daemon=True).start()
 
+    def _emit_verification_preview(self, meta: dict[str, Any], trace: AgentExecutionTrace | None = None) -> None:
+        if trace:
+            meta.setdefault("agent_trace", trace.to_meta())
+        if callable(self.on_verification):
+            try:
+                self.on_verification(meta)
+            except Exception:
+                pass
+
     async def _run_research(
         self,
         q: str,
@@ -652,6 +706,7 @@ class AgentRuntime:
         on_text: TextCb,
         run_mode: str = "standard",
         trace: AgentExecutionTrace | None = None,
+        decision: LayaDecision | None = None,
     ) -> TurnResult:
         if run_mode == "quick":
             return await self._run_chat(q, on_text, trace=trace)
@@ -660,9 +715,14 @@ class AgentRuntime:
             from lora.agent.research import research as _research
 
             self._research_fn = _research
-        plan_pair = await self._plan(role="reader" if deep else "writer")
+        # Always use 8k-capped writer plan so 6 GB GPU never spills a 32k KV cache into system RAM
+        plan_pair = await self._plan(role="writer")
         on_status("Planning the search…")
-        rplan: ResearchPlan = await make_plan(lambda msgs: self._collect(msgs, plan_pair=plan_pair, role="planner"), q, self.history.messages())
+        rplan: ResearchPlan = await make_plan(
+            lambda msgs: self._collect(msgs, plan_pair=plan_pair, role="planner", options_override={"num_ctx": 4096}),
+            q,
+            self.history.messages(),
+        )
         logger.info("Prompt engineer: %r -> question=%r queries=%s", q, rplan.question, rplan.queries)
         try:
             takes_queries = "queries" in inspect.signature(self._research_fn).parameters
@@ -676,6 +736,7 @@ class AgentRuntime:
         self._check_abort()
         mine = await self._user_sources(rplan.question, start_index=len(found.sources) + 1)
         found.sources = list(found.sources) + mine
+        self.last_raw_sources = list(found.sources)
         if not found.sources:
             on_status("I couldn't reach the web, answering from what I know…")
             msgs = build_messages(
@@ -707,10 +768,10 @@ class AgentRuntime:
         if deep:
             installed_for_ver = await client.installed_models()
             verifier_model, _ = pick_judge_model(installed_for_ver, plan.model) if installed_for_ver else (plan.model, False)
-            ver_llm = VerifierLLM(client, verifier_model, plan.options, max_calls=8)
+            ver_llm = VerifierLLM(client, verifier_model, plan.options, max_calls=2)
         else:
             verifier_model = plan.model
-            ver_llm = VerifierLLM(client, plan.model, plan.options, max_calls=4)
+            ver_llm = VerifierLLM(client, plan.model, plan.options, max_calls=2)
         ver = await verify_answer(draft, found.sources, ver_llm)
         baseline_score = ver.score
         meta: dict[str, Any] = {"checked": ver.for_ui()}
@@ -718,17 +779,31 @@ class AgentRuntime:
         iterations_log: list[dict[str, Any]] | None = None
         table: dict[str, Any] | None = None
 
+        # Push initial 8-Way Verification Scorecard immediately so the user sees it right after the draft finishes
+        meta["verification_loop"] = build_verification_dropdown_meta(
+            ver=ver,
+            baseline_score=baseline_score,
+            final_score=ver.score,
+            iterations=None,
+            roundtable_info=None,
+        )
+        self._emit_verification_preview(meta, trace)
+
         async def verify_fn(t: str):
-            return await verify_answer(t, found.sources, VerifierLLM(client, verifier_model, plan.options, max_calls=6 if deep else 3))
+            return await verify_answer(t, found.sources, VerifierLLM(client, verifier_model, plan.options, max_calls=2))
 
         async def rewrite_fn(current: str, feedback: str) -> str:
-            return await self._collect(build_revise_messages(rplan.question, found.prompt_block(), current, feedback), plan_pair)
+            return await self._collect(
+                build_revise_messages(rplan.question, found.prompt_block(), current, feedback),
+                plan_pair,
+                options_override={"num_ctx": 6144},
+            )
 
         if not deep and ver.total and not ver.clean:
             on_status("Fixing what I couldn't confirm…")
             fixed = await refine(
                 draft, rplan.question, found.sources, verify_fn, rewrite_fn, [], status=on_status,
-                max_rounds=2, budget_s=60.0,
+                max_rounds=1, budget_s=35.0,
             )
             iterations_log = fixed.iterations
             if fixed.improved:
@@ -745,14 +820,20 @@ class AgentRuntime:
             on_status("Getting a second opinion…")
             opinion = Opinion(independent=independent)
             try:
-                raw = await self._collect(
-                    [{"role": "user", "content": opinion_prompt(rplan.question, draft, found.prompt_block())}],
-                    plan_pair, model=judge, keep_alive="5m",
+                raw = await asyncio.wait_for(
+                    self._collect(
+                        [{"role": "user", "content": opinion_prompt(rplan.question, draft, found.prompt_block())}],
+                        plan_pair,
+                        model=judge,
+                        keep_alive="5m",
+                        options_override={"num_ctx": 4096},
+                    ),
+                    timeout=25.0,
                 )
                 parsed = parse_opinion(raw)
                 opinion = Opinion(parsed.issues, parsed.verdict, independent)
             except Exception as exc:
-                logger.info("Second opinion unavailable: %s", exc)
+                logger.info("Second opinion unavailable or timed out: %s", exc)
             logger.info("Second opinion from %s (independent=%s): %s", judge, independent, opinion.issues)
             table = roundtable(draft, ver, found.sources, plan.model, judge, opinion)
             meta["roundtable"] = table
@@ -760,7 +841,7 @@ class AgentRuntime:
             if (table["decision"] != "approve" or not ver.clean) and run_mode in ("deep", "deep_with_refinement"):
                 result = await refine(
                     draft, rplan.question, found.sources, verify_fn, rewrite_fn, table["changes"], status=on_status,
-                    max_rounds=4 if run_mode == "deep_with_refinement" else 2,
+                    max_rounds=2, budget_s=45.0,
                 )
                 text, ver = result.text, result.verification
                 iterations_log = result.iterations
@@ -778,6 +859,7 @@ class AgentRuntime:
             iterations=iterations_log,
             roundtable_info=table,
         )
+        self._emit_verification_preview(meta, trace)
 
         text += self._footnote(ver)
         if deep:
@@ -972,6 +1054,74 @@ class AgentRuntime:
             return f"I'm not allowed to {what}: {detail}"
         return f"I couldn't {what}. {detail}".strip()
 
+    async def _do_rewrite_depth(
+        self,
+        depth_name: str,
+        on_status: Callable[[str], None],
+        on_text: TextCb,
+        trace: AgentExecutionTrace | None = None,
+    ) -> TurnResult:
+        """Re-synthesize the previous research answer at a new DepthMode (eli5..expert) without re-browsing."""
+        from lora.grounding.modes import DepthMode, DepthPromptBuilder
+
+        if not self.last_raw_sources and not self.last_answer:
+            msg = "Ask me a research question first, and then I can rewrite it at any depth (ELI5, Simple, Detailed, or Expert)."
+            on_text(msg, True)
+            return TurnResult(text=msg, kind="command")
+
+        try:
+            depth = DepthMode(depth_name.lower())
+        except ValueError:
+            depth = DepthMode.STANDARD
+
+        on_status(f"Rewriting at {depth.value.upper()} depth…")
+        if self.last_raw_sources:
+            cards = cards_from_sources(self.last_raw_sources)
+            prompt = DepthPromptBuilder().build_prompt(self.last_question or "Summarize these sources", cards, depth=depth)
+            msgs = [{"role": "user", "content": prompt}]
+            draft = await self._stream(msgs, on_text, speak=True)
+            ver = await verify_answer(draft, self.last_raw_sources, llm=None)
+            meta: dict[str, Any] = {
+                "checked": ver.for_ui(),
+                "verification_loop": build_verification_dropdown_meta(ver=ver, baseline_score=ver.score, final_score=ver.score),
+            }
+            self._emit_verification_preview(meta, trace)
+            return TurnResult(text=draft, sources=self.last_sources, kind="research", meta=meta)
+
+        msgs = build_messages(
+            f"Rewrite your previous answer at **{depth.value}** depth:\n\n{self.last_answer}",
+            self.history,
+            self._profile_fn(),
+        )
+        draft = await self._stream(msgs, on_text, speak=True)
+        return TurnResult(text=draft, kind="chat")
+
+    async def _do_save_notebook(self, explicit_title: str = "") -> str:
+        from lora.grounding.chunk import DocumentChunker
+        from lora.storage.notebook import DEFAULT_NOTEBOOK_DB, NotebookStore
+
+        if not self.last_answer:
+            return "I don't have a research session to save yet — ask me a question first."
+        store = NotebookStore(db_path=self._notebook_db_path or DEFAULT_NOTEBOOK_DB)
+        title = explicit_title or (self.last_question[:60] if self.last_question else "Research Session")
+        chunker = DocumentChunker()
+        chunks = []
+        for s in self.last_raw_sources:
+            chunks.extend(chunker.chunk_text(s.text or s.snippet, s.url, s.title))
+        cards = cards_from_sources(self.last_raw_sources)
+        nb_id = await store.save_notebook(title=title, chunks=chunks, cards=cards, answer=self.last_answer)
+        return f"Saved research notebook **{title}** (`{nb_id}`) with {len(cards)} evidence source(s)."
+
+    async def _do_list_notebooks(self) -> str:
+        from lora.storage.notebook import DEFAULT_NOTEBOOK_DB, NotebookStore
+
+        store = NotebookStore(db_path=self._notebook_db_path or DEFAULT_NOTEBOOK_DB)
+        nbs = await store.list_notebooks()
+        if not nbs:
+            return "You don't have any saved research notebooks yet. Say \"save this to my notebook\" after a research query."
+        lines = [f"- **{n['title']}** (`{n['id']}` · depth: {n.get('depth_mode', 'standard')})" for n in nbs[:15]]
+        return f"Here are your saved research notebooks ({len(nbs)}):\n" + "\n".join(lines)
+
     async def _run_command(
         self,
         cmd: Command,
@@ -986,6 +1136,22 @@ class AgentRuntime:
             text = await self._do_open(cmd.target, cmd.args.get("verb", "open"))
             if text is None:
                 return None
+        elif cmd.kind == "sleep":
+            if callable(self.on_power_command):
+                self.on_power_command("sleep")
+            text = "Going to sleep. Say \"Awaken LORA\" or tap the droplet when you need me."
+        elif cmd.kind == "turn_off":
+            text = "Shutting down L.O.R.A. Goodbye!"
+            on_text(text, True)
+            if callable(self.on_power_command):
+                self.on_power_command("turn_off")
+            return TurnResult(text=text, kind="command")
+        elif cmd.kind == "rewrite_depth":
+            return await self._do_rewrite_depth(cmd.target, on_status, on_text, trace=trace)
+        elif cmd.kind == "save_notebook":
+            text = await self._do_save_notebook(cmd.target)
+        elif cmd.kind == "list_notebooks":
+            text = await self._do_list_notebooks()
         elif cmd.kind == "switch_model":
             text = self.set_model(cmd.target)
             if self.on_model_changed:
@@ -1102,7 +1268,7 @@ class AgentRuntime:
             res = await self._tool("open_url", {"url": f"https://www.google.com/search?q={quote_plus(t)}"})
             if res.get("status") == "success":
                 return f"I don't have a shortcut for “{t}”, so I'm searching for it."
-        if verb not in ("open", "launch"):
+        if verb not in ("open", "launch", "activate", "start", "run", "fire up", "bring up", "pull up", "show me"):
             return None
 
         if len(parts) >= 3 or re.search(r"\b(on|about|for|and|with|to|in|from|how|what|why|where|who)\b", t, re.IGNORECASE):

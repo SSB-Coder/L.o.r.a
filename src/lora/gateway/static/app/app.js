@@ -1,15 +1,15 @@
 /**
  * L.O.R.A Mobile Web App Client
- * Connects to Gateway via REST and WebSocket /v1/events with token auth.
+ * Connects to Gateway via REST and WebSocket /v1/events with token auth + job status polling.
  */
 
 (function () {
   let orb = null;
   let ws = null;
   let activeJobId = null;
+  let pollTimer = null;
   let currentDepth = 'standard';
   let ttsEnabled = true;
-  let activeSpeech = null;
 
   // DOM Elements
   const statusText = document.getElementById('status-text');
@@ -19,7 +19,8 @@
   const chatFeed = document.getElementById('chat-feed');
   const askForm = document.getElementById('ask-form');
   const queryInput = document.getElementById('query-input');
-  const depthChips = document.querySelectorAll('.depth-chip');
+  const depthChips = document.querySelectorAll('.depth-chip[data-depth]');
+  const nbToggle = document.getElementById('nb-toggle');
   const ttsToggle = document.getElementById('tts-toggle');
   const floatingStop = document.getElementById('floating-stop-container');
   const stopBtn = document.getElementById('floating-stop-btn');
@@ -119,12 +120,67 @@
     } else if (msg.type === 'partial_text') {
       appendPartialToken(msg.text);
     } else if (msg.type === 'answer') {
+      if (activeJobId && msg.job_id && msg.job_id !== activeJobId) return;
+      clearPollTimer();
+      activeJobId = null;
       renderCompletedAnswer(msg);
       updateStatus('idle', 'Connected');
     } else if (msg.type === 'error') {
+      clearPollTimer();
+      activeJobId = null;
       appendSystemMessage(`Error: ${msg.message}`);
       updateStatus('idle', 'Connected');
     }
+  }
+
+  function clearPollTimer() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  function startJobPolling(jobId) {
+    clearPollTimer();
+    const token = getToken();
+    pollTimer = setInterval(async () => {
+      if (!activeJobId || activeJobId !== jobId) {
+        clearPollTimer();
+        return;
+      }
+      try {
+        const res = await fetch(`/v1/jobs/${jobId}`, {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        if (!res.ok) return;
+        const job = await res.json();
+        if (job.status === 'completed' && job.result) {
+          clearPollTimer();
+          activeJobId = null;
+          const r = job.result;
+          const checked = (r.verification && r.verification.checked) || {};
+          const citations = (r.sources || []).map((s, idx) => ({
+            id: s.id || `S${idx + 1}`,
+            title: s.title || '',
+            source_url: s.url || '',
+            quote: s.domain || '',
+            tier: 1
+          }));
+          renderCompletedAnswer({
+            text: r.answer || '',
+            citations: citations,
+            confidence: (checked.score || 0.95) >= 0.85 ? 'HIGH' : 'MEDIUM',
+            unverified: checked.unverified || []
+          });
+          updateStatus('idle', 'Connected');
+        } else if (job.status === 'failed') {
+          clearPollTimer();
+          activeJobId = null;
+          appendSystemMessage(`Error: ${job.error || 'Job failed'}`);
+          updateStatus('idle', 'Connected');
+        }
+      } catch (e) {}
+    }, 1200);
   }
 
   // Append user or assistant messages
@@ -179,7 +235,6 @@
     const bubble = document.createElement('div');
     bubble.className = 'msg-bubble';
 
-    // Safely HTML-escape text first to prevent XSS
     let formattedText = escapeHtml(data.text || '');
     if (data.citations && data.citations.length > 0) {
       data.citations.forEach((c) => {
@@ -190,7 +245,6 @@
     }
     bubble.innerHTML = formattedText;
 
-    // Confidence and metadata footer
     const metaDiv = document.createElement('div');
     metaDiv.className = 'verif-meta';
 
@@ -202,7 +256,6 @@
 
     bubble.appendChild(metaDiv);
 
-    // Unverified claims section built safely with DOM nodes
     if (data.unverified && data.unverified.length > 0) {
       const unverDiv = document.createElement('div');
       unverDiv.className = 'unverified-box';
@@ -223,7 +276,6 @@
     chatFeed.appendChild(msgDiv);
     chatFeed.scrollTop = chatFeed.scrollHeight;
 
-    // Attach citation click listeners
     bubble.querySelectorAll('.citation-badge').forEach((badge) => {
       badge.addEventListener('click', () => {
         showCitationSheet(
@@ -236,13 +288,11 @@
       });
     });
 
-    // Client-side Web Speech TTS readout (0 MB host GPU load)
     if (ttsEnabled && 'speechSynthesis' in window && data.text) {
       speakAnswer(data.text);
     }
   }
 
-  // Show citation detail bottom sheet
   function showCitationSheet(id, title, url, quote, tier) {
     document.getElementById('citation-badge-label').textContent = id;
     document.getElementById('citation-title').textContent = title || 'Source Reference';
@@ -256,10 +306,8 @@
     citationSheet.classList.add('hidden');
   }
 
-  // Client-side Web Speech TTS
   function speakAnswer(text) {
     window.speechSynthesis.cancel();
-    // Strip markdown citations for clean speech
     const cleanSpeech = text.replace(/\[S\d+[^\]]*\]/g, '').trim();
     if (!cleanSpeech) return;
 
@@ -269,7 +317,6 @@
 
     utterance.onstart = () => {
       updateStatus('speaking');
-      // Simulate audio excitation on the Hydro-Orb
       if (orb) {
         orb.setAudioLevel(0.6);
       }
@@ -283,6 +330,26 @@
     };
 
     window.speechSynthesis.speak(utterance);
+  }
+
+  async function loadNotebooks() {
+    const token = getToken();
+    try {
+      const res = await fetch('/v1/notebooks', {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      const nbs = data.notebooks || [];
+      if (!nbs.length) {
+        appendSystemMessage('No saved notebooks yet. Save a research session on desktop or ask "Save this to my notebook".');
+        return;
+      }
+      const listStr = nbs.map(n => `• ${n.title} (${n.id} · ${n.depth_mode})`).join('\n');
+      appendSystemMessage(`Saved Notebooks (${nbs.length}):\n${listStr}`);
+    } catch (err) {
+      appendSystemMessage(`Could not load notebooks: ${err.message}`);
+    }
   }
 
   // Submit Query
@@ -314,6 +381,7 @@
 
       const data = await res.json();
       activeJobId = data.job_id;
+      startJobPolling(activeJobId);
       if (data.queue_position > 0) {
         queueBanner.classList.remove('hidden');
         queuePos.textContent = data.queue_position;
@@ -328,6 +396,7 @@
   async function stopJob() {
     if (!activeJobId) return;
     const token = getToken();
+    clearPollTimer();
     try {
       await fetch('/v1/stop', {
         method: 'POST',
@@ -346,7 +415,6 @@
     }
   }
 
-  // Setup Event Listeners
   function setupEvents() {
     askForm.addEventListener('submit', (e) => {
       e.preventDefault();
@@ -364,6 +432,10 @@
       });
     });
 
+    if (nbToggle) {
+      nbToggle.addEventListener('click', loadNotebooks);
+    }
+
     ttsToggle.addEventListener('click', () => {
       ttsEnabled = !ttsEnabled;
       ttsToggle.classList.toggle('active', ttsEnabled);
@@ -377,7 +449,6 @@
     closeSheetBtn.addEventListener('click', hideCitationSheet);
   }
 
-  // Boot Application
   window.addEventListener('DOMContentLoaded', () => {
     initVisualizer();
     setupEvents();

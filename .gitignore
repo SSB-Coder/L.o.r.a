@@ -42,6 +42,7 @@ htmlcov/
 data/
 logs/
 cache/
+models/
 *.db-shm
 *.db-wal
 outputs/

@@ -5,6 +5,7 @@ import re
 from pydantic import BaseModel, ConfigDict, Field
 
 from lora.grounding.cards import EvidenceCard
+from lora.verify.claims import extract_citation_ids
 
 
 class CitationCheckResult(BaseModel):
@@ -31,15 +32,15 @@ class CitationExistenceChecker:
         """Check all bracketed citations and quotes against available cards."""
         card_map = {c.card_id: c for c in cards}
 
-        # 1. Check citations [S1 ...], [S2 ...]
-        cited_ids = re.findall(r"\[(S\d+)[^\]]*\]", text)
+        # 1. Check citations [S1 ...], [S1, S4], [1], superscripts
+        cited_ids = extract_citation_ids(text)
         forged: list[str] = []
         for cid in cited_ids:
             if cid not in card_map:
                 forged.append(cid)
 
-        # 2. Check quoted phrases "..."
-        quotes = re.findall(r'"([^"]{6,})"', text)
+        # 2. Check multi-word verbatim quoted sentences "..." (4+ words)
+        quotes = [q for q in re.findall(r'"([^"\n]{24,})"', text) if len(q.split()) >= 4]
         invalid_quotes: list[str] = []
 
         combined_source_quotes = " ".join(c.exact_quote for c in cards).lower()

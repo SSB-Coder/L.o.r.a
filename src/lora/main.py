@@ -13,7 +13,7 @@ from lora.gateway.server import create_gateway_app
 from lora.ui.audio_cues import AudioCueManager, SoundCue
 from lora.ui.hud import LoraDesktopHUD
 from lora.ui.tray import LoraSystemTray
-from lora.ui.widget import WidgetState
+from lora.ui.widget import AmbientDropletWidget, WidgetState
 
 logger = logging.getLogger("lora")
 
@@ -66,7 +66,30 @@ def init_platform(base_dir: Path | None = None) -> tuple[ConfigManager, LoraUser
     return cfg_mgr, user_cfg
 
 
-def start_gateway_thread(host: str, port: int, queue=None, origin: str = "desktop", token_validator=None, media_db=None) -> uvicorn.Server | None:
+def _detect_lan_ip() -> str:
+    """Detect the active private LAN IPv4 address for mobile QR pairing (never 0.0.0.0)."""
+    import socket
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+
+def start_gateway_thread(
+    host: str,
+    port: int,
+    queue=None,
+    origin: str = "desktop",
+    token_validator=None,
+    media_db=None,
+    connection_manager=None,
+) -> uvicorn.Server | None:
     """Launches the FastAPI Gateway inside a dedicated background thread."""
     import socket
 
@@ -75,7 +98,13 @@ def start_gateway_thread(host: str, port: int, queue=None, origin: str = "deskto
             logger.info("Gateway daemon already active at http://%s:%d", host, port)
             return None
 
-    app = create_gateway_app(origin=origin, queue=queue, token_validator=token_validator, media_db=media_db)
+    app = create_gateway_app(
+        origin=origin,
+        queue=queue,
+        token_validator=token_validator,
+        media_db=media_db,
+        connection_manager=connection_manager,
+    )
     config = uvicorn.Config(
         app=app,
         host=host,
@@ -95,9 +124,9 @@ def run_desktop_app(
     user_cfg: LoraUserConfig,
     args: argparse.Namespace,
 ) -> int:
-    """Launches the PySide6 holographic HUD, System Tray, and Audio/Voice Pipeline.
+    """Launches the PySide6 holographic HUD, Ambient Droplet Widget, System Tray, and Voice Pipeline.
 
-    Threading rule: only the GUI thread may touch ``hud``/``tray``. Worker threads (Ollama,
+    Threading rule: only the GUI thread may touch ``hud``/``tray``/``widget``. Worker threads (Ollama,
     Whisper, TTS, the sounddevice callback, the pynput hotkey) hand results over with
     ``ui.post(fn)``. ``QTimer.singleShot(0, fn)`` from those threads silently never fires.
     """
@@ -121,20 +150,25 @@ def run_desktop_app(
     audio = AudioCueManager(enabled=user_cfg.voice.sound_effects_enabled and not args.no_audio)
     hud = LoraDesktopHUD(media_db=media_db)
     tray = LoraSystemTray()
+    widget = AmbientDropletWidget()
 
     def on_sleep_toggled(is_sleeping: bool) -> None:
         if is_sleeping:
             audio.play_cue(SoundCue.SLEEP)
             tray.update_state(WidgetState.SLEEPING)
+            widget.set_state(WidgetState.SLEEPING)
             hud.set_voice_state("sleeping")
         else:
             audio.play_cue(SoundCue.WAKE)
             tray.update_state(WidgetState.IDLE)
+            widget.set_state(WidgetState.IDLE)
             hud.set_voice_state("idle")
 
     hud.sleep_toggled.connect(on_sleep_toggled)
     tray.sleep_toggled.connect(lambda: hud.sleep_toggled.emit(hud._current_voice_state != "sleeping"))
     tray.open_hud_requested.connect(hud.toggle_window)
+    widget.hud_requested.connect(hud.toggle_window)
+    widget.sleep_toggled.connect(on_sleep_toggled)
 
     # Clean shutdown & microphone release
     capture = None
@@ -162,6 +196,7 @@ def run_desktop_app(
             sd.stop()
         except Exception:
             pass
+        widget.close()
         hud.close()
         tray.hide()
         app.quit()
@@ -190,8 +225,13 @@ def run_desktop_app(
             from lora.voice.tts.engine import TtsEngine
             from lora.voice.tts.worker import Qwen3TtsWorkerProcess
 
+            kokoro_dir = (
+                str(Path("models/kokoro").resolve())
+                if Path("models/kokoro").exists()
+                else r"C:\Models\kokoro"
+            )
             tts_worker = Qwen3TtsWorkerProcess(
-                models_dir=r"C:\Models\kokoro",
+                models_dir=kokoro_dir,
                 tokenizer_dir=r"C:\Models\Qwen3-TTS-Tokenizer-12Hz",
                 default_voice=active_voice[0],
                 spawn_process=False,
@@ -257,7 +297,7 @@ def run_desktop_app(
                 return
             step = samples[step_idx * slice_size : (step_idx + 1) * slice_size]
             rms = float(np.sqrt(np.mean(step**2))) if len(step) else 0.0
-            ui.post(lambda lvl=min(1.0, rms * 8.0): hud.set_audio_level(lvl))
+            ui.post(lambda lvl=min(1.0, rms * 8.0): (hud.set_audio_level(lvl), widget.set_audio_level(lvl)))
             time.sleep(duration / num_steps)
         if not stop_event.is_set() and not is_exiting.is_set() and not used_winsound:
             try:
@@ -275,7 +315,7 @@ def run_desktop_app(
 
         def _started() -> None:
             speech_active.set()
-            ui.post(lambda: hud.set_voice_state("speaking"))
+            ui.post(lambda: (hud.set_voice_state("speaking"), widget.set_state(WidgetState.SPEAKING)))
 
         def _done(spoke: bool) -> None:
             speech_active.clear()
@@ -284,7 +324,9 @@ def run_desktop_app(
             if turn_done.is_set():
                 ui.post(lambda: (
                     hud.set_voice_state("idle"),
+                    widget.set_state(WidgetState.IDLE),
                     hud.set_audio_level(0.0),
+                    widget.set_audio_level(0.0),
                     audio.play_cue(SoundCue.COMPLETE) if spoke else None,
                 ))
 
@@ -303,7 +345,12 @@ def run_desktop_app(
         except Exception:
             pass
         if update_ui:
-            ui.post(lambda: (hud.set_voice_state("idle"), hud.set_audio_level(0.0)))
+            ui.post(lambda: (
+                hud.set_voice_state("idle"),
+                widget.set_state(WidgetState.IDLE),
+                hud.set_audio_level(0.0),
+                widget.set_audio_level(0.0),
+            ))
 
     hud.stop_audio_requested.connect(stop_current_speech)
 
@@ -334,9 +381,11 @@ def run_desktop_app(
         mcp_config_path=cfg_mgr.paths.mcp_file,
         skills_dir=cfg_mgr.paths.skills_dir,
         agents_dir=cfg_mgr.paths.agents_dir,
+        notebook_db_path=Path(cfg_mgr.paths.user_profile_file).parent / "notebooks.db",
     )
+    logger.info("Laya decision router initialized (%s).", runtime.laya_router.backend)
 
-    # Wire manual/auto Model, Skill, and Voice selectors between HUD and AgentRuntime
+    # Wire manual/auto Model, Skill, Voice, Verification, and Power callbacks between HUD and AgentRuntime
     def on_model_selected(model_name: str) -> None:
         msg = runtime.set_model(model_name)
         logger.info(msg)
@@ -353,6 +402,15 @@ def run_desktop_app(
         active_voice.__setitem__(0, vc),
         ui.post(lambda v=vc: hud.set_active_voice(v)),
     )
+    runtime.on_verification = lambda meta: ui.post(lambda m=dict(meta): hud.set_verification(m))
+
+    def _handle_power_cmd(action: str) -> None:
+        if action == "sleep":
+            ui.post(lambda: on_sleep_toggled(True))
+        elif action == "turn_off":
+            ui.post(on_exit)
+
+    runtime.on_power_command = _handle_power_cmd
 
     def _confirm_blocking(text: str) -> bool:
         """Ask the user (GUI thread dialog) and wait for the answer from the worker thread."""
@@ -398,7 +456,7 @@ def run_desktop_app(
             from lora.agent.commands import parse_command
 
             fast_cmd = parse_command(query) if not turn_attachments else None
-            if fast_cmd is not None and fast_cmd.kind in ("open", "google", "site_search", "list_dir", "switch_model", "switch_voice", "switch_skill"):
+            if fast_cmd is not None and fast_cmd.kind in ("open", "google", "site_search", "list_dir", "switch_model", "switch_voice", "switch_skill", "sleep", "turn_off"):
                 def _fast_worker() -> None:
                     try:
                         res = _run_coro(runtime._run_command(fast_cmd, query, lambda _s: None, lambda _t, _sp=True: None))
@@ -418,6 +476,7 @@ def run_desktop_app(
 
         stop_current_speech(update_ui=False)
         hud.set_voice_state("thinking")
+        widget.set_state(WidgetState.THINKING)
         hud.stream_begin(query, "")
         turn_done = threading.Event()
 
@@ -458,12 +517,15 @@ def run_desktop_app(
                     turn_done.set()
                     if streamer is None:
                         hud.set_voice_state("idle")
+                        widget.set_state(WidgetState.IDLE)
                         return
                     spoken = result.spoken if result.spoken is not None else result.text
                     if result.spoken is not None:
                         streamer.feed(spoken)
                     streamer.finish(spoken)
-                    hud.set_voice_state("speaking" if streamer.has_pending else "idle")
+                    is_sp = streamer.has_pending
+                    hud.set_voice_state("speaking" if is_sp else "idle")
+                    widget.set_state(WidgetState.SPEAKING if is_sp else WidgetState.IDLE)
                 finally:
                     inflight.clear()
 
@@ -472,7 +534,7 @@ def run_desktop_app(
         threading.Thread(target=_worker, daemon=True).start()
 
     hud.query_submitted.connect(on_query_submitted)
-    hud.rewrite_requested.connect(lambda dir, depth: on_query_submitted(last_query[0], depth))
+    hud.rewrite_requested.connect(lambda dir, depth: on_query_submitted(f"Explain that at {depth or 'detailed'} depth", depth))
 
     def _preload_voice() -> None:
         """Load the Kokoro CPU voice (0 MB GPU VRAM) at startup."""
@@ -654,7 +716,7 @@ def run_desktop_app(
                 now = time.monotonic()
                 if now - _last_ui_update_time[0] >= 0.04:
                     _last_ui_update_time[0] = now
-                    ui.post(lambda lvl=level: hud.set_audio_level(lvl))
+                    ui.post(lambda lvl=level: (hud.set_audio_level(lvl), widget.set_audio_level(lvl)))
 
                 if armed_until[0] and now > armed_until[0]:
                     armed_until[0] = 0.0
@@ -772,9 +834,17 @@ def run_desktop_app(
 
     from lora.agent.jobs import JobWorker
     from lora.gateway.queue import JobQueue
+    from lora.gateway.ws import ConnectionManager
 
     job_queue = JobQueue()
-    gateway_server = start_gateway_thread(host=args.host, port=args.port, queue=job_queue, media_db=media_db)
+    ws_manager = ConnectionManager()
+    gateway_server = start_gateway_thread(
+        host=args.host,
+        port=args.port,
+        queue=job_queue,
+        media_db=media_db,
+        connection_manager=ws_manager,
+    )
 
     def _make_job_runtime(origin: str) -> AgentRuntime:
         return AgentRuntime(
@@ -785,31 +855,83 @@ def run_desktop_app(
             profile_fn=_profile_text,
             media_db=media_db,
             allow_actions=(origin == "desktop"),
+            notebook_db_path=Path(cfg_mgr.paths.user_profile_file).parent / "notebooks.db",
         )
 
-    job_worker = JobWorker(job_queue, _make_job_runtime, desktop_busy=inflight.is_set)
+    job_worker = JobWorker(
+        job_queue,
+        _make_job_runtime,
+        desktop_busy=inflight.is_set,
+        broadcaster=ws_manager.broadcast,
+    )
     job_worker.start()
 
-    mobile_server = None
+    mobile_server_ref: list[uvicorn.Server | None] = [None]
+    mobile_url_ref: list[str] = [""]
+
+    def _ensure_mobile_gateway(bind_str: str | None = None) -> str:
+        if mobile_url_ref[0]:
+            return mobile_url_ref[0]
+        import secrets as _secrets
+        from lora.gateway.auth import TokenValidator
+        from lora.gateway.qr import generate_pairing_qr_terminal, get_pairing_url
+
+        target = bind_str or getattr(args, "mobile_bind", None) or f"{_detect_lan_ip()}:8766"
+        m_host, _, m_port = target.rpartition(":")
+        m_port_int = int(m_port or 8766)
+        token_file = Path(cfg_mgr.paths.user_profile_file).parent / "mobile_token.txt"
+        token = os.environ.get("LORA_MOBILE_TOKEN") or (
+            token_file.read_text(encoding="utf-8").strip() if token_file.exists() else _secrets.token_urlsafe(32)
+        )
+        token_file.write_text(token, encoding="utf-8")
+        srv = start_gateway_thread(
+            m_host,
+            m_port_int,
+            queue=job_queue,
+            origin="mobile",
+            token_validator=TokenValidator(mobile_token=token),
+            media_db=media_db,
+            connection_manager=ws_manager,
+        )
+        if srv is not None:
+            mobile_server_ref[0] = srv
+        url = get_pairing_url(m_host, m_port_int, token)
+        mobile_url_ref[0] = url
+        try:
+            qr_ascii = generate_pairing_qr_terminal(m_host, m_port_int, token)
+            logger.info("Mobile gateway on %s\n%s", url, qr_ascii)
+        except Exception:
+            logger.info("Mobile gateway on %s (token saved in %s)", url, token_file)
+        return url
+
     if getattr(args, "mobile_bind", None):
         try:
-            import secrets as _secrets
-            from lora.gateway.auth import TokenValidator
-
-            m_host, _, m_port = args.mobile_bind.rpartition(":")
-            token_file = Path(cfg_mgr.paths.user_profile_file).parent / "mobile_token.txt"
-            token = os.environ.get("LORA_MOBILE_TOKEN") or (
-                token_file.read_text(encoding="utf-8").strip() if token_file.exists() else _secrets.token_urlsafe(32)
-            )
-            token_file.write_text(token, encoding="utf-8")
-            mobile_server = start_gateway_thread(
-                m_host, int(m_port), queue=job_queue, origin="mobile", token_validator=TokenValidator(mobile_token=token)
-            )
-            logger.info("Mobile gateway on http://%s:%s. Pairing token saved in %s", m_host, m_port, token_file)
+            _ensure_mobile_gateway(args.mobile_bind)
         except Exception as exc:
             logger.warning("Could not start the mobile gateway: %s", exc)
 
-    # Show holographic HUD centered
+    def _on_show_mobile_qr() -> None:
+        try:
+            from lora.gateway.qr import generate_pairing_qr_terminal
+
+            url = _ensure_mobile_gateway()
+            host_part = url.split("//", 1)[-1].split("/")[0]
+            ip_str, _, port_str = host_part.rpartition(":")
+            token_str = url.split("token=", 1)[-1]
+            qr_text = generate_pairing_qr_terminal(ip_str, int(port_str or 8766), token_str)
+            body = (
+                f"### Mobile LAN Companion Pairing\n"
+                f"Open this URL on your phone (connected to the same Wi-Fi/LAN) or scan the QR code below:\n\n"
+                f"**[{url}]({url})**\n\n"
+                f"```\n{qr_text}\n```"
+            )
+            hud.present_answer("Pair Mobile (QR)", body, streamed=False)
+        except Exception as exc:
+            hud.append_message("System", f"Could not generate mobile pairing QR: {exc}")
+
+    hud.mobile_qr_requested.connect(_on_show_mobile_qr)
+
+    # Show holographic HUD centered and Ambient Droplet Widget snapped to bottom-right corner
     screen_geo = app.primaryScreen().geometry()
     hud.move(
         max(0, (screen_geo.width() - hud.width()) // 2),
@@ -843,7 +965,7 @@ def run_desktop_app(
             pass
     if runtime.mcp_hub is not None:
         runtime.mcp_hub.close()
-    for server in (gateway_server, mobile_server):
+    for server in (gateway_server, mobile_server_ref[0]):
         if server is not None:
             server.should_exit = True
     return exit_code
