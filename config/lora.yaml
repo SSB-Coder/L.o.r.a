@@ -1,8 +1,8 @@
-# LORA Master Configuration (Phase 0 Baseline)
+# LORA Master Configuration (Phase 0 Baseline + v5 Agentic Harness & Kokoro TTS)
 models_dir: 'C:\Models'
 
 voice:
-  mode: auto                      # quality | fast | auto
+  mode: quality                     # quality | fast | auto
   wake:
     engine: openwakeword
     model: models/voice/hey_lora.onnx
@@ -22,18 +22,18 @@ voice:
     compute: int8
     beam: 1
     vad_filter: true
-    initial_prompt: "LORA, arXiv, RAG, Ollama, Python, VS Code, GitHub, Hugging Face, Granite, Gemma, Spark"
+    initial_prompt: "LORA, arXiv, RAG, Ollama, Python, VS Code, GitHub, Hugging Face, Granite, Gemma, Spark, Kokoro, Wikipedia, ChatGPT"
   stt_fallback: [moonshine, parakeet-sherpa-onnx]
   tts_quality:
-    engine: qwen3-tts
-    model_path: "C:\\Models\\Qwen3-TTS-12Hz-1.7B-CustomVoice"
-    tokenizer_path: "C:\\Models\\Qwen3-TTS-Tokenizer-12Hz"
-    speaker: Vivian
-    dtype: bfloat16
-    attn: sdpa
+    engine: kokoro-onnx
+    model_path: "C:\\Models\\kokoro\\kokoro-v1.0.onnx"
+    voices_path: "C:\\Models\\kokoro\\voices-v1.0.bin"
+    speaker: af_sky
+    lang: en-us
+    speed: 1.0
   tts_fast:
-    engine: piper
-    voice: en_US-lessac-medium
+    engine: kokoro-onnx
+    voice: af_sky
 
 decision:                         # Laya decision model
   checkpoint: models/laya-lora-ft
@@ -65,14 +65,27 @@ models:                           # Model role assignments
   controller:
     name: "granite4.2:8b"
     think: false
-    num_ctx: 4096
+    num_ctx: 6144
+    fallback: ["ornith-1.5:9b", "gemma4:e4b", "spark-x25-4b-q4"]
   writer:
     name: "spark-x25-4b-q4"
     family: spark
     think: false
     temperature: 0.3
     num_ctx: 8192                      # 8k context cap for writer
-    fallback: ["ornith-1.5:9b"]
+    fallback: ["gemma4:e4b", "granite4.2:8b", "ornith-1.5:9b"]
+  complex:
+    name: "granite4.2:8b"
+    think: false
+    temperature: 0.2
+    num_ctx: 8192
+    fallback: ["ornith-1.5:9b", "gemma4:e4b", "spark-x25-4b-q4"]
+  vision:
+    name: "gemma3:4b"
+    think: false
+    temperature: 0.2
+    num_ctx: 8192
+    fallback: ["llava:latest", "qwen2.5vl:latest", "minicpm-v:latest", "gemma4:e4b", "granite4.2:8b", "spark-x25-4b-q4"]
   reader:
     name: "spark-x25-4b-q4"
     family: spark
@@ -112,7 +125,7 @@ research:
   query_mode_min_similarity: 0.35
 
 outerloop:
-  max_iters: 5
+  max_iters: 8
   epsilon: auto
   wallclock_minutes: 20
   faithfulness_floor: 0.85
@@ -133,6 +146,9 @@ safety:
     - ".png"
     - ".jpg"
     - ".jpeg"
+    - ".svg"
+    - ".py"
+    - ".html"
     - ".json"
     - ".yaml"
     - ".yml"

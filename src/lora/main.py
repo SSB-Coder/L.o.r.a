@@ -101,10 +101,9 @@ def run_desktop_app(
     Whisper, TTS, the sounddevice callback, the pynput hotkey) hand results over with
     ``ui.post(fn)``. ``QTimer.singleShot(0, fn)`` from those threads silently never fires.
     """
+    import asyncio
     from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication
-
-    import asyncio
 
     from lora.agent.runtime import AgentRuntime, TurnResult
     from lora.dialogue import ConversationHistory
@@ -116,7 +115,6 @@ def run_desktop_app(
     app.setQuitOnLastWindowClosed(True)
     ui = UiDispatcher()  # lives on the GUI thread
 
-    # Initialize components
     from lora.grounding.media_vector_db import MediaVectorDB
 
     media_db = MediaVectorDB()
@@ -172,16 +170,16 @@ def run_desktop_app(
     hud.exit_requested.connect(on_exit)
     app.aboutToQuit.connect(on_exit)
 
-    # Voice capture, STT, and TTS setup
+    # Voice capture, STT, and Kokoro TTS (default voice: af_sky) setup
     transcriber = None
     speech_active = threading.Event()
-    active_voice = ["vivian"]
+    active_voice = ["af_sky"]
     voice_enabled = [True]
     voice_init_error = [""]
 
     def on_voice_changed(new_voice: str) -> None:
-        active_voice[0] = new_voice
-        logger.info("Active TTS voice selected: %s", new_voice)
+        active_voice[0] = new_voice or "af_sky"
+        logger.info("Active TTS voice selected: %s", active_voice[0])
 
     hud.voice_changed.connect(on_voice_changed)
     hud.voice_toggled.connect(lambda enabled: voice_enabled.__setitem__(0, bool(enabled)))
@@ -193,13 +191,13 @@ def run_desktop_app(
             from lora.voice.tts.worker import Qwen3TtsWorkerProcess
 
             tts_worker = Qwen3TtsWorkerProcess(
-                models_dir=r"C:\Models\Qwen3-TTS-12Hz-1.7B-CustomVoice",
+                models_dir=r"C:\Models\kokoro",
                 tokenizer_dir=r"C:\Models\Qwen3-TTS-Tokenizer-12Hz",
                 default_voice=active_voice[0],
                 spawn_process=False,
             )
             tts_engine = TtsEngine(worker=tts_worker)
-            logger.info("TTS engine initialized.")
+            logger.info("TTS engine initialized (default voice: %s).", active_voice[0])
         except Exception as e:
             logger.warning("Could not initialize TTS engine: %s", e)
 
@@ -259,7 +257,7 @@ def run_desktop_app(
                 return
             step = samples[step_idx * slice_size : (step_idx + 1) * slice_size]
             rms = float(np.sqrt(np.mean(step**2))) if len(step) else 0.0
-            ui.post(lambda lvl=min(1.0, rms * 8.0): hud.set_audio_level(lvl))  # level only: no per-step pulses
+            ui.post(lambda lvl=min(1.0, rms * 8.0): hud.set_audio_level(lvl))
             time.sleep(duration / num_steps)
         if not stop_event.is_set() and not is_exiting.is_set() and not used_winsound:
             try:
@@ -338,6 +336,24 @@ def run_desktop_app(
         agents_dir=cfg_mgr.paths.agents_dir,
     )
 
+    # Wire manual/auto Model, Skill, and Voice selectors between HUD and AgentRuntime
+    def on_model_selected(model_name: str) -> None:
+        msg = runtime.set_model(model_name)
+        logger.info(msg)
+
+    def on_skill_selected(skill_name: str) -> None:
+        msg = runtime.set_skill(skill_name)
+        logger.info(msg)
+
+    hud.model_changed.connect(on_model_selected)
+    hud.skill_changed.connect(on_skill_selected)
+    runtime.on_model_changed = lambda active, models: ui.post(lambda a=active, m=models: hud.update_model_list(m, a))
+    runtime.on_skill_changed = lambda sk: ui.post(lambda s=sk: hud.set_active_skill(s))
+    runtime.on_voice_changed_cb = lambda vc: (
+        active_voice.__setitem__(0, vc),
+        ui.post(lambda v=vc: hud.set_active_voice(v)),
+    )
+
     def _confirm_blocking(text: str) -> bool:
         """Ask the user (GUI thread dialog) and wait for the answer from the worker thread."""
         answer = {"ok": False}
@@ -361,7 +377,6 @@ def run_desktop_app(
     async def _confirm(text: str) -> bool:
         return await asyncio.to_thread(_confirm_blocking, text)
 
-    # Persistent background asyncio event loop so Playwright & HTTP transports never die between turns
     bg_loop = asyncio.new_event_loop()
     threading.Thread(target=bg_loop.run_forever, daemon=True, name="lora-async-loop").start()
 
@@ -375,14 +390,15 @@ def run_desktop_app(
     def on_query_submitted(query: str, depth: str = "") -> None:
         """Runs on the GUI thread. Starts one assistant turn in the background."""
         query = (query or "").strip()
-        if not query:
+        turn_attachments = list(getattr(hud, "pending_attachments", []) or [])
+        hud.pending_attachments = []
+        if not query and not turn_attachments:
             return
         if inflight.is_set():
-            # Allow instant desktop launch/open commands to run immediately without waiting for slow LLM turns
             from lora.agent.commands import parse_command
 
-            fast_cmd = parse_command(query)
-            if fast_cmd is not None and fast_cmd.kind in ("open", "google", "site_search", "list_dir"):
+            fast_cmd = parse_command(query) if not turn_attachments else None
+            if fast_cmd is not None and fast_cmd.kind in ("open", "google", "site_search", "list_dir", "switch_model", "switch_voice", "switch_skill"):
                 def _fast_worker() -> None:
                     try:
                         res = _run_coro(runtime._run_command(fast_cmd, query, lambda _s: None, lambda _t, _sp=True: None))
@@ -423,8 +439,8 @@ def run_desktop_app(
                     streamer.feed(full)
 
             try:
-                result = _run_coro(runtime.run_turn(query, on_status, on_text))
-            except Exception as exc:  # never leave the UI waiting
+                result = _run_coro(runtime.run_turn(query, on_status, on_text, attachments=turn_attachments or None))
+            except Exception as exc:
                 logger.exception("Turn crashed")
                 result = TurnResult(text="Something went wrong on my side. Try again in a moment.", kind="error", failure=str(exc))
             logger.info(
@@ -459,7 +475,7 @@ def run_desktop_app(
     hud.rewrite_requested.connect(lambda dir, depth: on_query_submitted(last_query[0], depth))
 
     def _preload_voice() -> None:
-        """Load the natural voice first: Ollama sizes its GPU share from what is free when IT loads."""
+        """Load the Kokoro CPU voice (0 MB GPU VRAM) at startup."""
         if tts_engine is None or args.no_audio:
             return
         try:
@@ -470,17 +486,20 @@ def run_desktop_app(
             logger.warning("Voice preload failed: %s", exc)
 
     def _warm_up_model() -> None:
-        """Load the model in the background at startup so the first greeting is instant."""
+        """Load the model in the background at startup and sync installed models to the UI dropdown."""
         _preload_voice()
-        threading.Thread(target=runtime.start_mcp, daemon=True, name="lora-mcp").start()  # ~/.lora/mcp.json servers
+        threading.Thread(target=runtime.start_mcp, daemon=True, name="lora-mcp").start()
         async def _go() -> None:
             from lora.models.ollama_client import OllamaClient
             from lora.models.selection import plan_chat
 
             client = OllamaClient(base_url=user_cfg.models.ollama_url)
             plan = None
-            for _ in range(30):  # Ollama may still be starting: wait up to ~1 minute
+            for _ in range(30):
                 try:
+                    installed = await client.installed_models()
+                    if installed:
+                        ui.post(lambda m=installed: hud.update_model_list(m, runtime.manual_model or "auto"))
                     plan = await plan_chat(client, user_default=user_cfg.models.default_model)
                     break
                 except Exception:
@@ -525,7 +544,7 @@ def run_desktop_app(
             is_ptt_active = threading.Event()
             ptt_start_time = [0.0]
             ptt_chunks: list[np.ndarray] = []
-            armed_until = [0.0]  # after "Hey LORA" alone, the next utterance is the query
+            armed_until = [0.0]
             ARM_SECONDS = 10.0
             stt_error_shown = [False]
 
@@ -604,7 +623,7 @@ def run_desktop_app(
 
                         wake = wakeword.evaluate_text(text, audio_clip, current_state=current_st)
                         if not wake.detected:
-                            return  # ordinary conversation in the room: ignore it
+                            return
                         audio.play_cue(SoundCue.WAKE)
                         if sleeping:
                             logger.info("Wake word detected while sleeping. Waking up.")
@@ -669,7 +688,7 @@ def run_desktop_app(
                 if hud._current_voice_state in ("thinking", "think", "verify", "sleep", "sleeping"):
                     return
                 if is_ptt_active.is_set():
-                    return  # Ignore duplicate PTT press events while already holding
+                    return
                 armed_until[0] = 0.0
                 ptt_chunks.clear()
                 is_ptt_active.set()
@@ -719,7 +738,6 @@ def run_desktop_app(
             voice_init_error[0] = f"{type(e).__name__}: {e}"
             logger.warning("Voice capture could not be initialized: %s", e, exc_info=True)
 
-    # Tell the user the truth about the microphone (name, or why it is off) and watch it.
     def _refresh_mic_status() -> None:
         if args.no_audio:
             hud.set_mic_status(False, "disabled (--no-audio)")
@@ -747,12 +765,11 @@ def run_desktop_app(
 
     runtime.diag_extras = _diag_extras
 
-    mic_timer = QTimer(hud)  # parented to the HUD so it stays alive; runs on the GUI thread
+    mic_timer = QTimer(hud)
     mic_timer.setInterval(2000)
     mic_timer.timeout.connect(_refresh_mic_status)
     mic_timer.start()
 
-    # Start Gateway background server
     from lora.agent.jobs import JobWorker
     from lora.gateway.queue import JobQueue
 
@@ -760,7 +777,6 @@ def run_desktop_app(
     gateway_server = start_gateway_thread(host=args.host, port=args.port, queue=job_queue, media_db=media_db)
 
     def _make_job_runtime(origin: str) -> AgentRuntime:
-        # Phone jobs may chat and research, never open apps/files or type; desktop-origin jobs keep full tools.
         return AgentRuntime(
             ollama_url=user_cfg.models.ollama_url,
             user_default_model=user_cfg.models.default_model,
@@ -778,7 +794,6 @@ def run_desktop_app(
     if getattr(args, "mobile_bind", None):
         try:
             import secrets as _secrets
-
             from lora.gateway.auth import TokenValidator
 
             m_host, _, m_port = args.mobile_bind.rpartition(":")
@@ -834,7 +849,7 @@ def run_desktop_app(
     return exit_code
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = build_argument_parser()
     parser.add_argument(
         "--mobile-bind",
@@ -842,9 +857,8 @@ def main() -> int:
         metavar="HOST:PORT",
         help="Also listen for phone requests on this LAN address (token-protected). Off by default.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    # Configure logging
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -856,16 +870,18 @@ def main() -> int:
         logger.info("Starting L.O.R.A in headless daemon mode...")
         server = start_gateway_thread(host=args.host, port=args.port)
         try:
-            import time
-
-            while not server.should_exit:
+            while server and not server.should_exit:
                 time.sleep(0.5)
         except KeyboardInterrupt:
             logger.info("Shutting down L.O.R.A headless daemon...")
-            server.should_exit = True
+            if server is not None:
+                server.should_exit = True
         return 0
 
     return run_desktop_app(cfg_mgr, user_cfg, args)
+
+
+cli = main
 
 
 if __name__ == "__main__":

@@ -8,6 +8,11 @@ from pydantic import BaseModel
 class ChatMessage(BaseModel):
     role: str
     content: str
+    images: list[str] | None = None
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        kwargs.setdefault("exclude_none", True)
+        return super().model_dump(*args, **kwargs)
 
 
 class OllamaChatRequest(BaseModel):

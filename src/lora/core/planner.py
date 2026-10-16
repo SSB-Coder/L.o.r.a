@@ -45,10 +45,25 @@ class ControlPlanner:
                 reasoning=f"User requested switching to window '{target}'",
             )]
 
-        # 3. Ask External AI (ChatGPT, Claude, Gemini, Perplexity)
-        ask_ai_match = re.search(r"^ask\s+(claude|chatgpt|gemini|perplexity)\s+(?:to\s+)?(.+)", text.strip(), re.IGNORECASE)
+        # 3a. Compound "open <ai> and ask <prompt>"
+        open_ask_match = re.search(
+            r"^(?:open|launch|go to|visit|use)\s+(?:the\s+)?(claude|chatgpt|chat gpt|gemini|perplexity)\s+(?:and\s+)?(?:then\s+)?(?:ask|tell|prompt|message|query)\s+(?:it\s+|them\s+)?(?:to\s+|about\s+|that\s+)?(.+)",
+            text.strip(),
+            re.IGNORECASE,
+        )
+        if open_ask_match:
+            svc = open_ask_match.group(1).strip().lower().replace(" ", "")
+            prompt = open_ask_match.group(2).strip()
+            return [PlannedAction(
+                tool="ask_other_ai",
+                params={"service": svc, "prompt": prompt},
+                reasoning=f"User requested opening and asking {svc} external AI",
+            )]
+
+        # 3b. Direct Ask External AI (ChatGPT, Claude, Gemini, Perplexity)
+        ask_ai_match = re.search(r"^ask\s+(claude|chatgpt|chat gpt|gemini|perplexity)\s+(?:to\s+)?(.+)", text.strip(), re.IGNORECASE)
         if ask_ai_match:
-            svc = ask_ai_match.group(1).strip().lower()
+            svc = ask_ai_match.group(1).strip().lower().replace(" ", "")
             prompt = ask_ai_match.group(2).strip()
             return [PlannedAction(
                 tool="ask_other_ai",
@@ -106,24 +121,29 @@ class ControlPlanner:
                     reasoning=f"User requested opening system {folder_name} folder",
                 )]
 
-        # 4. Open web apps (Claude, ChatGPT, Wikipedia, etc.)
-        for web_key in self.app_launcher.web_apps:
-            if f"open {web_key}" in clean or f"launch {web_key}" in clean:
-                # Check if there is a query (e.g. "open wikipedia on quantum computing")
-                query = ""
-                on_match = re.search(rf"open {web_key}\s+(?:on|about|for|in)\s+(.+)", clean)
-                if on_match:
-                    query = on_match.group(1).strip()
+        # 9. Open web apps (Claude, ChatGPT, Wikipedia, YouTube, arXiv, etc.) with optional topic query
+        for web_key, web_info in self.app_launcher.web_apps.items():
+            aliases = [web_key] + [a.lower() for a in web_info.get("aliases", [])]
+            for alias in aliases:
+                if f"open {alias}" in clean or f"launch {alias}" in clean:
+                    query = ""
+                    on_match = re.search(
+                        rf"(?:open|launch)\s+{re.escape(alias)}\s+(?:(?:page|article|video|entry)\s+)?(?:on|about|for|in)\s+(.+)",
+                        text.strip(),
+                        re.IGNORECASE,
+                    )
+                    if on_match:
+                        query = on_match.group(1).strip()
 
-                target = self.app_launcher.resolve_web_app(web_key, query=query)
-                if target:
-                    return [PlannedAction(
-                        tool="open_url",
-                        params={"url": target["url"]},
-                        reasoning=f"User requested opening web service {target['name']}",
-                    )]
+                    target = self.app_launcher.resolve_web_app(web_key, query=query)
+                    if target:
+                        return [PlannedAction(
+                            tool="open_url",
+                            params={"url": target["url"]},
+                            reasoning=f"User requested opening web service {target['name']}",
+                        )]
 
-        # 5. Open desktop app (Notepad, VS Code, Calculator, etc.)
+        # 10. Open desktop app (Notepad, VS Code, Calculator, etc.)
         for app_key in self.app_launcher.applications:
             aliases = [app_key] + self.app_launcher.applications[app_key].get("aliases", [])
             for alias in aliases:
@@ -138,16 +158,13 @@ class ControlPlanner:
 
     def plan(self, user_request: str, decision: LayaDecision | None = None) -> list[PlannedAction]:
         """Generate an execution plan of structured actions."""
-        # Check fast path first for instantaneous sub-10ms response
         fast_plan = self._fast_path_plan(user_request)
         if fast_plan:
             return fast_plan
 
-        # Fallback / compound action parsing
         clean = user_request.strip().lower()
         actions: list[PlannedAction] = []
 
-        # Compound check: "open downloads and list files"
         if "downloads" in clean:
             actions.append(PlannedAction(
                 tool="open_path",
@@ -164,7 +181,6 @@ class ControlPlanner:
         if actions:
             return actions
 
-        # Default fallback: attempt opening application
         first_word = user_request.split()[-1] if user_request else ""
         return [PlannedAction(
             tool="open_app",

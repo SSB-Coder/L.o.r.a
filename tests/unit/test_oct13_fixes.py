@@ -361,3 +361,165 @@ def test_roles_from_lora_yaml_choose_the_other_model_families():
     installed = ["spark-x25-4b-8k:latest", role["name"], "granite4.2:8b"]
     judge, independent = pick_judge_model(installed, "spark-x25-4b-8k:latest")
     assert independent and judge != "spark-x25-4b-8k:latest"
+
+
+# ---- v5 Agentic Harness, Kokoro TTS (af_sky), Model Switching, 8-Way Verification & Artifacts -------------------------
+def test_kokoro_tts_default_voice_is_af_sky(tmp_path, monkeypatch):
+    import numpy as np
+    import types
+    from lora.voice.tts import worker as tts_worker
+
+    assert tts_worker.DEFAULT_KOKORO_VOICE == "af_sky"
+    assert tts_worker.resolve_kokoro_voice(None) == "af_sky"
+    assert tts_worker.resolve_kokoro_voice("vivian") == "af_sky"
+    assert tts_worker.resolve_kokoro_voice("bm_george") == "bm_george"
+
+    kokoro_dir = tmp_path / "kokoro"
+    kokoro_dir.mkdir()
+    (kokoro_dir / "kokoro-v1.0.onnx").write_bytes(b"fake_onnx")
+    (kokoro_dir / "voices-v1.0.bin").write_bytes(b"fake_voices")
+
+    calls = {}
+
+    class FakeKokoro:
+        def __init__(self, model_path: str, voices_path: str):
+            calls["model_path"] = model_path
+            calls["voices_path"] = voices_path
+
+        def get_voices(self):
+            return ["af_sky", "af_heart", "bm_george"]
+
+        def create(self, text: str, voice: str = "af_sky", speed: float = 1.0, lang: str = "en-us"):
+            calls["voice"] = voice
+            calls["lang"] = lang
+            return np.ones(2400, dtype=np.float32) * 0.2, 24000
+
+    monkeypatch.setattr(tts_worker, "_CACHED_KOKORO_MODEL", None)
+    monkeypatch.setattr(tts_worker, "_KOKORO_STATUS", {"state": "unloaded", "reason": "", "fix": "", "dir": ""})
+    monkeypatch.setitem(sys.modules, "kokoro_onnx", types.SimpleNamespace(Kokoro=FakeKokoro))
+
+    w = tts_worker.Qwen3TtsWorkerProcess(models_dir=str(kokoro_dir))
+    assert w.default_voice == "af_sky"
+    chunk = w.synthesize("Hello from Kokoro Sky!")
+    assert len(chunk.samples) == 2400 and chunk.sample_rate == 24000
+    assert calls["voice"] == "af_sky" and calls["lang"] == "en-us"
+    assert w.diagnosis()["ok"] is True and "af_sky" in w.diagnosis()["summary"]
+
+
+@pytest.mark.asyncio
+async def test_open_wikipedia_on_page_and_open_chatgpt_and_ask(tmp_path, monkeypatch):
+    c_wiki = parse_command("Open wikipedia on Alan Turing")
+    assert c_wiki is not None and c_wiki.kind == "site_search"
+    assert c_wiki.target == "wikipedia" and c_wiki.args["query"] == "Alan Turing"
+
+    c_wiki_rev = parse_command("Open quantum computing on wikipedia")
+    assert c_wiki_rev is not None and c_wiki_rev.kind == "site_search"
+    assert c_wiki_rev.target == "wikipedia" and c_wiki_rev.args["query"] == "quantum computing"
+
+    c_ai = parse_command("open chatgpt and ask how transformers work")
+    assert c_ai is not None and c_ai.kind == "ask_ai"
+    assert c_ai.args["service"] == "chatgpt" and "transformers" in c_ai.args["prompt"]
+
+    rt = make_rt(tmp_path, monkeypatch)
+    with patch("webbrowser.open") as wb:
+        res_wiki = await turn(rt, "Open wikipedia on Alan Turing")
+    assert res_wiki.kind == "command"
+    assert "Searching Wikipedia for “Alan Turing”" in res_wiki.text
+    assert "en.wikipedia.org/wiki/Special:Search?search=Alan+Turing" in wb.call_args.args[0]
+
+
+def test_manual_and_automatic_model_selection():
+    from lora.models.selection import candidate_names, is_complex_query, pick_escalation_model
+
+    cands_manual = candidate_names("ornith-1.5:9b", {"name": "spark-x25-4b"}, role="writer", manual_model="granite4.2:8b")
+    assert cands_manual[0] == "granite4.2:8b"
+
+    cands_complex = candidate_names(None, {}, role="complex")
+    assert cands_complex[0] == "granite4.2:8b"
+
+    cands_vision = candidate_names(None, {}, role="vision")
+    assert "gemma3:4b" in cands_vision[:2] or "llava" in cands_vision[:3]
+
+    esc = pick_escalation_model(["SparkLLM/Spark-X2.5-4B:latest", "granite4.2:8b"], "SparkLLM/Spark-X2.5-4B:latest")
+    assert esc == "granite4.2:8b"
+    assert is_complex_query("Compare the architectural trade-offs between Mamba and Transformers in depth")
+
+
+@pytest.mark.asyncio
+async def test_simple_questions_get_clean_prompts_not_bloated_rubrics():
+    from lora.dialogue import is_simple_question
+    from lora.tools.browser.prompt_agent import PromptOptimizerAgent, PromptStyle, is_simple_prompt
+
+    assert is_simple_prompt("what is 2 + 2?")
+    assert is_simple_question("what is the capital of France?")
+    assert not is_simple_prompt("Research the literature on quantum error correction architectures")
+
+    opt = PromptOptimizerAgent()
+    res_simple = await opt.optimize("what is the capital of Japan?", target_ai="chatgpt", style="auto", deep=False)
+    assert res_simple.style == PromptStyle.SIMPLE
+    assert res_simple.optimized_prompt == "what is the capital of Japan?"
+    assert "Executive Summary" not in res_simple.optimized_prompt
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_eight_way_verification_scorecard_and_iterations(tmp_path, monkeypatch):
+    from lora.agent.research import ResearchResult, Source
+
+    rt = make_rt(tmp_path, monkeypatch)
+    page_text = "Mamba is a selective state space architecture that scales linearly with sequence length. " * 4
+
+    async def _fake_res(q, st, queries=None):
+        return ResearchResult(q, [Source("S1", "Mamba Paper", "https://arxiv.org/abs/2312.00752", text=page_text)])
+
+    rt._research_fn = _fake_res
+
+    respx.get(f"{URL}/api/tags").respond(200, json={"models": [{"name": "SparkLLM/Spark-X2.5-4B:latest"}, {"name": "granite4.2:8b"}]})
+    respx.post(f"{URL}/api/chat").respond(200, content=nd("Mamba scales linearly with sequence length [S1]."))
+
+    res = await turn(rt, "research mamba state space models")
+    assert "verification_loop" in res.meta
+    vl = res.meta["verification_loop"]
+    assert len(vl["stages"]) == 8
+    assert [s["id"] for s in vl["stages"]] == ["V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8"]
+    assert len(vl["iterations"]) >= 1
+    assert vl["iterations"][0]["decision"] == "baseline"
+
+
+def test_builtin_skills_and_subagents_loaded():
+    from lora.agent.runtime import SUBAGENTS
+    from lora.skills.loader import SkillLoader
+
+    loader = SkillLoader(include_builtin=True)
+    skills = loader.load_skills()
+    expected = {"deep-research", "web-navigator", "code-architect", "artifact-studio", "visual-creator", "truth-auditor"}
+    assert expected.issubset(set(skills.keys()))
+    assert set(SUBAGENTS.keys()) == {
+        "supervisor", "system_navigator", "research", "workspace_code", "artifact_studio", "critic_verifier"
+    }
+
+
+def test_multimodal_attachments_and_artifact_generation(tmp_path):
+    import base64
+    from pathlib import Path
+    from lora.agent.notes import create_artifact, generate_visual, process_attachments
+
+    art_res = create_artifact("fibonacci", "def fib(n):\n    return n if n <= 1 else fib(n-1) + fib(n-2)\n", ext="py", folder=tmp_path)
+    assert art_res["status"] == "success"
+    assert art_res["artifact"]["ext"] == "py" and Path(art_res["path"]).is_file()
+
+    vis_res = generate_visual("Agent Pipeline", "1. Planner\n2. Specialist\n3. 8-Way Verifier", folder=tmp_path)
+    assert vis_res["status"] == "success"
+    assert vis_res["artifact"]["kind"] == "image"
+    assert vis_res["artifact"]["data_url"].startswith("data:image/svg+xml;base64,")
+
+    tiny_png = base64.b64encode(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
+        b"\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0\x00\x00\x03\x01\x01\x00\x18\xdd\x8d\xb0\x00\x00\x00\x00IEND\xaeB`\x82"
+    ).decode("ascii")
+    imgs, ctx, _ = process_attachments([
+        {"name": "paste.png", "mime": "image/png", "data_url": f"data:image/png;base64,{tiny_png}"},
+        {"name": "notes.py", "mime": "text/x-python", "text": "print('hello world')"},
+    ])
+    assert len(imgs) == 1 and imgs[0] == tiny_png
+    assert "notes.py" in ctx and "print('hello world')" in ctx

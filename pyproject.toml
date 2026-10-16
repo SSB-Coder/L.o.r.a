@@ -27,6 +27,8 @@ dependencies = [
     "beautifulsoup4>=4.15.0",
     "truststore>=0.10.0",
     "sounddevice>=0.5.6",
+    "soundfile>=0.12.1",
+    "kokoro-onnx>=0.5.0",
     "scipy>=1.17.1",
     "faster-whisper>=1.2.1",
     "onnxruntime>=1.30.0",
@@ -39,6 +41,9 @@ dependencies = [
     "pyside6>=6.8.0",
     "laya>=0.4.7",
 ]
+
+[project.scripts]
+lora = "lora.main:main"
 
 [project.optional-dependencies]
 dev = [

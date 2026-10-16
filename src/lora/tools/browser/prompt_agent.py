@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class PromptStyle(StrEnum):
     """Target stylistic and depth constraints for external prompt generation."""
 
+    SIMPLE = "simple"
     RESEARCH = "research"
     CODE = "code"
     CONCISE = "concise"
@@ -31,18 +32,31 @@ class OptimizedPrompt(BaseModel):
     redactions: list[str] = Field(default_factory=list)
 
 
+def is_simple_prompt(prompt: str) -> bool:
+    """True when the user's question is short and straightforward and should NOT be wrapped in a heavy multi-section rubric."""
+    clean = (prompt or "").strip()
+    words = clean.split()
+    if len(words) > 14 or "\n" in clean or "```" in clean:
+        return False
+    complex_markers = (
+        "research", "literature", "paper", "architecture", "mechanism", "state of the art",
+        "in depth", "in-depth", "deep", "thorough", "detailed", "comprehensive",
+        "write code", "implement", "script", "function", "class", "bug", "traceback",
+        "verify", "is it true", "fact check", "controversy", "debunk",
+        "compare", "contrast", "step by step", "step-by-step", "analyze", "analysis",
+    )
+    low = clean.lower()
+    return not any(w in low for w in complex_markers)
+
+
 class PrivacyScrubber:
     """Detects and redacts local file paths, usernames, private IPs, and API tokens."""
 
-    # Sensitive patterns
     PATH_PATTERNS = [
-        # Windows drive paths (C:\Users\..., D:/Projects/...)
         re.compile(r"\b[a-zA-Z]:[\\/](?:[a-zA-Z0-9_\-.]+[\\/])*[a-zA-Z0-9_\-.]+", re.IGNORECASE),
-        # UNC network paths (\\server\share\...)
         re.compile(r"\\\\[a-zA-Z0-9_.\-]+(?:\\[a-zA-Z0-9_.\-]+)+"),
     ]
 
-    # Private IP addresses
     PRIVATE_IP_PATTERN = re.compile(
         r"\b(?:127\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
         r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
@@ -50,7 +64,6 @@ class PrivacyScrubber:
         r"172\.(?:1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3})\b"
     )
 
-    # API keys and bearer tokens
     SECRET_PATTERNS = [
         (re.compile(r"\bsk-[a-zA-Z0-9]{20,}\b"), "[SECRET_KEY]"),
         (re.compile(r"\bghp_[a-zA-Z0-9]{20,}\b"), "[GITHUB_TOKEN]"),
@@ -66,15 +79,13 @@ class PrivacyScrubber:
         redactions: list[str] = []
         cleaned = text
 
-        # 1. Scrub secrets and tokens
         for pattern, replacement in self.SECRET_PATTERNS:
             matches = pattern.findall(cleaned)
             if matches:
-                for m in matches:
+                for _ in matches:
                     redactions.append(f"Secret: {pattern.pattern[:15]}...")
                 cleaned = pattern.sub(replacement, cleaned)
 
-        # 2. Scrub Windows and UNC paths
         for p_regex in self.PATH_PATTERNS:
             matches = p_regex.findall(cleaned)
             if matches:
@@ -82,7 +93,6 @@ class PrivacyScrubber:
                     redactions.append(f"Local Path: {match}")
                 cleaned = p_regex.sub("[LOCAL_PATH]", cleaned)
 
-        # 3. Scrub username if present in standalone context
         if self.username and len(self.username) > 2:
             user_pattern = re.compile(rf"\b{re.escape(self.username)}\b", re.IGNORECASE)
             matches = user_pattern.findall(cleaned)
@@ -90,7 +100,6 @@ class PrivacyScrubber:
                 redactions.append(f"Username: {self.username}")
                 cleaned = user_pattern.sub("[USER]", cleaned)
 
-        # 4. Scrub private IPs
         ip_matches = self.PRIVATE_IP_PATTERN.findall(cleaned)
         if ip_matches:
             for ip_m in ip_matches:
@@ -111,8 +120,8 @@ class PromptOptimizerAgent:
         self.scrubber = scrubber or PrivacyScrubber()
         self.ollama_client = ollama_client
 
-    def _detect_style(self, prompt: str) -> PromptStyle:
-        """Infer suitable prompt style if set to general."""
+    def _detect_style(self, prompt: str, allow_simple: bool = False) -> PromptStyle:
+        """Infer suitable prompt style if set to general or auto."""
         lower = prompt.lower()
         if any(w in lower for w in ["write code", "implement", "script", "function", "class", "bug", "traceback"]):
             return PromptStyle.CODE
@@ -128,6 +137,8 @@ class PromptOptimizerAgent:
             return PromptStyle.FACT_CHECK
         if any(w in lower for w in ["briefly", "short", "tl;dr", "tldr", "summarize in 3 points", "quick"]):
             return PromptStyle.CONCISE
+        if allow_simple and is_simple_prompt(prompt):
+            return PromptStyle.SIMPLE
         return PromptStyle.GENERAL
 
     def _build_deterministic_prompt(
@@ -139,7 +150,9 @@ class PromptOptimizerAgent:
         """Construct a structured, high-leverage prompt with zero conversational filler."""
         target = target_ai.strip().lower()
 
-        # Common negative constraint
+        if style == PromptStyle.SIMPLE:
+            return clean_text
+
         no_fluff = "Do not include conversational preamble, pleasantries, or polite introductions. Go directly to the answer."
 
         if style == PromptStyle.CODE:
@@ -182,7 +195,6 @@ class PromptOptimizerAgent:
                 f"Format strictly as bullet points highlighting key facts. {no_fluff}"
             )
 
-        # General style tailored by target AI strengths
         if target == "claude":
             return (
                 f"Provide an authoritative, detailed, and logically structured analysis of:\n"
@@ -222,32 +234,43 @@ class PromptOptimizerAgent:
         deep: bool = False,
     ) -> OptimizedPrompt:
         """Sanitize privacy identifiers and engineer an optimized prompt."""
-        # 1. Resolve style
+        allow_simple = isinstance(style, str) and style.lower() == "auto"
         if isinstance(style, str):
-            try:
-                style_enum = PromptStyle(style.lower())
-            except ValueError:
-                style_enum = PromptStyle.GENERAL
+            if style.lower() == "auto":
+                style_enum = self._detect_style(prompt, allow_simple=True)
+            else:
+                try:
+                    style_enum = PromptStyle(style.lower())
+                except ValueError:
+                    style_enum = PromptStyle.GENERAL
         else:
             style_enum = style
 
-        # If general was requested, infer if a more specific style applies
-        if style_enum == PromptStyle.GENERAL:
-            style_enum = self._detect_style(prompt)
+        if style_enum == PromptStyle.GENERAL and not allow_simple:
+            style_enum = self._detect_style(prompt, allow_simple=False)
 
-        # 2. Privacy Scrubbing
         scrubbed_text, redactions = self.scrubber.scrub(prompt.strip())
 
-        # 3. LLM Refinement Tier (deep prompt engineering via local LLM)
+        # Simple questions bypass heavy LLM prompt rewriting so they stay natural and fast
+        if style_enum == PromptStyle.SIMPLE and not deep:
+            return OptimizedPrompt(
+                original_prompt=prompt,
+                optimized_prompt=scrubbed_text,
+                target_ai=target_ai,
+                style=style_enum,
+                redacted_count=len(redactions),
+                redactions=redactions,
+            )
+
         if deep and self.ollama_client is not None:
             try:
                 from lora.dialogue import strip_think
 
                 meta_system = (
-                    f"You are an expert prompt engineer writing a high-leverage prompt to send to {target_ai}. "
-                    "Transform the user's request into a clear, specific, well-structured prompt that honors all of "
-                    "the user's constraints (such as depth, tone, examples, or focus areas) without adding unwanted "
-                    "formatting gimmicks. Do NOT answer the question yourself. Output ONLY the engineered prompt text."
+                    f"You are an expert prompt engineer writing a clear prompt to send to {target_ai}. "
+                    "Match the complexity of the user's question: if the question is simple, keep the prompt short and direct; "
+                    "if it is complex, structure it clearly without adding unwanted bloat. "
+                    "Do NOT answer the question yourself. Output ONLY the prompt text."
                 )
                 raw_refined = await self.ollama_client.generate(
                     prompt=f"User request to turn into a prompt ({style_enum.value} mode):\n{scrubbed_text}",
@@ -255,7 +278,7 @@ class PromptOptimizerAgent:
                     temperature=0.2,
                 )
                 refined = strip_think(str(raw_refined or "")).strip().strip('"')
-                if refined and len(refined) > 10:
+                if refined and len(refined) > 5:
                     return OptimizedPrompt(
                         original_prompt=prompt,
                         optimized_prompt=refined,
@@ -265,10 +288,8 @@ class PromptOptimizerAgent:
                         redactions=redactions,
                     )
             except Exception:
-                # Seamless fallback to deterministic tier on LLM error/timeout
                 pass
 
-        # 4. Deterministic Rule Tier (sub-millisecond fast path)
         optimized = self._build_deterministic_prompt(
             clean_text=scrubbed_text,
             target_ai=target_ai,

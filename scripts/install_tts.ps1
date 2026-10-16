@@ -1,48 +1,45 @@
-# ==============================================================================
-# L.O.R.A - natural voice setup (Qwen3-TTS on your GPU)
-#
-# Creates a SEPARATE Python environment (.venv-tts) with the GPU build of PyTorch and qwen-tts.
-# LORA finds it automatically and runs the voice there. Your main environment is not touched
-# (`uv run` would undo a GPU PyTorch installed there, which is why the voice kept using the Windows voice).
-#
-# Run once from the project folder:   powershell -ExecutionPolicy Bypass -File scripts\install_tts.ps1
-# Then restart LORA and say "run diagnostics".
-# ==============================================================================
-[CmdletBinding()]
-param (
-    [string]$Cuda = "cu128"   # cu126 or cu124 if your NVIDIA driver is older
+# Sets up Kokoro-ONNX TTS (CPU, 0 MB GPU VRAM, default voice af_sky) and downloads model files to C:\Models\kokoro.
+# Pass -LegacyQwen if you want the old .venv-tts GPU Qwen3-TTS environment instead.
+param(
+    [switch]$LegacyQwen = $false
 )
 
 $ErrorActionPreference = "Stop"
-$ProjectRoot = (Resolve-Path "$PSScriptRoot\..").Path
-$Env = Join-Path $ProjectRoot ".venv-tts"
-$Py = Join-Path $Env "Scripts\python.exe"
-$Uv = Get-Command uv -ErrorAction SilentlyContinue
+Set-Location (Split-Path -Parent $PSScriptRoot)
 
-if (-not (Test-Path $Py)) {
-    Write-Host "Creating the voice environment..." -ForegroundColor Yellow
-    if ($Uv) { & uv venv $Env --python 3.12 } else { & py -3.12 -m venv $Env }
-    if ($LASTEXITCODE -ne 0) { Write-Error "Could not create .venv-tts (Python 3.12 needed)."; exit 1 }
+if (-not $LegacyQwen) {
+    Write-Host "==> Installing kokoro-onnx + soundfile into main environment..." -ForegroundColor Cyan
+    $MainPy = Join-Path ".venv" "Scripts\python.exe"
+    uv pip install --python $MainPy -U kokoro-onnx soundfile
+
+    $KokoroDir = "C:\Models\kokoro"
+    New-Item -ItemType Directory -Force -Path $KokoroDir | Out-Null
+
+    $OnnxFile = Join-Path $KokoroDir "kokoro-v1.0.onnx"
+    $VoicesFile = Join-Path $KokoroDir "voices-v1.0.bin"
+
+    if (-not (Test-Path $OnnxFile)) {
+        Write-Host "==> Downloading kokoro-v1.0.onnx (~310 MB) to $KokoroDir..." -ForegroundColor Cyan
+        curl.exe -L "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx" -o $OnnxFile
+    }
+    if (-not (Test-Path $VoicesFile)) {
+        Write-Host "==> Downloading voices-v1.0.bin (~27 MB) to $KokoroDir..." -ForegroundColor Cyan
+        curl.exe -L "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin" -o $VoicesFile
+    }
+
+    & $MainPy -c "from kokoro_onnx import Kokoro; k = Kokoro(r'$OnnxFile', r'$VoicesFile'); s, sr = k.create('LORA voice ready with Sky.', voice='af_sky', speed=1.0, lang='en-us'); print('Kokoro TTS ready: samples=', len(s), 'sr=', sr)"
+    Write-Host "==> Done. Start LORA normally: uv run lora (default voice: af_sky)" -ForegroundColor Green
+    exit 0
 }
 
-function Install-Pkg([string[]]$PipArgs) {
-    if ($Uv) { & uv pip install --python $Py @PipArgs } else { & $Py -m pip install @PipArgs }
-    if ($LASTEXITCODE -ne 0) { Write-Error "Install failed: $PipArgs"; exit 1 }
+Write-Host "==> Creating .venv-tts (separate GPU environment for the legacy Qwen voice)..." -ForegroundColor Cyan
+if (-not (Test-Path ".venv-tts\Scripts\python.exe")) {
+    uv venv .venv-tts --python 3.11
 }
+$Py = (Resolve-Path ".venv-tts\Scripts\python.exe").Path
 
-Write-Host "Installing GPU PyTorch ($Cuda). This downloads about 2.5 GB..." -ForegroundColor Yellow
-Install-Pkg @("torch", "--index-url", "https://download.pytorch.org/whl/$Cuda")
+Write-Host "==> Installing CUDA PyTorch into .venv-tts..." -ForegroundColor Cyan
+uv pip install --python $Py --index-url https://download.pytorch.org/whl/cu124 torch torchvision torchaudio
 
-Write-Host "Installing qwen-tts and compatible transformers (4.53.x)..." -ForegroundColor Yellow
-Install-Pkg @("qwen-tts", "transformers>=4.52.0,<4.54.0", "accelerate", "numpy")
-
-Write-Host "`nChecking GPU support..." -ForegroundColor Yellow
-& $Py -c "import torch; print('torch', torch.__version__, '| CUDA available:', torch.cuda.is_available(), '|', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO GPU FOUND')"
-
-Write-Host @"
-
-Done. Put the model files in C:\Models:
-  - Qwen3-TTS-12Hz-0.6B-CustomVoice   (about 2 GB of GPU memory: recommended on a 6 GB GPU that also runs the language model)
-  - Qwen3-TTS-12Hz-1.7B-CustomVoice   (about 4.5 GB; used only if it fits)
-LORA picks the biggest one that fits. Restart LORA, then say "run diagnostics".
-"@ -ForegroundColor Green
+Write-Host "==> Installing qwen-tts with compatible transformers into .venv-tts..." -ForegroundColor Cyan
+uv pip install --python $Py "qwen-tts" "transformers>=4.52.0,<4.54.0" accelerate safetensors soundfile librosa einops

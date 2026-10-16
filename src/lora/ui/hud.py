@@ -1,16 +1,18 @@
 """L.O.R.A Desktop HUD - Clean Ethereal Water Droplet Holographic Interface."""
 
-import html
 import json
 import logging
+import os
+import subprocess
+import sys
 import threading
 import time
 import urllib.parse
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal, Slot
-from PySide6.QtWidgets import QApplication, QMainWindow, QWidget
+from PySide6.QtCore import QObject, QTimer, QUrl, Signal, Slot
+from PySide6.QtWidgets import QMainWindow, QWidget
 
 try:
     from PySide6.QtWebChannel import QWebChannel
@@ -78,17 +80,12 @@ class _DummyLabel:
 
 
 class LoraDesktopHUD(QMainWindow):
-    """Clean, Ethereal Water Droplet Holographic HUD for L.O.R.A.
-
-    Features:
-    - 3D Translucent Water Droplet visualizer with audio-reactive surface ripples
-    - Voice-first Push-to-Talk (Hold Space) and Dual Wake Word activations
-    - Chat panel, droplet, and an 'Add sources' menu
-    - Full bi-directional integration with local Ollama, Faster-Whisper, and Qwen3-TTS
-    """
+    """Clean, Ethereal Water Droplet Holographic HUD for L.O.R.A."""
 
     query_submitted = Signal(str, str)  # query, depth or voice
-    voice_changed = Signal(str)  # new voice name
+    voice_changed = Signal(str)  # new voice name (default: af_sky)
+    model_changed = Signal(str)  # "auto" or specific Ollama model tag
+    skill_changed = Signal(str)  # "auto" or specific skill name
     ptt_pressed = Signal()
     ptt_released = Signal()
     stop_audio_requested = Signal()
@@ -122,6 +119,7 @@ class LoraDesktopHUD(QMainWindow):
         self._web_loading = False
         self._pending_js: list[str] = []
         self._last_ipc_action: tuple[str, str, float] = ("", "", 0.0)
+        self.pending_attachments: list[dict[str, Any]] = []
 
         self._init_ui()
         self._init_shortcuts()
@@ -158,9 +156,6 @@ class LoraDesktopHUD(QMainWindow):
         self.setCentralWidget(placeholder)
 
     def _init_shortcuts(self) -> None:
-        # Push-to-talk on Space is handled by the page itself (droplet.html: hold to talk,
-        # ignored while typing). A Qt QShortcut here would also steal spaces typed into the
-        # input box and cut every recording to a fixed 1.5 s.
         pass
 
     def _handle_space_ptt(self) -> None:
@@ -204,26 +199,36 @@ class LoraDesktopHUD(QMainWindow):
         payload_key = json.dumps(payload, sort_keys=True) if isinstance(payload, dict) else str(payload)
         last_act, last_key, last_t = self._last_ipc_action
         if action == last_act and payload_key == last_key and (now - last_t) < 0.08:
-            return  # Deduplicate simultaneous titleChanged + iframe fallback events
+            return
         self._last_ipc_action = (action, payload_key, now)
         if action == "on_user_submit":
             text = payload.get("text", "").strip()
             depth = payload.get("depth", self._depth_mode)
-            if text:
+            atts = payload.get("attachments")
+            self.pending_attachments = list(atts) if isinstance(atts, list) else []
+            if text or self.pending_attachments:
                 self.set_voice_state("thinking")
-                self.query_submitted.emit(text, depth)
+                self.query_submitted.emit(text or "Analyze the attached file(s).", depth)
         elif action == "on_ptt_down":
             self._on_ptt_pressed()
         elif action == "on_ptt_up":
             self._on_ptt_released()
         elif action == "on_voice_changed":
-            voice = payload.get("voice", "vivian")
+            voice = payload.get("voice", "af_sky")
             self.voice_changed.emit(voice)
+        elif action == "on_model_changed":
+            model = str(payload.get("model", "auto")).strip()
+            self.model_changed.emit(model)
+        elif action == "on_skill_changed":
+            skill = str(payload.get("skill", "auto")).strip()
+            self.skill_changed.emit(skill)
         elif action == "on_sleep_toggle":
             is_sleeping = payload.get("is_sleeping", False)
             self.sleep_toggled.emit(is_sleeping)
         elif action == "on_open_url":
             self._open_external_url(str(payload.get("url", "")))
+        elif action == "on_open_path":
+            self._open_local_artifact(str(payload.get("path", "")))
         elif action == "on_voice_toggle":
             self.voice_toggled.emit(bool(payload.get("enabled", True)))
         elif action == "on_turn_off":
@@ -244,8 +249,6 @@ class LoraDesktopHUD(QMainWindow):
                 )
                 self.media_updated.emit()
         elif action == "on_browse_media":
-            # Open the chooser after this bridge call returns: a modal dialog inside the web-channel
-            # callback can deadlock the page.
             QTimer.singleShot(0, self._browse_media)
         elif action == "on_report_media":
             q = str(payload.get("query", "")).strip()
@@ -256,6 +259,23 @@ class LoraDesktopHUD(QMainWindow):
                 report=True,
             )
 
+    @staticmethod
+    def _open_local_artifact(path_str: str) -> None:
+        if not path_str:
+            return
+        p = Path(path_str)
+        if not p.exists():
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(p))  # noqa: S606
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(p)])
+            else:
+                subprocess.Popen(["xdg-open", str(p)])
+        except Exception as exc:
+            logger.warning("Could not open artifact path %s: %s", p, exc)
+
     # ------------------------------------------------------------------ media (background work)
     def _browse_media(self) -> None:
         from PySide6.QtWidgets import QFileDialog
@@ -264,7 +284,7 @@ class LoraDesktopHUD(QMainWindow):
             self,
             "Add sources",
             str(known_folder("documents")),
-            "Documents (*.pdf *.md *.txt *.docx *.csv);;All files (*)",
+            "Documents (*.pdf *.md *.txt *.docx *.csv *.png *.jpg *.jpeg);;All files (*)",
         )
         self._add_media_paths(list(chosen))
 
@@ -330,8 +350,6 @@ class LoraDesktopHUD(QMainWindow):
                     self._pending_js.append(script)
                 return
             try:
-                # Own function scope: a top-level `const x` would stay declared in the page, and the NEXT call
-                # declaring it again fails with "Identifier 'x' has already been declared".
                 self.web_view.page().runJavaScript("(function(){\n" + script + "\n})();")
             except Exception:
                 pass
@@ -339,6 +357,18 @@ class LoraDesktopHUD(QMainWindow):
     def set_sources(self, sources: list[Any]) -> None:
         """Attach clickable sources to the currently streaming answer bubble immediately."""
         self._run_js(f"window.setSources && window.setSources({json.dumps(sources or [])});")
+
+    def update_model_list(self, models: list[str], active_model: str = "auto") -> None:
+        """Populate the top-bar Model Selector dropdown with installed Ollama models."""
+        self._run_js(f"window.updateModelList && window.updateModelList({json.dumps(models or [])}, {json.dumps(active_model or 'auto')});")
+
+    def set_active_skill(self, skill_name: str = "auto") -> None:
+        """Sync the active skill selector in droplet.html."""
+        self._run_js(f"window.setActiveSkill && window.setActiveSkill({json.dumps(skill_name or 'auto')});")
+
+    def set_active_voice(self, voice_name: str = "af_sky") -> None:
+        """Sync the active Kokoro voice selector in droplet.html."""
+        self._run_js(f"window.setActiveVoice && window.setActiveVoice({json.dumps(voice_name or 'af_sky')});")
 
     def sync_media_files(self) -> None:
         """Synchronizes active indexed media files to droplet drawer."""
@@ -426,7 +456,6 @@ class LoraDesktopHUD(QMainWindow):
         """Updates droplet surface capillary ripples in real time."""
         clamped = max(0.0, min(1.0, level))
         now = time.monotonic()
-        # Throttle: unchanged / too-frequent updates only add JS-bridge churn and visible flicker.
         if clamped != 0.0 and abs(clamped - self._last_level) < 0.04 and now - self._last_level_time < 0.06:
             return
         self._last_level = clamped

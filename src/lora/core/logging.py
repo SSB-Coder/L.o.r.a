@@ -1,8 +1,10 @@
 """Structured logging and sensitive data scrubbing for LORA."""
 
+import logging
 import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 # Patterns to match sensitive tokens in strings
@@ -23,6 +25,23 @@ SENSITIVE_KEYS = {
     "auth_token",
     "bearer_token",
 }
+
+
+def setup_logging(log_dir: Path | str | None = None, level: int = logging.INFO) -> None:
+    """Configure standard console (and optional file) logging for L.O.R.A."""
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if log_dir is not None:
+        try:
+            p = Path(log_dir)
+            p.mkdir(parents=True, exist_ok=True)
+            handlers.append(logging.FileHandler(p / "lora.log", encoding="utf-8"))
+        except Exception:
+            pass
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=handlers,
+    )
 
 
 def scrub_sensitive_data(data: Any) -> Any:
@@ -46,7 +65,7 @@ def scrub_sensitive_data(data: Any) -> Any:
         return [scrub_sensitive_data(item) for item in data]
 
     if isinstance(data, tuple):
-        return tuple(scrub_sensitive_data(item) for item in data)
+        return tuple(scrub_sensitive_data(item) for item_ in data for item in (item_,))
 
     return data
 

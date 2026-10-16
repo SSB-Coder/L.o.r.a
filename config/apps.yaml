@@ -64,7 +64,7 @@ web_apps:
     name: "Wikipedia"
     url: "https://en.wikipedia.org"
     search_template: "https://en.wikipedia.org/wiki/Special:Search?search={query}"
-    aliases: ["wiki"]
+    aliases: ["wiki", "wikimedia", "wiki media", "wiki pedia"]
   arxiv:
     name: "arXiv"
     url: "https://arxiv.org"

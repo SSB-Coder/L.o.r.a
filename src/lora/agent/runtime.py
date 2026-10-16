@@ -1,9 +1,8 @@
-"""One assistant turn: command -> tool, question -> web research, or conversation.
+"""L.O.R.A Multi-Agent Runtime: coordinates Supervisor, Specialist Sub-Agents, Skills, 8-Way Verification, and Artifacts.
 
 Qt-free so it can be tested on its own. The UI and TTS hang off the callbacks:
   on_status(text)        short progress line ("Searching the web…")
   on_text(full, speak)   the visible reply so far; ``speak=False`` keeps TTS quiet for that update
-Model names never reach the UI; they are only logged.
 """
 
 from __future__ import annotations
@@ -33,6 +32,7 @@ from lora.agent.commands import (
 )
 from lora.agent.deep import (
     Opinion,
+    build_verification_dropdown_meta,
     opinion_prompt,
     parse_opinion,
     pick_judge_model,
@@ -40,6 +40,7 @@ from lora.agent.deep import (
     roundtable,
 )
 from lora.agent.fuzzy import best_key
+from lora.agent.notes import create_artifact, generate_visual, process_attachments
 from lora.agent.prompting import ResearchPlan, make_plan
 from lora.agent.research import Source
 from lora.agent.toolloop import ToolLoop, looks_agentic
@@ -69,6 +70,124 @@ class EngineUnavailable(Exception):
     """The local model could not be reached (details are logged, not shown)."""
 
 
+# ---------------------------------------------------------------------------
+# Multi-Agent Coordinator Specifications (Supervisor + 5 Specialist Sub-Agents)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class SubAgentSpec:
+    id: str
+    name: str
+    role: str
+    description: str
+    default_model_role: str = "writer"
+
+
+SUBAGENTS: dict[str, SubAgentSpec] = {
+    "supervisor": SubAgentSpec(
+        id="supervisor",
+        name="Supervisor & Planner Agent",
+        role="Orchestrator",
+        description="Decomposes user intent, selects the optimal model & skill, and coordinates specialist sub-agents.",
+        default_model_role="planner",
+    ),
+    "system_navigator": SubAgentSpec(
+        id="system_navigator",
+        name="System & Web Navigator Agent",
+        role="Control & Navigation",
+        description="Launches apps, opens site-specific topic pages (Wikipedia, YouTube, arXiv), and delegates to external AIs.",
+        default_model_role="writer",
+    ),
+    "research": SubAgentSpec(
+        id="research",
+        name="Deep Research & Retrieval Agent",
+        role="Web & Local RAG",
+        description="Plans search queries, fetches web & scholarly sources, and synthesizes cited answers with [S1] grounding.",
+        default_model_role="reader",
+    ),
+    "workspace_code": SubAgentSpec(
+        id="workspace_code",
+        name="Workspace & Code Agent",
+        role="Files, Code & ToolLoop",
+        description="Searches and reads local files, analyzes pasted attachments/images, and runs multi-step tool loops.",
+        default_model_role="complex",
+    ),
+    "artifact_studio": SubAgentSpec(
+        id="artifact_studio",
+        name="Artifact & Visual Studio Agent",
+        role="File & Image Generation",
+        description="Creates standalone code/markdown/data files and generates or edits inline SVG/PNG diagrams and images.",
+        default_model_role="complex",
+    ),
+    "critic_verifier": SubAgentSpec(
+        id="critic_verifier",
+        name="8-Way Critic & Verifier Agent",
+        role="Verification & Prompt Evolution",
+        description="Executes V1-V8 claim verification, 4-persona Round-Table critique, and iterative prompt/score refinement.",
+        default_model_role="verifier",
+    ),
+}
+
+
+@dataclass
+class AgentExecutionTrace:
+    """Tracks which specialist sub-agents and skills participated in a turn for UI visibility."""
+
+    active_skill: str | None = None
+    model_used: str = ""
+    model_mode: str = "auto"
+    escalated: bool = False
+    agents_invoked: list[dict[str, str]] = field(default_factory=list)
+
+    def record(self, agent_id: str, action: str, status: str = "completed") -> None:
+        spec = SUBAGENTS.get(agent_id)
+        name = spec.name if spec else agent_id
+        self.agents_invoked.append({
+            "id": agent_id,
+            "name": name,
+            "action": action,
+            "status": status,
+        })
+
+    def to_meta(self) -> dict[str, Any]:
+        return {
+            "active_skill": self.active_skill or "auto",
+            "model_used": self.model_used,
+            "model_mode": self.model_mode,
+            "escalated": self.escalated,
+            "agents": list(self.agents_invoked),
+        }
+
+
+_ARTIFACT_INTENT_RE = re.compile(
+    r"\b(?:create|make|generate|write|save|export|build|draw|render|plot|design)\s+"
+    r"(?:me\s+)?(?:a\s+|an\s+|the\s+|new\s+)*"
+    r"(?:python\s+script|script|code\s+file|html\s+file|csv\s+file|json\s+file|svg|diagram|chart|plot|flowchart|image|picture|illustration|visual)\b",
+    re.IGNORECASE,
+)
+
+
+def classify_agent_route(
+    query: str,
+    has_command: bool,
+    is_research_query: bool,
+    is_agentic_query: bool,
+    has_attachments: bool = False,
+    skill_agent: str = "auto",
+) -> str:
+    """Determine the primary specialist agent route when not explicitly overridden."""
+    if skill_agent and skill_agent != "auto" and skill_agent in SUBAGENTS:
+        return skill_agent
+    if has_command:
+        return "system_navigator"
+    if _ARTIFACT_INTENT_RE.search(query or ""):
+        return "artifact_studio"
+    if is_research_query:
+        return "research"
+    if is_agentic_query or has_attachments:
+        return "workspace_code"
+    return "chat"
+
+
 @dataclass
 class TurnResult:
     text: str = ""
@@ -76,7 +195,7 @@ class TurnResult:
     kind: str = "chat"
     failure: str | None = None
     spoken: str | None = None  # when set, TTS says this instead of the visible text
-    meta: dict[str, Any] = field(default_factory=dict)  # verification / second-opinion summary for the UI
+    meta: dict[str, Any] = field(default_factory=dict)  # verification / sub-agent / artifact metadata for the UI
 
 
 TextCb = Callable[[str, bool], None]
@@ -103,6 +222,8 @@ class AgentRuntime:
     ) -> None:
         self.ollama_url = ollama_url
         self.user_default_model = user_default_model
+        self.manual_model: str | None = None  # None = Auto (Smart Routing); otherwise explicit Ollama model tag
+        self.active_skill: str | None = None  # None = Auto trigger matching; otherwise explicit skill name
         self.history = history
         self._registry_factory = registry_factory
         self._registry: Any = None
@@ -116,7 +237,7 @@ class AgentRuntime:
         self.confirm: Callable[[str], Awaitable[bool]] = _deny  # user OK for sensitive actions (typing)
         self.typer: Any = None
         self.persona: str | None = None  # ~/.lora/agents/persona.md overrides the built-in personality
-        self.skills: Any = None  # ~/.lora/skills/*/skill.yaml: trigger phrase -> extra instructions / default depth
+        self.skills: Any = None  # built-in SKILL.md + ~/.lora/skills/*
         self.mcp_hub: Any = None
         self._mcp_config_path = mcp_config_path
         self._mcp_lock = __import__("threading").Lock()
@@ -125,11 +246,70 @@ class AgentRuntime:
         self.last_answer = ""
         self.last_question = ""
         self.last_sources: list[dict[str, str]] = []
+        self.last_model_used = ""
+        self.on_model_changed: Callable[[str, list[str]], None] | None = None
+        self.on_skill_changed: Callable[[str], None] | None = None
+        self.on_voice_changed_cb: Callable[[str], None] | None = None
 
     def on_sources_changed(self) -> None:
         """Clear cached conversation context when a FAISS media source is removed so deleted sources are never echoed."""
         self.history.clear()
         self.last_sources.clear()
+
+    # ------------------------------------------------------- model & skill controls
+    def set_model(self, model_name: str | None) -> str:
+        clean = (model_name or "").strip()
+        if not clean or clean.lower() in ("auto", "smart", "default"):
+            self.manual_model = None
+            return "Model routing set to **Auto (Smart Complexity Routing)**."
+        self.manual_model = clean
+        return f"Switched active model to **{clean}**."
+
+    def set_skill(self, skill_name: str | None) -> str:
+        clean = (skill_name or "").strip().lower()
+        if not clean or clean in ("auto", "none", "off"):
+            self.active_skill = None
+            return "Skill mode set to **Auto (Intent Matching)**."
+        if self.skills is not None:
+            sk = self.skills.get_skill(clean)
+            if sk is not None:
+                self.active_skill = sk.name
+                return f"Activated skill **{sk.name}** ({sk.description})."
+        self.active_skill = clean
+        return f"Activated skill **{clean}**."
+
+    def list_skills(self) -> list[dict[str, Any]]:
+        if self.skills is None:
+            return []
+        try:
+            loaded = self.skills.skills or self.skills.load_skills()
+            return [
+                {
+                    "name": s.name,
+                    "description": s.description,
+                    "agent": s.agent,
+                    "default_depth": s.default_depth,
+                    "builtin": s.builtin,
+                }
+                for s in loaded.values()
+            ]
+        except Exception:
+            return []
+
+    @staticmethod
+    def list_subagents() -> list[dict[str, str]]:
+        return [
+            {"id": a.id, "name": a.name, "role": a.role, "description": a.description}
+            for a in SUBAGENTS.values()
+        ]
+
+    async def available_models(self) -> list[str]:
+        from lora.models.ollama_client import OllamaClient
+
+        try:
+            return await OllamaClient(base_url=self.ollama_url).installed_models()
+        except Exception:
+            return []
 
     # ------------------------------------------------------- personalization & MCP
     def _load_personalization(self, skills_dir: Any, agents_dir: Any) -> None:
@@ -138,17 +318,16 @@ class AgentRuntime:
         try:
             if agents_dir and (_P(agents_dir) / "persona.md").is_file():
                 self.persona = (_P(agents_dir) / "persona.md").read_text(encoding="utf-8")[:2000].strip() or None
-            if skills_dir:
-                from lora.skills.loader import SkillLoader
+            from lora.skills.loader import SkillLoader
 
-                self.skills = SkillLoader(_P(skills_dir))
-                self.skills.load_skills()
+            self.skills = SkillLoader(_P(skills_dir) if skills_dir else None, include_builtin=True)
+            self.skills.load_skills()
         except Exception as exc:
             logger.warning("Could not load skills/persona: %s", exc)
 
     def _skill_for(self, q: str) -> Any:
         try:
-            return self.skills.match_skill(q) if self.skills is not None else None
+            return self.skills.match_skill(q, explicit_skill=self.active_skill) if self.skills is not None else None
         except Exception:
             return None
 
@@ -196,35 +375,62 @@ class AgentRuntime:
         on_text: TextCb,
         mode: str | None = None,
         should_abort: Callable[[], str | None] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> TurnResult:
         """mode: quick | standard | deep | deep_with_refinement (None: standard, deep if asked for)."""
         q = query.strip()
         self._should_abort = should_abort or (lambda: None)
         if self._registry is not None:
-            self._registry.action_gate.reset_task()  # budget + repeat-detection are per request, not per app run
-        try:
-            canned = quick_reply(q) or capability_reply(q)
-            if canned:
-                on_text(canned, True)
-                return TurnResult(text=canned, kind="smalltalk")
+            self._registry.action_gate.reset_task()
 
-            cmd = parse_command(q)
+        images_b64, attachment_context, image_paths = process_attachments(attachments)
+        skill = self._skill_for(q)
+        trace = AgentExecutionTrace(
+            active_skill=skill.name if skill else None,
+            model_mode=self.manual_model or "auto",
+        )
+        trace.record("supervisor", f"Routing intent (skill={skill.name if skill else 'auto'})")
+
+        try:
+            if not attachments:
+                canned = quick_reply(q) or capability_reply(q)
+                if canned:
+                    on_text(canned, True)
+                    return TurnResult(text=canned, kind="smalltalk")
+
+            cmd = parse_command(q) if not attachments else None
             if cmd is not None and not self.allow_actions:
                 msg = "That kind of request only works from the desktop app."
                 on_text(msg, True)
                 return TurnResult(text=msg, kind="command")
-            result = await self._run_command(cmd, q, on_status, on_text) if cmd is not None else None
+
+            result = await self._run_command(cmd, q, on_status, on_text, trace=trace) if cmd is not None else None
             if result is not None:
                 pass
-            elif is_research(q) or (is_deep(q) and len(q.split()) >= 5):
-                skill = self._skill_for(q)
+            elif is_research(q) or (is_deep(q) and len(q.split()) >= 5) or (skill and skill.agent == "research"):
+                trace.record("research", "Multi-source web & local FAISS retrieval")
                 skill_mode = skill.default_depth if skill and skill.default_depth in ("quick", "deep", "deep_with_refinement") else None
                 run_mode = mode or skill_mode or ("deep" if is_deep(q) else "standard")
-                result = await self._run_research(q, on_status, on_text, run_mode)
-            elif self.allow_actions and (looks_agentic(q) or self._mentions_mcp(q)):
-                result = await self._run_agent(q, on_status, on_text)
+                result = await self._run_research(q, on_status, on_text, run_mode, trace=trace)
+            elif self.allow_actions and (
+                looks_agentic(q)
+                or self._mentions_mcp(q)
+                or (skill and skill.agent in ("workspace_code", "artifact_studio"))
+                or (image_paths and re.search(r"\b(edit|modify|grayscale|invert|caption|annotate)\b", q, re.IGNORECASE))
+            ):
+                trace.record("workspace_code", "Multi-step ToolLoop execution")
+                result = await self._run_agent(
+                    q, on_status, on_text, extra_context=attachment_context, image_paths=image_paths, trace=trace
+                )
             else:
-                result = await self._run_chat(q, on_text)
+                route_id = classify_agent_route(
+                    q, False, False, False, has_attachments=bool(attachments), skill_agent=skill.agent if skill else "auto"
+                )
+                if route_id != "chat":
+                    trace.record(route_id, "Contextual synthesis")
+                result = await self._run_chat(
+                    q, on_text, images=images_b64, attachment_context=attachment_context, trace=trace
+                )
         except EngineUnavailable as exc:
             logger.warning("Engine unavailable: %s", exc)
             msg = NO_MODELS if "no models" in str(exc) else ENGINE_DOWN
@@ -236,9 +442,12 @@ class AgentRuntime:
             msg = "Something went wrong on my side. Try that again in a moment."
             return TurnResult(text=msg, kind="error", failure=f"{type(exc).__name__}: {exc}")
 
-        if result.kind in ("chat", "research", "agent") and result.text and not result.failure:
+        if result.kind in ("chat", "research", "agent", "note") and result.text and not result.failure:
             self.history.add(q, result.text)
             self.last_answer, self.last_question, self.last_sources = result.text, q, result.sources
+            trace.model_used = self.last_model_used
+            if result.meta:
+                result.meta.setdefault("agent_trace", trace.to_meta())
         return result
 
     async def run_job(self, text: str, run_mode: str, should_abort: Callable[[], str | None]) -> dict[str, Any]:
@@ -266,11 +475,17 @@ class AgentRuntime:
 
         client = OllamaClient(base_url=self.ollama_url)
         last_exc: Exception | None = None
-        for attempt in range(4):  # Ollama may still be starting, or busy loading the model
+        for attempt in range(4):
             try:
-                plan = await plan_chat(client, user_default=self.user_default_model, role=role)
+                plan = await plan_chat(
+                    client,
+                    user_default=self.user_default_model,
+                    role=role,
+                    manual_model=self.manual_model,
+                )
                 if plan is None:
                     raise EngineUnavailable("no models installed")
+                self.last_model_used = plan.model
                 return client, plan
             except EngineUnavailable:
                 raise
@@ -280,10 +495,18 @@ class AgentRuntime:
                 await asyncio.sleep(self.retry_delay * (attempt + 1))
         raise EngineUnavailable(str(last_exc))
 
-    async def _collect(self, messages: list[dict[str, str]], plan_pair: Any = None, model: str | None = None, keep_alive: str | None = None, role: str = "writer") -> str:
+    async def _collect(
+        self,
+        messages: list[dict[str, Any]],
+        plan_pair: Any = None,
+        model: str | None = None,
+        keep_alive: str | None = None,
+        role: str = "writer",
+    ) -> str:
         """Run the model to completion without showing the text (critic, rewrite, tool loop)."""
         client, plan = plan_pair or await self._plan(role=role)
         chosen = model or plan.model
+        self.last_model_used = chosen
         logger.info("Model (%s): %s (options=%s think=%s)", role, chosen, plan.options, plan.think)
         text = ""
         async for delta in client.stream_chat(
@@ -292,19 +515,41 @@ class AgentRuntime:
             text += delta
         return strip_think(text)
 
-    async def _stream(self, messages: list[dict[str, str]], on_text: TextCb, speak: bool = True, plan_pair: Any = None, role: str = "writer") -> str:
+    async def _stream(
+        self,
+        messages: list[dict[str, Any]],
+        on_text: TextCb,
+        speak: bool = True,
+        plan_pair: Any = None,
+        role: str = "writer",
+    ) -> str:
+        from lora.models.selection import pick_escalation_model
+
         client, plan = plan_pair or await self._plan(role=role)
-        logger.info("Model (%s): %s (options=%s think=%s)", role, plan.model, plan.options, plan.think)
+        chosen_model = plan.model
+        self.last_model_used = chosen_model
+        logger.info("Model (%s): %s (options=%s think=%s)", role, chosen_model, plan.options, plan.think)
         answer = ""
         for attempt in range(2):
             try:
                 async for delta in client.stream_chat(
-                    plan.model, messages, options=plan.options, think=plan.think, keep_alive=plan.keep_alive
+                    chosen_model, messages, options=plan.options, think=plan.think, keep_alive=plan.keep_alive
                 ):
                     answer += delta
                     shown = strip_think(answer, streaming=True)
                     if shown:
                         on_text(shown, speak)
+                if strip_think(answer):
+                    break
+                if attempt == 0 and not self.manual_model:
+                    installed = await client.installed_models()
+                    esc = pick_escalation_model(installed, chosen_model)
+                    if esc:
+                        logger.info("Auto-escalating empty reply from %s -> %s", chosen_model, esc)
+                        chosen_model = esc
+                        self.last_model_used = esc
+                        answer = ""
+                        continue
                 break
             except Exception as exc:
                 if answer or attempt == 1:
@@ -336,17 +581,47 @@ class AgentRuntime:
         return out
 
     # ------------------------------------------------------------------ chat
-    async def _run_chat(self, q: str, on_text: TextCb) -> TurnResult:
+    async def _run_chat(
+        self,
+        q: str,
+        on_text: TextCb,
+        images: list[str] | None = None,
+        attachment_context: str = "",
+        trace: AgentExecutionTrace | None = None,
+    ) -> TurnResult:
         from lora.models.selection import is_complex_query
 
-        role = "complex" if is_complex_query(q) else "writer"
+        if images:
+            role = "vision"
+        elif is_complex_query(q) or len(attachment_context) > 400:
+            role = "complex"
+        else:
+            role = "writer"
+        if trace and role in ("vision", "complex"):
+            trace.escalated = True
+
         mine = await self._user_sources(q)
         if mine:
             block = "\n\n".join(f"[{s.id}] {s.title}\n{s.text}" for s in mine)
+            if attachment_context:
+                block = f"{block}\n\nAttached Context:\n{attachment_context}"
             msgs = build_research_messages(q, block, self.history, **self._persona_kwargs(q))
+            if images:
+                msgs[-1]["images"] = images
             text = await self._stream(msgs, on_text, role=role)
-            return TurnResult(text=text, sources=[{"id": s.id, "title": s.title, "url": "", "domain": "your files"} for s in mine], kind="chat")
-        msgs = build_messages(q, self.history, self._profile_fn(), **self._persona_kwargs(q))
+            return TurnResult(
+                text=text,
+                sources=[{"id": s.id, "title": s.title, "url": "", "domain": "your files"} for s in mine],
+                kind="chat",
+            )
+        msgs = build_messages(
+            q,
+            self.history,
+            self._profile_fn(),
+            images=images,
+            attachment_context=attachment_context,
+            **self._persona_kwargs(q),
+        )
         text = await self._stream(msgs, on_text, role=role)
         return TurnResult(text=text, kind="chat")
 
@@ -370,15 +645,21 @@ class AgentRuntime:
 
         threading.Thread(target=_go, daemon=True).start()
 
-    async def _run_research(self, q: str, on_status: Callable[[str], None], on_text: TextCb, run_mode: str = "standard") -> TurnResult:
+    async def _run_research(
+        self,
+        q: str,
+        on_status: Callable[[str], None],
+        on_text: TextCb,
+        run_mode: str = "standard",
+        trace: AgentExecutionTrace | None = None,
+    ) -> TurnResult:
         if run_mode == "quick":
-            return await self._run_chat(q, on_text)
+            return await self._run_chat(q, on_text, trace=trace)
         deep = run_mode in ("deep", "deep_with_refinement")
         if self._research_fn is None:
             from lora.agent.research import research as _research
 
             self._research_fn = _research
-        # Use the writer/reader model for query planning to avoid an extra 20s VRAM swap before searching
         plan_pair = await self._plan(role="reader" if deep else "writer")
         on_status("Planning the search…")
         rplan: ResearchPlan = await make_plan(lambda msgs: self._collect(msgs, plan_pair=plan_pair, role="planner"), q, self.history.messages())
@@ -387,8 +668,11 @@ class AgentRuntime:
             takes_queries = "queries" in inspect.signature(self._research_fn).parameters
         except (TypeError, ValueError):
             takes_queries = False
-        found = await (self._research_fn(rplan.question, on_status, queries=rplan.queries) if takes_queries
-                       else self._research_fn(rplan.question, on_status))
+        found = await (
+            self._research_fn(rplan.question, on_status, queries=rplan.queries)
+            if takes_queries
+            else self._research_fn(rplan.question, on_status)
+        )
         self._check_abort()
         mine = await self._user_sources(rplan.question, start_index=len(found.sources) + 1)
         found.sources = list(found.sources) + mine
@@ -417,32 +701,36 @@ class AgentRuntime:
         draft = await self._stream(msgs, on_text, speak=not deep, plan_pair=plan_pair)
         self._check_abort()
 
+        if trace:
+            trace.record("critic_verifier", "Running 8-stage verification (V1-V8)")
         on_status("Checking the facts…")
-        # Standard mode uses the already-loaded model (with max_calls=2) so it never stalls for 2 minutes swapping VRAM;
-        # Deep mode loads the independent cross-family judge model (granite4.2:8b).
         if deep:
             installed_for_ver = await client.installed_models()
             verifier_model, _ = pick_judge_model(installed_for_ver, plan.model) if installed_for_ver else (plan.model, False)
-            ver_llm = VerifierLLM(client, verifier_model, plan.options, max_calls=6)
+            ver_llm = VerifierLLM(client, verifier_model, plan.options, max_calls=8)
         else:
             verifier_model = plan.model
-            ver_llm = VerifierLLM(client, plan.model, plan.options, max_calls=2)
+            ver_llm = VerifierLLM(client, plan.model, plan.options, max_calls=4)
         ver = await verify_answer(draft, found.sources, ver_llm)
+        baseline_score = ver.score
         meta: dict[str, Any] = {"checked": ver.for_ui()}
         text = draft
+        iterations_log: list[dict[str, Any]] | None = None
+        table: dict[str, Any] | None = None
 
         async def verify_fn(t: str):
-            return await verify_answer(t, found.sources, VerifierLLM(client, verifier_model, plan.options, max_calls=4 if deep else 2))
+            return await verify_answer(t, found.sources, VerifierLLM(client, verifier_model, plan.options, max_calls=6 if deep else 3))
 
         async def rewrite_fn(current: str, feedback: str) -> str:
             return await self._collect(build_revise_messages(rplan.question, found.prompt_block(), current, feedback), plan_pair)
 
         if not deep and ver.total and not ver.clean:
-            # Self-correct once: rewrite using the unsupported claims as feedback, re-check, keep it only if it
-            # scores higher without getting less faithful (the same loop deep mode runs for more rounds).
             on_status("Fixing what I couldn't confirm…")
-            fixed = await refine(draft, rplan.question, found.sources, verify_fn, rewrite_fn, [], status=on_status,
-                                 max_rounds=1, budget_s=60.0)
+            fixed = await refine(
+                draft, rplan.question, found.sources, verify_fn, rewrite_fn, [], status=on_status,
+                max_rounds=2, budget_s=60.0,
+            )
+            iterations_log = fixed.iterations
             if fixed.improved:
                 text, ver = fixed.text, fixed.verification
                 meta["checked"], meta["improved"], meta["rounds"] = ver.for_ui(), True, fixed.rounds
@@ -472,15 +760,24 @@ class AgentRuntime:
             if (table["decision"] != "approve" or not ver.clean) and run_mode in ("deep", "deep_with_refinement"):
                 result = await refine(
                     draft, rplan.question, found.sources, verify_fn, rewrite_fn, table["changes"], status=on_status,
-                    max_rounds=3 if run_mode == "deep_with_refinement" else 2,
+                    max_rounds=4 if run_mode == "deep_with_refinement" else 2,
                 )
                 text, ver = result.text, result.verification
+                iterations_log = result.iterations
                 meta["checked"] = ver.for_ui()
                 meta["improved"] = result.improved
                 meta["rounds"] = result.rounds
             if independent:
                 self._rewarm(client, plan)
             on_text(text, False)
+
+        meta["verification_loop"] = build_verification_dropdown_meta(
+            ver=ver,
+            baseline_score=baseline_score,
+            final_score=ver.score,
+            iterations=iterations_log,
+            roundtable_info=table,
+        )
 
         text += self._footnote(ver)
         if deep:
@@ -500,7 +797,7 @@ class AgentRuntime:
         self,
         question: str,
         sources: list[Source],
-        max_iters: int = 3,
+        max_iters: int = 5,
     ) -> dict[str, Any]:
         """Run the formal Phase 10 RSIEngine (PromptGenome evolution + rollback) over retrieved sources."""
         import tempfile
@@ -579,10 +876,8 @@ class AgentRuntime:
         reg = self._get_registry()
         return await reg.aexecute(name, dict(params), origin="desktop", provenance=prov)
 
-    # ---- tools the free-form loop can use that are not registry tools
     async def _web_search_tool(self, query: str) -> dict[str, Any]:
         import httpx
-
         from lora.agent.research import HEADERS, search_with_report
 
         async with async_client(HEADERS, httpx.Timeout(12.0, connect=6.0)) as client:
@@ -593,18 +888,45 @@ class AgentRuntime:
 
     async def _fetch_page_tool(self, url: str) -> dict[str, Any]:
         import httpx
-
         from lora.agent.research import HEADERS, fetch_text
 
         async with async_client(HEADERS, 15.0) as client:
             text = await fetch_text(url, client)
         return {"status": "success", "text": text} if text else {"status": "error", "message": "Couldn't read that page."}
 
-    async def _run_agent(self, q: str, on_status: Callable[[str], None], on_text: TextCb) -> TurnResult:
+    async def _run_agent(
+        self,
+        q: str,
+        on_status: Callable[[str], None],
+        on_text: TextCb,
+        extra_context: str = "",
+        image_paths: list[str] | None = None,
+        trace: AgentExecutionTrace | None = None,
+    ) -> TurnResult:
+        if image_paths and re.search(r"\b(edit|modify|grayscale|invert|caption|annotate)\b", q, re.IGNORECASE):
+            on_status("Editing image artifact…")
+            res = generate_visual(
+                title=note_title(q, "Edited Image"),
+                spec=q,
+                source_image_path=image_paths[0],
+                policy=self._get_registry().action_gate.policy_engine,
+            )
+            if res.get("status") == "success" and res.get("artifact"):
+                art = res["artifact"]
+                msg = f"I created the modified image **{art['name']}** (`{art['path']}`)."
+                on_text(msg, True)
+                return TurnResult(text=msg, kind="agent", meta={"artifacts": [art]})
+
         loop = ToolLoop(self)
-        final = await loop.run(q, on_status, on_text, self.history.messages())
+        final = await loop.run(q, on_status, on_text, self.history.messages(), extra_context=extra_context)
         on_text(final, True)
-        return TurnResult(text=final, kind="agent")
+        meta: dict[str, Any] = {}
+        if loop.artifacts:
+            meta["artifacts"] = loop.artifacts
+        if loop.steps_taken and trace:
+            for st in loop.steps_taken:
+                trace.record("workspace_code", f"Tool: {st['tool']} ({st['status']})")
+        return TurnResult(text=final, kind="agent", meta=meta)
 
     # -------------------------------------------------------- typing into editors
     async def _do_type(self, text: str, target: str) -> str:
@@ -651,12 +973,46 @@ class AgentRuntime:
         return f"I couldn't {what}. {detail}".strip()
 
     async def _run_command(
-        self, cmd: Command, q: str, on_status: Callable[[str], None], on_text: TextCb
+        self,
+        cmd: Command,
+        q: str,
+        on_status: Callable[[str], None],
+        on_text: TextCb,
+        trace: AgentExecutionTrace | None = None,
     ) -> TurnResult | None:
+        if trace:
+            trace.record("system_navigator", f"Command: {cmd.kind} ({cmd.target or cmd.args})")
         if cmd.kind == "open":
             text = await self._do_open(cmd.target, cmd.args.get("verb", "open"))
             if text is None:
-                return None  # "start a conversation about cats": not a launch request, let chat handle it
+                return None
+        elif cmd.kind == "switch_model":
+            text = self.set_model(cmd.target)
+            if self.on_model_changed:
+                try:
+                    models = await self.available_models()
+                    self.on_model_changed(self.manual_model or "auto", models)
+                except Exception:
+                    pass
+        elif cmd.kind == "switch_voice":
+            from lora.voice.tts.worker import resolve_kokoro_voice
+
+            resolved = resolve_kokoro_voice(cmd.target)
+            if self.on_voice_changed_cb:
+                try:
+                    self.on_voice_changed_cb(resolved)
+                except Exception:
+                    pass
+            text = f"Switched active voice to **{resolved}**."
+        elif cmd.kind == "switch_skill":
+            text = self.set_skill(cmd.target)
+            if self.on_skill_changed:
+                try:
+                    self.on_skill_changed(self.active_skill or "auto")
+                except Exception:
+                    pass
+        elif cmd.kind == "generate_image":
+            return await self._do_generate_image(cmd, q, on_status, on_text, trace=trace)
         elif cmd.kind == "google":
             res = await self._tool("open_url", {"url": f"https://www.google.com/search?q={quote_plus(cmd.target)}"})
             text = (
@@ -704,9 +1060,10 @@ class AgentRuntime:
         if folder is not None:
             res = await self._tool("open_path", {"path": str(folder)})
             return f"Opening {folder.name or t}." if res.get("status") == "success" else self._failure_text(res, f"open {t}")
+
         app = launcher.resolve_app(t)
         app_key = t
-        if not app:  # spoken names are often slightly off: "VSCORE", "crome", "note pad"
+        if not app and len(t.split()) <= 3:
             key = best_key(t, launcher.applications)
             if key:
                 app, app_key = launcher.applications[key], key
@@ -717,19 +1074,40 @@ class AgentRuntime:
                 if res.get("status") == "success"
                 else self._failure_text(res, f"open {app['name']}")
             )
+
         web = launcher.resolve_web_app(t)
-        if not web:
+        if not web and len(t.split()) <= 2:
             wkey = best_key(t, launcher.web_apps)
             web = launcher.resolve_web_app(wkey) if wkey else None
         if web:
             res = await self._tool("open_url", {"url": web["url"]})
             return f"Opening {web.get('name', t)}." if res.get("status") == "success" else self._failure_text(res, f"open {t}")
+
+        parts = t.split()
+        if len(parts) >= 2:
+            first_word = parts[0].lower()
+            matched_web = launcher.resolve_web_app(first_word)
+            if not matched_web:
+                wkey = best_key(first_word, launcher.web_apps)
+                if wkey:
+                    matched_web = launcher.resolve_web_app(wkey)
+                    first_word = wkey
+            if matched_web:
+                rest = " ".join(parts[1:]).strip()
+                rest = re.sub(r"^(?:(?:page|article|video|entry|paper|repo)\s+)?(?:on|about|for|in|of|titled|called)\s+", "", rest, flags=re.IGNORECASE).strip()
+                if rest:
+                    return await self._do_site_search(first_word, rest)
+
         if verb in ("go to", "visit", "browse", "browse to", "navigate to", "take me to") and len(t.split()) <= 3:
             res = await self._tool("open_url", {"url": f"https://www.google.com/search?q={quote_plus(t)}"})
             if res.get("status") == "success":
                 return f"I don't have a shortcut for “{t}”, so I'm searching for it."
         if verb not in ("open", "launch"):
             return None
+
+        if len(parts) >= 3 or re.search(r"\b(on|about|for|and|with|to|in|from|how|what|why|where|who)\b", t, re.IGNORECASE):
+            return None
+
         return (
             f"I don't have “{t}” on my list of apps I can open. "
             "You can add it to config/apps.yaml and I'll be able to launch it."
@@ -817,9 +1195,11 @@ class AgentRuntime:
         more = f"\n…and {len(items) - 40} more." if len(items) > 40 else ""
         return f"Here's what's in {folder.name} ({len(items)} items):\n" + "\n".join(lines) + more
 
-    # ----------------------------------------------------------------- notes
+    # ----------------------------------------------------------------- notes & artifacts
     async def _save(self, title: str, content: str, ext: str) -> dict[str, Any]:
-        return await self._tool("create_note", {"title": title, "content": content, "ext": ext})
+        if ext in ("md", "txt"):
+            return await self._tool("create_note", {"title": title, "content": content, "ext": ext})
+        return create_artifact(title, content, ext=ext, policy=self._get_registry().action_gate.policy_engine)
 
     async def _do_save_last(self, cmd: Command) -> str:
         if not self.last_answer:
@@ -838,35 +1218,97 @@ class AgentRuntime:
         on_status("Writing…")
         content = await self._stream(build_note_messages(q, ext), on_text, speak=False)
         res = await self._save(note_title(q), content, ext)
+        meta: dict[str, Any] = {}
         if res.get("status") == "success":
             text = f"{content}\n\n---\nSaved to {res['path']}"
             saved_name = re.sub(r"[^\w .()-]", "", res["path"].replace("\\", "/").split("/")[-1])
             spoken = f"Done. I saved it as {saved_name}."
+            meta["artifacts"] = [
+                res.get("artifact")
+                or {
+                    "kind": "image" if ext == "svg" else "file",
+                    "name": saved_name,
+                    "path": str(res["path"]),
+                    "ext": ext,
+                    "preview": content[:240],
+                }
+            ]
         else:
             text = f"{content}\n\n---\n{self._failure_text(res, 'save that file')}"
             spoken = "I wrote it, but I couldn't save the file."
         on_text(text, False)
         self.last_answer, self.last_question, self.last_sources = content, q, []
-        return TurnResult(text=text, kind="note", spoken=spoken)
+        return TurnResult(text=text, kind="note", spoken=spoken, meta=meta)
+
+    async def _do_generate_image(
+        self,
+        cmd: Command,
+        q: str,
+        on_status: Callable[[str], None],
+        on_text: TextCb,
+        trace: AgentExecutionTrace | None = None,
+    ) -> TurnResult:
+        if trace:
+            trace.record("artifact_studio", f"Generating visual artifact: {cmd.target[:50]}")
+        on_status("Designing visual artifact…")
+        svg_prompt = [
+            {
+                "role": "system",
+                "content": (
+                    "Generate a clean, standalone SVG diagram (<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 640 360\">...</svg>) "
+                    "for the user's request, followed by a 1-2 sentence explanation."
+                ),
+            },
+            {"role": "user", "content": q},
+        ]
+        try:
+            raw = await self._collect(svg_prompt, role="complex")
+        except Exception:
+            raw = cmd.target
+        title = note_title(q, cmd.target[:40] or "Visual Diagram")
+        res = generate_visual(
+            title=title,
+            spec=raw or cmd.target,
+            svg_code=raw,
+            policy=self._get_registry().action_gate.policy_engine,
+        )
+        if res.get("status") == "success" and res.get("artifact"):
+            art = res["artifact"]
+            explanation = re.sub(r"<svg[\s\S]*?</svg>", "", raw or "", flags=re.IGNORECASE).strip()
+            text = f"{explanation or f'Here is the visual diagram for **{title}**:'}\n\n---\nSaved to {res['path']}"
+            on_text(text, False)
+            return TurnResult(
+                text=text,
+                kind="note",
+                spoken=f"Done. I generated the visual diagram for {title}.",
+                meta={"artifacts": [art]},
+            )
+        err = self._failure_text(res, "generate that visual")
+        on_text(err, True)
+        return TurnResult(text=err, kind="command")
 
     # ---------------------------------------------------------------- ask AI
     async def _do_ask_ai(self, cmd: Command, on_status: Callable[[str], None], on_text: TextCb) -> TurnResult:
+        from lora.tools.browser.prompt_agent import is_simple_prompt
+
         service = cmd.args["service"]
         pretty = {"chatgpt": "ChatGPT", "claude": "Claude", "gemini": "Gemini", "perplexity": "Perplexity"}[service]
-        on_status(f"Engineering prompt for {pretty}…")
+        raw_prompt = cmd.args["prompt"]
+        simple = is_simple_prompt(raw_prompt)
+        on_status(f"Asking {pretty}…" if simple else f"Engineering prompt for {pretty}…")
         reg = self._get_registry()
         try:
-            reg.browser_driver.headless = False  # visible window so you can see the conversation
+            reg.browser_driver.headless = False
         except Exception:
             pass
         res = await self._tool(
             "ask_other_ai",
             {
                 "service": service,
-                "prompt": cmd.args["prompt"],
+                "prompt": raw_prompt,
                 "optimize_prompt": True,
-                "style": "general",
-                "deep_optimize": True,
+                "style": "auto",
+                "deep_optimize": not simple,
             },
         )
         if res.get("status") != "success":
@@ -877,7 +1319,7 @@ class AgentRuntime:
                 text = self._failure_text(res, f"reach {pretty}")
             on_text(text, True)
             return TurnResult(text=text, kind="command")
-        sent_prompt = str(res.get("prompt") or cmd.args["prompt"]).strip()
+        sent_prompt = str(res.get("prompt") or raw_prompt).strip()
         reply = str(res.get("response") or "").strip() or "(No reply came back.)"
         text = f"**Prompt sent to {pretty}:**\n> {sent_prompt}\n\n**{pretty} replied (unverified):**\n\n{reply}"
         on_text(text, False)

@@ -1,4 +1,4 @@
-"""Safe file reading with PyMuPDF PDF extraction for L.O.R.A."""
+"""Safe file reading with PyMuPDF (or pypdf fallback) PDF extraction for L.O.R.A."""
 
 import os
 from pathlib import Path
@@ -7,7 +7,10 @@ from typing import Any
 try:
     import pymupdf as fitz
 except ImportError:
-    import fitz
+    try:
+        import fitz
+    except ImportError:
+        fitz = None  # type: ignore
 
 from lora.safety.policy import PolicyEngine
 
@@ -36,7 +39,6 @@ def read_file(
             "content": "",
         }
 
-    # Enforce size cap
     size = target.stat().st_size
     if size > max_bytes:
         return {
@@ -47,19 +49,24 @@ def read_file(
 
     suffix = target.suffix.lower()
 
-    # 1. PDF Extraction via PyMuPDF
     if suffix == ".pdf":
         try:
             pages = []
             full_text_parts = []
-            with fitz.open(str(target)) as doc:
-                for page_num in range(len(doc)):
-                    page = doc[page_num]
-                    text = page.get_text()
-                    pages.append({
-                        "page": page_num + 1,
-                        "text": text,
-                    })
+            if fitz is not None:
+                with fitz.open(str(target)) as doc:
+                    for page_num in range(len(doc)):
+                        page = doc[page_num]
+                        text = page.get_text()
+                        pages.append({"page": page_num + 1, "text": text})
+                        full_text_parts.append(text)
+            else:
+                from pypdf import PdfReader
+
+                reader = PdfReader(str(target))
+                for page_num, page in enumerate(reader.pages):
+                    text = page.extract_text() or ""
+                    pages.append({"page": page_num + 1, "text": text})
                     full_text_parts.append(text)
 
             return {
@@ -77,7 +84,6 @@ def read_file(
                 "content": "",
             }
 
-    # 2. Plain Text / Markdown / CSV / JSON
     try:
         content = target.read_text(encoding="utf-8", errors="replace")
         return {

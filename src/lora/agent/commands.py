@@ -1,7 +1,7 @@
-"""Deterministic parser for imperative requests ("open Chrome", "create a note about ...").
+"""Deterministic parser for imperative requests ("open Chrome", "open wikipedia on ...", "open chatgpt and ask ...").
 
-A 4B model is unreliable at deciding when to call tools, and a regex is instant, so
-unambiguous commands are recognised here. Everything else falls through to research or chat.
+Handles unambiguous desktop, web-app, site-topic, external-AI, model-switch, and skill-switch intents
+while allowing compound or multi-step requests to flow into the multi-agent harness instead of dead-ending.
 """
 
 from __future__ import annotations
@@ -20,7 +20,12 @@ _OPEN = re.compile(
 )
 _NOTE = re.compile(
     _POLITE + r"(?:create|make|write|save|draft|generate|compose|put together)\s+(?:me\s+)?(?:a\s+|an\s+|the\s+|new\s+)*"
-    r"(?P<kind>markdown|md|text|txt|note|notes|file|document|doc)\b(?P<rest>.*)$",
+    r"(?P<kind>markdown|md|text|txt|note|notes|file|document|doc|python|py|script|html|csv|json|svg)\b(?P<rest>.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_IMAGE_GEN = re.compile(
+    _POLITE + r"(?:create|make|generate|draw|plot|render|design)\s+(?:me\s+)?(?:a\s+|an\s+|the\s+|new\s+)*"
+    r"(?P<kind>image|picture|diagram|chart|plot|graphic|svg|illustration|poster|visual)\s+(?:of|for|about|showing|titled|called)?\s*(?P<prompt>.+)$",
     re.IGNORECASE | re.DOTALL,
 )
 _SAVE_LAST = re.compile(
@@ -30,6 +35,11 @@ _SAVE_LAST = re.compile(
 )
 _NOTE_THAT = re.compile(
     _POLITE + r"(?:make|take|jot down)\s+(?:a\s+)?note\s+(?:of\s+)?(?:that|this|it)\b(?P<rest>.*)$", re.IGNORECASE
+)
+_OPEN_AND_ASK_AI = re.compile(
+    _POLITE + r"(?:open|launch|start|go to|visit|use)\s+(?:up\s+)?(?:the\s+)?(?P<service>chat ?gpt|claude|gemini|perplexity)\s+"
+    r"(?:and\s+)?(?:then\s+)?(?:please\s+)?(?:ask|tell|message|prompt|type|search|query)(?:\s+(?:it|them|for|about|to|that))?\s*(?:to|that|about|:|,)?\s+(?P<prompt>.+)$",
+    re.IGNORECASE | re.DOTALL,
 )
 _ASK_AI = re.compile(
     _POLITE + r"(?:ask|tell|message|prompt|type (?:this )?(?:into|in to|to))\s+(?P<service>chat ?gpt|claude|gemini|perplexity)\s*(?:to|that|about|:|,)?\s+(?P<prompt>.+)$",
@@ -43,20 +53,35 @@ _LIST = re.compile(
     _POLITE + r"(?:list|show)\s+(?:me\s+)?(?:the\s+)?(?:files|contents|what'?s)\s+(?:in|inside|of|on)\s+(?:the\s+|my\s+)?(?P<target>.+?)[\s.!?]*$",
     re.IGNORECASE,
 )
+_SITE_NAMES = r"youtube|you ?tube|amazon|wikipedia|wikimedia|wiki ?pedia|wiki|arxiv|ar ?xive|github|git ?hub|reddit|maps|google maps|stack ?overflow|flipkart|imdb|spotify|perplexity|google"
+
+# Matches: "open youtube and search for lofi beats", "open wikipedia and look up alan turing"
 _SITE_SEARCH_A = re.compile(
-    _POLITE + r"(?:open|launch|go to|visit)\s+(?:the\s+)?(?P<site>[\w .-]{2,30}?)\s+and\s+(?:then\s+)?(?:search|look)(?:\s+for)?\s+(?P<q>.+?)[\s.!?]*$",
+    _POLITE + r"(?:open|launch|go to|visit)\s+(?:the\s+)?(?P<site>[\w .-]{2,30}?)\s+and\s+(?:then\s+)?(?:search|look(?:\s+up)?|find|query)(?:\s+(?:for|about|on))?\s+(?P<q>.+?)[\s.!?]*$",
+    re.IGNORECASE,
+)
+# Matches: "open wikipedia on <page>", "open wikipedia about <topic>", "open youtube for <query>", "open arxiv on <paper>"
+_SITE_OPEN_ON = re.compile(
+    _POLITE + r"(?:open|launch|go to|visit|pull up|bring up|show me)\s+(?:up\s+)?(?:the\s+)?(?P<site>" + _SITE_NAMES + r")\s+"
+    r"(?:(?:page|article|video|entry|repo|paper|results?)\s+)?(?:on|about|for|in|regarding|titled|called)\s+(?P<q>.+?)[\s.!?]*$",
+    re.IGNORECASE,
+)
+# Matches: "open <page/topic> on wikipedia", "open <video> on youtube", "open <paper> on arxiv"
+_SITE_OPEN_REVERSE = re.compile(
+    _POLITE + r"(?:open|launch|go to|visit|pull up|bring up|show me)\s+(?:up\s+)?(?:the\s+)?(?:(?:page|article|video|entry|paper)\s+(?:on|about|for)\s+)?(?P<q>.+?)\s+"
+    r"(?:on|in)\s+(?P<site>" + _SITE_NAMES + r")(?:\s+(?:page|site|website|app))?[\s.!?]*$",
     re.IGNORECASE,
 )
 _SITE_SEARCH_B = re.compile(
-    _POLITE + r"(?:search|look up|find)\s+(?:on\s+|in\s+)?(?P<site>youtube|amazon|wikipedia|github|reddit|maps|google maps|stack ?overflow|flipkart|imdb|spotify)"
-    r"\s+(?:for\s+)?(?P<q>.+?)[\s.!?]*$",
+    _POLITE + r"(?:search|look up|find)\s+(?:on\s+|in\s+)?(?P<site>" + _SITE_NAMES + r")"
+    r"\s+(?:for\s+|about\s+|on\s+)?(?P<q>.+?)[\s.!?]*$",
     re.IGNORECASE,
 )
 _SITE_SEARCH_C = re.compile(
-    _POLITE + r"(?:search|look up|find)\s+(?P<q>.+?)\s+(?:on|in)\s+(?P<site>youtube|amazon|wikipedia|github|reddit|google maps|maps|stack ?overflow|flipkart|imdb)[\s.!?]*$",
+    _POLITE + r"(?:search|look up|find)\s+(?:for\s+)?(?P<q>.+?)\s+(?:on|in)\s+(?P<site>" + _SITE_NAMES + r")[\s.!?]*$",
     re.IGNORECASE,
 )
-_PLAY_ON = re.compile(_POLITE + r"play\s+(?P<q>.+?)\s+on\s+(?P<site>youtube)[\s.!?]*$", re.IGNORECASE)
+_PLAY_ON = re.compile(_POLITE + r"play\s+(?P<q>.+?)\s+on\s+(?P<site>youtube|spotify)[\s.!?]*$", re.IGNORECASE)
 _READ_URL = re.compile(
     _POLITE + r"(?:summari[sz]e|read|tl;?dr|explain|check out|look at)\s+(?:this\s+|the\s+)?(?:page|article|link|url|site|website)?\s*(?P<url>https?://\S+)",
     re.IGNORECASE,
@@ -64,6 +89,20 @@ _READ_URL = re.compile(
 _DIAG = re.compile(
     r"^(?:please\s+)?(?:run\s+|do\s+)?(?:a\s+|the\s+)?(?:diagnos(?:e|tics?)|self[- ]?test|self[- ]?check|health ?check|system check|check (?:my|your|the) setup|what'?s wrong(?: with you)?)[\s.!?]*$",
     re.IGNORECASE,
+)
+_SWITCH_MODEL = re.compile(
+    _POLITE + r"(?:switch|change|set|use)\s+(?:(?:the|your|my)\s+)?model\s+(?:to\s+)?(?P<model>[\w.:/-]+)[\s.!?]*$",
+    re.IGNORECASE,
+)
+_SWITCH_VOICE = re.compile(
+    _POLITE + r"(?:switch|change|set|use)\s+(?:(?:the|your|my)\s+)?voice\s+(?:to\s+)?(?P<voice>[\w_-]+)[\s.!?]*$",
+    re.IGNORECASE,
+)
+_SWITCH_SKILL = re.compile(
+    r"^(?:/skill\s+(?P<slash_skill>[\w-]+)(?:\s+(?P<slash_rest>.*))?|"
+    + _POLITE
+    + r"(?:use|activate|enable|switch to)\s+(?:the\s+)?(?P<skill>[\w-]+)\s+skill)[\s.!?]*$",
+    re.IGNORECASE | re.DOTALL,
 )
 _TYPE_INTO = re.compile(
     _POLITE + r"(?:type|write|enter|dictate|put)\s+(?P<text>[\"“'].+?[\"”']|.+?)\s+(?:into|in|on)\s+(?:the\s+|my\s+)?"
@@ -73,7 +112,7 @@ _TYPE_INTO = re.compile(
 _DEEP = re.compile(
     r"\b(deep(?:ly)?|thorough(?:ly)?|in[- ]depth|comprehensive(?:ly)?|really dig|double[- ]check|fact[- ]check|verify)\b", re.IGNORECASE
 )
-_DOC_EXT = re.compile(r"\.(?:pdf|docx?|txt|md|xlsx?|pptx?|csv|png|jpe?g|gif|zip|mp3|mp4|py|ipynb)$", re.IGNORECASE)
+_DOC_EXT = re.compile(r"\.(?:pdf|docx?|txt|md|xlsx?|pptx?|csv|png|jpe?g|gif|svg|zip|mp3|mp4|py|html|json|ipynb)$", re.IGNORECASE)
 _URL = re.compile(r"^(?:https?://)?(?:[\w-]+\.)+[a-z]{2,}(?:[/?#]\S*)?$", re.IGNORECASE)
 _PATHLIKE = re.compile(r"^(?:[a-z]:[\\/]|\\\\|~[\\/]|/)", re.IGNORECASE)
 _TRAIL_WORDS = re.compile(r"\s+(?:app|application|program|website|site|page|folder|directory|please)$", re.IGNORECASE)
@@ -84,7 +123,11 @@ FOLDER_WORDS = {
     "desktop": "desktop", "picture": "pictures", "pictures": "pictures", "photo": "pictures", "photos": "pictures",
     "music": "music", "video": "videos", "videos": "videos",
 }
-_EXT = {"markdown": "md", "md": "md", "text": "txt", "txt": "txt"}
+_EXT = {
+    "markdown": "md", "md": "md", "text": "txt", "txt": "txt",
+    "python": "py", "py": "py", "script": "py", "html": "html",
+    "csv": "csv", "json": "json", "svg": "svg",
+}
 
 _RESEARCH_STRONG = re.compile(
     r"\b(research|look\s?up|look into|search(?: the web| online| for| up)|search\b|find (?:out|information|info|sources)|"
@@ -111,7 +154,7 @@ _THANKS = re.compile(r"^(?:thanks|thank you|thx|cheers|ty|nice one|great job|awe
 
 @dataclass
 class Command:
-    kind: str  # open | list_dir | note | save_last | ask_ai | google
+    kind: str  # open | list_dir | note | save_last | ask_ai | google | site_search | switch_model | switch_voice | switch_skill | generate_image
     target: str = ""
     args: dict = field(default_factory=dict)
 
@@ -123,6 +166,19 @@ def _clean_target(raw: str) -> str:
         if new == t:
             return t
         t = new
+
+
+def _normalize_site_key(site: str) -> str:
+    s = re.sub(r"\s+", "", _clean_target(site).lower())
+    aliases = {
+        "wiki": "wikipedia",
+        "wikimedia": "wikipedia",
+        "wikipedia": "wikipedia",
+        "arxive": "arxiv",
+        "googlemaps": "maps",
+        "googlesearch": "google",
+    }
+    return aliases.get(s, _clean_target(site))
 
 
 def normalize_speech(text: str) -> str:
@@ -152,19 +208,49 @@ def _parse(text: str) -> Command | None:
     if _DIAG.match(q):
         return Command("diagnose")
 
+    m = _SWITCH_MODEL.match(q)
+    if m:
+        return Command("switch_model", target=m.group("model").strip())
+
+    m = _SWITCH_VOICE.match(q)
+    if m:
+        return Command("switch_voice", target=m.group("voice").strip().lower())
+
+    m = _SWITCH_SKILL.match(q)
+    if m:
+        sk = (m.group("slash_skill") or m.group("skill") or "").strip().lower()
+        rest = (m.group("slash_rest") or "").strip()
+        if sk and not rest:
+            return Command("switch_skill", target=sk)
+
     m = _TYPE_INTO.match(q)
     if m and not re.match(r"^(?:a|an|the)\s+(?:new\s+)?(?:note|file|document|doc|markdown)\b", m.group("text").strip(), re.IGNORECASE):
-        text = m.group("text").strip().strip("\"'“”")
-        return Command("type_into", target=re.sub(r"\s+", " ", m.group("app").lower()), args={"text": text})
+        text_val = m.group("text").strip().strip("\"'“”")
+        return Command("type_into", target=re.sub(r"\s+", " ", m.group("app").lower()), args={"text": text_val})
 
     m = _READ_URL.match(q)
     if m:
         return Command("read_url", target=m.group("url").rstrip(".,)"))
 
-    for pat in (_SITE_SEARCH_A, _SITE_SEARCH_B, _SITE_SEARCH_C, _PLAY_ON):
+    # Compound "open chatgpt and ask <query>" MUST be checked BEFORE generic _OPEN!
+    m = _OPEN_AND_ASK_AI.match(q)
+    if m:
+        service = re.sub(r"\s+", "", m.group("service").lower())
+        return Command("ask_ai", args={"service": service, "prompt": m.group("prompt").strip()})
+
+    m = _ASK_AI.match(q)
+    if m:
+        service = re.sub(r"\s+", "", m.group("service").lower())
+        return Command("ask_ai", args={"service": service, "prompt": m.group("prompt").strip()})
+
+    # Site-specific topic navigation ("open wikipedia on <page>", "open <page> on wikipedia", etc.)
+    for pat in (_SITE_SEARCH_A, _SITE_OPEN_ON, _SITE_OPEN_REVERSE, _SITE_SEARCH_B, _SITE_SEARCH_C, _PLAY_ON):
         m = pat.match(q)
         if m:
-            return Command("site_search", target=_clean_target(m.group("site")), args={"query": m.group("q").strip()})
+            site = _normalize_site_key(m.group("site"))
+            query = m.group("q").strip().strip("\"'“”")
+            if site and query:
+                return Command("site_search", target=site, args={"query": query})
 
     m = _NOTE_THAT.match(q)
     if m:
@@ -174,10 +260,9 @@ def _parse(text: str) -> Command | None:
     if m:
         return Command("save_last", args={"ext": _EXT.get((m.group("kind") or "md").lower(), "md"), "rest": (m.group("rest") or "").strip()})
 
-    m = _ASK_AI.match(q)
+    m = _IMAGE_GEN.match(q)
     if m:
-        service = re.sub(r"\s+", "", m.group("service").lower())
-        return Command("ask_ai", args={"service": service, "prompt": m.group("prompt").strip()})
+        return Command("generate_image", target=m.group("prompt").strip(), args={"kind": m.group("kind").lower()})
 
     m = _NOTE.match(q)
     if m:
@@ -195,6 +280,9 @@ def _parse(text: str) -> Command | None:
     m = _OPEN.match(q)
     if m:
         target = _clean_target(m.group("target"))
+        # Do not greedily swallow multi-clause agentic instructions as an app name
+        if re.search(r"\b(?:and\s+(?:then\s+)?(?:ask|tell|write|summarize|read|create|make|save|explain|find|check))\b", target, re.IGNORECASE):
+            return None
         if target and len(target.split()) <= 8:
             return Command("open", target=target, args={"verb": m.group("verb").lower()})
     return None
@@ -217,7 +305,6 @@ def is_research(text: str) -> bool:
         return False  # "can you browse the internet", "you can't browse": about LORA, not a request to search
     if _RESEARCH_STRONG.search(q):
         return True
-    # Time-sensitive words only count for real questions, not small talk.
     return bool(_RESEARCH_WEAK.search(q)) and len(q.split()) >= 4
 
 
@@ -297,19 +384,18 @@ _WHAT_CAN = re.compile(
 )
 CAPABILITIES = (
     "Here's what I can do:\n"
-    "- **Research:** ask me to research anything. I search the web, read the pages, check the facts and show my sources.\n"
-    "- **Open things:** apps, folders, files and websites (\"open Chrome\", \"open my Downloads folder\", \"open resume.pdf\").\n"
-    "- **Write:** create .md or .txt notes, and type into Notepad, Word or VS Code (I'll ask you first).\n"
-    "- **Your files:** use anything you add under Add sources.\n"
-    "- **Go deeper:** say \"deep research on…\" and I'll get a second opinion and improve the answer.\n"
-    "- **Talk:** hold Space, press the mic, or say \"Hey LORA\"."
+    "- **Multi-Agent Research & 8-Way Verification:** ask me to research anything. I search the web, read pages, run an 8-stage verification & self-correction loop, and show my sources and verification scorecard.\n"
+    "- **Smart Navigation & External AI:** open apps, folders, files, specific site pages (\"open Wikipedia on Alan Turing\"), or delegate to external AIs (\"open ChatGPT and ask...\").\n"
+    "- **Files & Visual Studio:** paste or attach images and files directly in chat, or ask me to generate code, notes, SVG diagrams, charts, and edited images.\n"
+    "- **Skills & Models:** switch models manually or use Auto smart routing, and activate specialized skills from the top bar.\n"
+    "- **Voice (Kokoro TTS `af_sky`):** hold Space, press the mic, or say \"Hey LORA\"."
 )
 _VERB_REPLY = {
-    "browse": "Yes. Ask me to research something and I'll search the web, read the pages, check the facts and show you my sources. I can also open a site for you, like \"open YouTube\".",
-    "search": "Yes. Say \"research\" and what you want to know, and I'll search the web and read the pages. For a quick look in your browser, say \"search YouTube for…\" or \"google…\".",
-    "open": "Yes. I can open apps, folders, files and websites. Try \"open Chrome\", \"open my Downloads folder\" or \"open resume.pdf\".",
-    "type": "Yes. I can create .md or .txt notes, and type into Notepad, Word or VS Code. I'll show you the text and ask first.",
-    "read": "Yes. I can read files in your Documents, Downloads and Desktop folders, plus anything you add under Add sources.",
+    "browse": "Yes. Ask me to research something and I'll search the web, read the pages, check the facts and show you my sources. I can also open a site or topic for you, like \"open Wikipedia on quantum computing\".",
+    "search": "Yes. Say \"research\" and what you want to know, and I'll search the web and read the pages. For a quick look in your browser, say \"open Wikipedia on…\" or \"search YouTube for…\".",
+    "open": "Yes. I can open apps, folders, files and websites. Try \"open Chrome\", \"open Wikipedia on Alan Turing\", \"open my Downloads folder\" or \"open resume.pdf\".",
+    "type": "Yes. I can create code, Markdown, text, or visual files, and type into Notepad, Word or VS Code. I'll show you the text and ask first.",
+    "read": "Yes. You can paste/attach images and files directly into the chat bar, or ask me to read files in Documents, Downloads, Desktop, or your indexed sources.",
     "hear": "Yes. Hold Space, press the mic, or say \"Hey LORA\".",
 }
 for _alias, _target in (("surf", "browse"), ("look up", "search"), ("access", "browse"), ("launch", "open"), ("write", "type"),

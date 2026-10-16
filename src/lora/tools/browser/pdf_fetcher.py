@@ -7,7 +7,11 @@ from typing import Any
 try:
     import pymupdf as fitz
 except ImportError:
-    import fitz
+    try:
+        import fitz
+    except ImportError:
+        fitz = None  # type: ignore
+
 import httpx
 
 from lora.safety.egress import EgressFilter
@@ -28,8 +32,7 @@ class PdfFetcher:
         self.spotlighter = spotlighter or Spotlighter()
 
     async def fetch_pdf(self, url: str) -> dict[str, Any]:
-        """Fetch remote PDF, parse text with PyMuPDF, and remove scratch file."""
-        # 1. Validate URL egress safety
+        """Fetch remote PDF, parse text with PyMuPDF (or pypdf fallback), and remove scratch file."""
         egress_res = self.egress_filter.check_egress(url)
         if not egress_res.allowed:
             return {
@@ -40,7 +43,6 @@ class PdfFetcher:
 
         target_url = egress_res.cleaned_url
 
-        # 2. Download into temporary quarantined file
         temp_file = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
@@ -61,18 +63,25 @@ class PdfFetcher:
                                 }
                             f.write(chunk)
 
-            # 3. Extract text using PyMuPDF
             pages = []
             full_text_parts = []
-            with fitz.open(str(temp_file)) as doc:
-                total_pages = len(doc)
-                for page_idx in range(min(total_pages, 50)):  # Read up to first 50 pages
-                    text = doc[page_idx].get_text()
-                    pages.append({
-                        "page": page_idx + 1,
-                        "text": text,
-                    })
+            if fitz is not None:
+                with fitz.open(str(temp_file)) as doc:
+                    total_pages = len(doc)
+                    for page_idx in range(min(total_pages, 50)):
+                        text = doc[page_idx].get_text()
+                        pages.append({"page": page_idx + 1, "text": text})
+                        full_text_parts.append(text)
+            else:
+                from pypdf import PdfReader
+
+                reader = PdfReader(str(temp_file))
+                total_pages = len(reader.pages)
+                for page_idx in range(min(total_pages, 50)):
+                    text = reader.pages[page_idx].extract_text() or ""
+                    pages.append({"page": page_idx + 1, "text": text})
                     full_text_parts.append(text)
+
             raw_content = "\n\n".join(full_text_parts)
             spotlight_res = self.spotlighter.frame_untrusted_data(
                 text=raw_content,
@@ -97,7 +106,6 @@ class PdfFetcher:
                 "content": "",
             }
         finally:
-            # 4. Clean up scratch file
             if temp_file and temp_file.exists():
                 try:
                     temp_file.unlink()

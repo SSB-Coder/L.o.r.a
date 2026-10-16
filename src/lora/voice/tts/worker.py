@@ -1,4 +1,4 @@
-"""Qwen3-TTS Worker Process and Audio Synthesis Backend."""
+"""Kokoro-ONNX (CPU) and Qwen3-TTS Worker Process & Audio Synthesis Backend."""
 
 import logging
 import multiprocessing as mp
@@ -12,7 +12,24 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_VOICES = [
+DEFAULT_KOKORO_VOICE = "af_sky"
+
+KOKORO_VOICES = [
+    "af_sky",
+    "af_heart",
+    "af_bella",
+    "af_nicole",
+    "af_sarah",
+    "am_adam",
+    "am_michael",
+    "bf_emma",
+    "bf_isabella",
+    "bm_george",
+    "bm_lewis",
+    "bm_daniel",
+]
+
+LEGACY_QWEN_VOICES = [
     "vivian",
     "serena",
     "aiden",
@@ -24,6 +41,32 @@ SUPPORTED_VOICES = [
     "uncle_fu",
 ]
 
+SUPPORTED_VOICES = KOKORO_VOICES + [v for v in LEGACY_QWEN_VOICES if v not in KOKORO_VOICES]
+
+KOKORO_VOICE_ALIASES: dict[str, str] = {
+    "vivian": "af_sky",
+    "sky": "af_sky",
+    "serena": "af_heart",
+    "heart": "af_heart",
+    "bella": "af_bella",
+    "nicole": "af_nicole",
+    "sarah": "af_sarah",
+    "ono_anna": "af_bella",
+    "sohee": "bf_emma",
+    "emma": "bf_emma",
+    "isabella": "bf_isabella",
+    "aiden": "am_adam",
+    "adam": "am_adam",
+    "dylan": "am_michael",
+    "michael": "am_michael",
+    "ryan": "bm_george",
+    "george": "bm_george",
+    "eric": "bm_lewis",
+    "lewis": "bm_lewis",
+    "uncle_fu": "bm_daniel",
+    "daniel": "bm_daniel",
+}
+
 
 @dataclass(frozen=True)
 class TtsJob:
@@ -31,7 +74,7 @@ class TtsJob:
 
     job_id: str
     text: str
-    voice: str = "vivian"
+    voice: str = DEFAULT_KOKORO_VOICE
 
 
 @dataclass(frozen=True)
@@ -47,31 +90,38 @@ class TtsAudioChunk:
     error: str | None = None
 
 
+def resolve_kokoro_voice(voice: str | None) -> str:
+    """Resolve a requested voice name or legacy alias to a valid Kokoro voice ID."""
+    v = (voice or DEFAULT_KOKORO_VOICE).strip().lower()
+    if v in KOKORO_VOICES:
+        return v
+    if v in KOKORO_VOICE_ALIASES:
+        return KOKORO_VOICE_ALIASES[v]
+    return DEFAULT_KOKORO_VOICE
+
+
 def _fallback_synth(text: str, sample_rate: int = 24000) -> np.ndarray:
     """Generate subtle synthetic tone audio representation for headless/test environments."""
     duration = min(3.0, max(0.5, len(text) * 0.04))
     t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False, dtype=np.float32)
-    # 440 Hz soft tone
     samples = (0.1 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
     return samples
 
 
-def _windows_speech_synth(text: str, voice: str = "vivian") -> tuple[np.ndarray, int] | None:
+def _windows_speech_synth(text: str, voice: str = DEFAULT_KOKORO_VOICE) -> tuple[np.ndarray, int] | None:
     """Ultra-fast native Windows Speech synthesis fallback generating real human spoken audio."""
+    import re as _re
     import subprocess
     import tempfile
     import wave
     from pathlib import Path
 
-    import re as _re
-
     clean = _re.sub(r'[\r\n"`\'$]+', " ", text).strip()
     if not clean:
         return None
 
-    # Map voice names to installed Windows desktop voices
     win_voice = "Microsoft Zira Desktop"
-    if voice.lower() in ("aiden", "dylan", "eric", "ryan", "uncle_fu", "david"):
+    if voice.lower() in ("aiden", "dylan", "eric", "ryan", "uncle_fu", "david", "am_adam", "am_michael", "bm_george", "bm_lewis", "bm_daniel"):
         win_voice = "Microsoft David Desktop"
 
     try:
@@ -87,7 +137,7 @@ def _windows_speech_synth(text: str, voice: str = "vivian") -> tuple[np.ndarray,
             f"try {{ $s.SelectVoice('{win_voice}') }} catch {{}}; "
             f"$s.SetOutputToWaveFile('{tmp_wav}'); "
             f"$s.Speak('{clean[:400]}'); "
-            f"$s.Dispose()"
+            f"$s.Dispose()",
         ]
         subprocess.run(cmd, capture_output=True, text=True, timeout=8.0)
         p = Path(tmp_wav)
@@ -105,11 +155,151 @@ def _windows_speech_synth(text: str, voice: str = "vivian") -> tuple[np.ndarray,
     return None
 
 
+# ---------------------------------------------------------------------------
+# Kokoro-ONNX CPU Backend (Primary TTS — 0 MB GPU VRAM)
+# ---------------------------------------------------------------------------
+_CACHED_KOKORO_MODEL: Any = None
+_KOKORO_STATUS: dict[str, str] = {"state": "unloaded", "reason": "", "fix": "", "dir": ""}
+_KOKORO_LOAD_LOCK = threading.Lock()
+FIX_KOKORO = (
+    r"run: uv pip install --python .\.venv\Scripts\python.exe -U kokoro-onnx soundfile "
+    r"and place kokoro-v1.0.onnx + voices-v1.0.bin in C:\Models\kokoro"
+)
+
+
+def candidate_kokoro_dirs(models_dir: str = r"C:\Models\kokoro") -> list[Path]:
+    """Locate directories that may contain kokoro-v1.0.onnx and voices-v1.0.bin."""
+    cands: list[Path] = []
+    for env_key in ("LORA_KOKORO_DIR", "LORA_TTS_MODEL_DIR"):
+        env_val = os.environ.get(env_key)
+        if env_val:
+            cands.append(Path(env_val))
+    base = Path(models_dir)
+    if base.is_file():
+        cands.append(base.parent)
+    else:
+        cands.append(base)
+        cands.append(base.parent / "kokoro")
+    cands.extend([
+        Path(r"C:\Models\kokoro"),
+        Path(r"C:\Models"),
+        Path("models/kokoro"),
+        Path("models/voice"),
+    ])
+    out: list[Path] = []
+    seen: set[str] = set()
+    for c in cands:
+        key = str(c).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+    return out
+
+
+def find_kokoro_files(models_dir: str = r"C:\Models\kokoro") -> tuple[Path, Path] | None:
+    """Return (onnx_model_path, voices_bin_path) if present on disk."""
+    for folder in candidate_kokoro_dirs(models_dir):
+        if not folder.is_dir():
+            continue
+        onnx_candidates = [
+            folder / "kokoro-v1.0.onnx",
+            folder / "kokoro-v1.0.int8.onnx",
+            folder / "kokoro-v0_19.onnx",
+            *sorted(folder.glob("kokoro*.onnx")),
+        ]
+        voice_candidates = [
+            folder / "voices-v1.0.bin",
+            folder / "voices.bin",
+            folder / "voices.npz",
+            *sorted(folder.glob("voices*.bin")),
+        ]
+        onnx_file = next((p for p in onnx_candidates if p.is_file()), None)
+        voice_file = next((p for p in voice_candidates if p.is_file()), None)
+        if onnx_file and voice_file:
+            return onnx_file, voice_file
+    return None
+
+
+def get_kokoro_model(models_dir: str = r"C:\Models\kokoro") -> Any:
+    """Load and cache the Kokoro-ONNX TTS model on CPU (0 MB GPU VRAM)."""
+    global _CACHED_KOKORO_MODEL
+    if _CACHED_KOKORO_MODEL is not None:
+        return _CACHED_KOKORO_MODEL
+    engine_pref = os.environ.get("LORA_TTS_ENGINE", "auto").lower()
+    if engine_pref in ("windows", "qwen", "qwen3-tts"):
+        return None
+    with _KOKORO_LOAD_LOCK:
+        if _CACHED_KOKORO_MODEL is not None:
+            return _CACHED_KOKORO_MODEL
+        if _KOKORO_STATUS["state"] == "failed":
+            return None
+        try:
+            from kokoro_onnx import Kokoro
+        except Exception as exc:
+            _KOKORO_STATUS.update({
+                "state": "failed",
+                "reason": f"kokoro-onnx is not installed ({exc})",
+                "fix": FIX_KOKORO,
+                "dir": "",
+            })
+            return None
+
+        files = find_kokoro_files(models_dir)
+        if files is None:
+            _KOKORO_STATUS.update({
+                "state": "failed",
+                "reason": f"Kokoro model files (kokoro-v1.0.onnx, voices-v1.0.bin) not found in {models_dir}",
+                "fix": FIX_KOKORO,
+                "dir": str(models_dir),
+            })
+            return None
+
+        onnx_path, voices_path = files
+        try:
+            logger.info("Loading Kokoro-ONNX TTS on CPU from %s ...", onnx_path.parent)
+            model = Kokoro(str(onnx_path), str(voices_path))
+            _CACHED_KOKORO_MODEL = model
+            _KOKORO_STATUS.update({
+                "state": "loaded",
+                "reason": "",
+                "fix": "",
+                "dir": str(onnx_path.parent),
+            })
+            logger.info("Kokoro-ONNX TTS ready (default voice: %s, 0 MB GPU VRAM).", DEFAULT_KOKORO_VOICE)
+            return model
+        except Exception as exc:
+            _KOKORO_STATUS.update({
+                "state": "failed",
+                "reason": f"Kokoro failed to load ({type(exc).__name__}: {exc})",
+                "fix": FIX_KOKORO,
+                "dir": str(onnx_path.parent),
+            })
+            logger.warning("Kokoro-ONNX load failed: %s", exc)
+            return None
+
+
+def _kokoro_generate(model: Any, text: str, voice: str = DEFAULT_KOKORO_VOICE) -> tuple[np.ndarray, int]:
+    """Synthesize speech with Kokoro-ONNX using the requested voice (defaults to af_sky)."""
+    target_voice = resolve_kokoro_voice(voice)
+    try:
+        available = list(model.get_voices()) if hasattr(model, "get_voices") else []
+        if available and target_voice not in available:
+            target_voice = DEFAULT_KOKORO_VOICE if DEFAULT_KOKORO_VOICE in available else available[0]
+    except Exception:
+        pass
+    lang = "en-gb" if target_voice.startswith("b") else "en-us"
+    samples, sr = model.create(text, voice=target_voice, speed=1.0, lang=lang)
+    return np.asarray(samples, dtype=np.float32).reshape(-1), int(sr)
+
+
+# ---------------------------------------------------------------------------
+# Legacy Qwen3-TTS Support (kept for backwards compatibility & unit tests)
+# ---------------------------------------------------------------------------
 _CACHED_QWEN_MODEL: Any = None
 _QWEN_STATUS: dict[str, str] = {"state": "unloaded", "reason": "", "fix": "", "dir": ""}
 _QWEN_LOAD_LOCK = threading.Lock()
 SMALL_MODEL_NAME = "Qwen3-TTS-12Hz-0.6B-CustomVoice"
-FIX_TORCH = r"run scripts\install_tts.ps1 (sets up a separate GPU environment just for the voice; nothing else changes)"
+FIX_TORCH = r"run scripts\install_tts.ps1 (sets up Kokoro-ONNX or the voice environment)"
 
 
 def _has_weights(p: Path) -> bool:
@@ -181,7 +371,7 @@ def get_external_server(models_dir: str) -> Any:
 def _set_status(state: str, reason: str = "", fix: str = "", dir_: str = "") -> None:
     _QWEN_STATUS.update({"state": state, "reason": reason, "fix": fix, "dir": dir_})
     if state == "failed":
-        logger.warning("Qwen3-TTS unavailable, using the Windows voice: %s. Fix: %s", reason, fix or "see docs")
+        logger.warning("Qwen3-TTS unavailable, using fallback voice: %s. Fix: %s", reason, fix or "see docs")
 
 
 def get_qwen_model(models_dir: str = r"C:\Models\Qwen3-TTS-12Hz-1.7B-CustomVoice") -> Any:
@@ -196,7 +386,7 @@ def get_qwen_model(models_dir: str = r"C:\Models\Qwen3-TTS-12Hz-1.7B-CustomVoice
         if _CACHED_QWEN_MODEL is not None:
             return _CACHED_QWEN_MODEL
         if _QWEN_STATUS["state"] == "failed":
-            return None  # do not retry (and re-log) on every sentence
+            return None
         try:
             import torch
         except Exception as exc:
@@ -240,7 +430,7 @@ def get_qwen_model(models_dir: str = r"C:\Models\Qwen3-TTS-12Hz-1.7B-CustomVoice
             logger.info("Loading Qwen3-TTS from %s (bf16, %.1f GB free VRAM)...", chosen, free_gb or -1)
             try:
                 model = Qwen3TTSModel.from_pretrained(str(chosen), device_map="cuda:0", dtype=torch.bfloat16)
-            except TypeError:  # older transformers call it torch_dtype
+            except TypeError:
                 model = Qwen3TTSModel.from_pretrained(str(chosen), device_map="cuda:0", torch_dtype=torch.bfloat16)
             _CACHED_QWEN_MODEL = model
             _set_status("loaded", dir_=str(chosen))
@@ -284,8 +474,26 @@ def _qwen_generate(model: Any, text: str, voice: str) -> tuple[np.ndarray, int]:
     return np.asarray(wav, dtype=np.float32).reshape(-1), int(sr)
 
 
-def tts_diagnosis(models_dir: str = r"C:\Models\Qwen3-TTS-12Hz-1.7B-CustomVoice") -> dict[str, Any]:
+def tts_diagnosis(models_dir: str = r"C:\Models\kokoro") -> dict[str, Any]:
     """Plain-language status of the natural voice, for 'run diagnostics' and the startup log."""
+    if _CACHED_KOKORO_MODEL is not None or _KOKORO_STATUS["state"] == "loaded":
+        return {
+            "ok": True,
+            "summary": f"Kokoro TTS ready on CPU (default voice: {DEFAULT_KOKORO_VOICE}).",
+            "detail": f"Kokoro-ONNX loaded from {_KOKORO_STATUS.get('dir') or models_dir}",
+        }
+    files = find_kokoro_files(models_dir)
+    if files is not None:
+        try:
+            import kokoro_onnx  # noqa: F401
+            return {
+                "ok": True,
+                "summary": f"Kokoro TTS ready to load on CPU (voice: {DEFAULT_KOKORO_VOICE}).",
+                "detail": str(files[0].parent),
+            }
+        except Exception:
+            pass
+
     from lora.voice.tts.external import find_tts_python
 
     if find_tts_python() is not None:
@@ -310,7 +518,6 @@ def tts_diagnosis(models_dir: str = r"C:\Models\Qwen3-TTS-12Hz-1.7B-CustomVoice"
             "fix": _QWEN_STATUS["fix"],
             "detail": _QWEN_STATUS["reason"],
         }
-    # not tried yet: report what we can see without loading anything
     try:
         import torch
     except Exception as exc:
@@ -334,17 +541,24 @@ def _run_tts_worker_loop(
     tokenizer_dir: str,
 ) -> None:
     """Main execution loop for isolated TTS worker process."""
-    qwen_model = get_qwen_model(models_dir)
+    kokoro_model = get_kokoro_model(models_dir)
+    qwen_model = None if kokoro_model is not None else get_qwen_model(models_dir)
 
     while True:
         job = input_queue.get()
-        if job is None:  # Shutdown signal
+        if job is None:
             break
 
         try:
             sample_rate = 24000
             samples = None
-            if qwen_model is not None:
+            if kokoro_model is not None:
+                try:
+                    samples, sample_rate = _kokoro_generate(kokoro_model, job.text, job.voice)
+                except Exception as ex:
+                    logger.warning("Kokoro synthesis error in loop: %s", ex)
+
+            if samples is None and qwen_model is not None:
                 try:
                     speaker = job.voice if job.voice in SUPPORTED_VOICES else "vivian"
                     samples, sample_rate = _qwen_generate(qwen_model, job.text, speaker)
@@ -379,13 +593,13 @@ def _run_tts_worker_loop(
 
 
 class Qwen3TtsWorkerProcess:
-    """Manages the lifecycle and IPC with Qwen3-TTS model."""
+    """Manages the lifecycle and synthesis for Kokoro-ONNX (primary CPU TTS) and Qwen3-TTS fallback."""
 
     def __init__(
         self,
-        models_dir: str = r"C:\Models\Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        models_dir: str = r"C:\Models\kokoro",
         tokenizer_dir: str = r"C:\Models\Qwen3-TTS-Tokenizer-12Hz",
-        default_voice: str = "vivian",
+        default_voice: str = DEFAULT_KOKORO_VOICE,
         spawn_process: bool = False,
     ) -> None:
         self.models_dir = models_dir
@@ -401,18 +615,23 @@ class Qwen3TtsWorkerProcess:
             self.start()
 
     def preload(self) -> bool:
-        """Load the natural voice now (call before the language model is loaded so both fit in VRAM)."""
+        """Load the natural voice now (Kokoro-ONNX on CPU first, then external/Qwen fallback)."""
+        if not os.environ.get("LORA_TTS_PYTHON") and not os.environ.get("LORA_TTS_FAKE"):
+            if get_kokoro_model(self.models_dir) is not None:
+                return True
         if get_external_server(self.models_dir) is not None:
             return True
         if _EXTERNAL is not None and _EXTERNAL.state == "failed":
-            return False  # the separate environment exists but could not load: do not also try in-process
+            return False
+        if get_kokoro_model(self.models_dir) is not None:
+            return True
         return get_qwen_model(self.models_dir) is not None
 
     def diagnosis(self) -> dict[str, Any]:
         return tts_diagnosis(self.models_dir)
 
     def shutdown(self) -> None:
-        """Stop the separate voice process (frees its GPU memory)."""
+        """Stop any separate voice process."""
         global _EXTERNAL
         if _EXTERNAL is not None:
             _EXTERNAL.stop()
@@ -434,8 +653,8 @@ class Qwen3TtsWorkerProcess:
         )
         self._process.start()
 
-    def synthesize(self, text: str, job_id: str = "1", voice: str = "vivian") -> TtsAudioChunk:
-        """Synthesize text into speech audio using Qwen3-TTS."""
+    def synthesize(self, text: str, job_id: str = "1", voice: str = DEFAULT_KOKORO_VOICE) -> TtsAudioChunk:
+        """Synthesize text into speech audio using Kokoro-ONNX (primary, af_sky) with graceful fallback."""
         if not text.strip():
             return TtsAudioChunk(
                 job_id=job_id,
@@ -446,7 +665,24 @@ class Qwen3TtsWorkerProcess:
 
         target_voice = voice if voice in SUPPORTED_VOICES else self.default_voice
 
-        # 0. The separate GPU voice environment (.venv-tts), if it has been set up
+        # 0. Primary CPU Engine: Kokoro-ONNX (0 MB GPU VRAM, default voice af_sky)
+        if not os.environ.get("LORA_TTS_FAKE"):
+            kokoro = get_kokoro_model(self.models_dir)
+            if kokoro is not None:
+                try:
+                    samples, sr = _kokoro_generate(kokoro, text, target_voice)
+                    return TtsAudioChunk(
+                        job_id=job_id,
+                        text=text,
+                        samples=samples,
+                        sample_rate=sr,
+                        duration=len(samples) / sr,
+                        is_last=True,
+                    )
+                except Exception as exc:
+                    logger.warning("Kokoro-ONNX generation failed, trying fallback: %s", exc)
+
+        # 1. External GPU voice environment (.venv-tts), if configured
         ext = get_external_server(self.models_dir)
         if ext is not None:
             audio = ext.synthesize(text, target_voice)
@@ -456,7 +692,7 @@ class Qwen3TtsWorkerProcess:
                     job_id=job_id, text=text, samples=samples, sample_rate=sr, duration=len(samples) / sr, is_last=True
                 )
 
-        # 1. Direct in-process execution if not running separate subprocess
+        # 2. Direct in-process execution
         if not self.spawn_process or self._process is None or not self._process.is_alive():
             model = None if (_EXTERNAL is not None and _EXTERNAL.state == "failed") else get_qwen_model(self.models_dir)
             if model is not None:
@@ -473,7 +709,6 @@ class Qwen3TtsWorkerProcess:
                 except Exception as e:
                     logger.warning("In-process Qwen3 generation failed: %s", e)
 
-            # Fast Windows speech synthesis fallback for natural vocal articulation
             win_res = _windows_speech_synth(text, voice=target_voice)
             if win_res is not None:
                 samples, sr = win_res
@@ -486,7 +721,6 @@ class Qwen3TtsWorkerProcess:
                     is_last=True,
                 )
 
-            # Fallback for tests or missing model
             samples = _fallback_synth(text)
             return TtsAudioChunk(
                 job_id=job_id,
@@ -497,7 +731,7 @@ class Qwen3TtsWorkerProcess:
                 is_last=True,
             )
 
-        # 2. Subprocess execution
+        # 3. Subprocess execution
         job = TtsJob(job_id=job_id, text=text, voice=target_voice)
         assert self._in_queue is not None
         assert self._out_queue is not None
@@ -519,3 +753,6 @@ class Qwen3TtsWorkerProcess:
             except Exception:
                 pass
             self._process = None
+
+
+KokoroTtsWorkerProcess = Qwen3TtsWorkerProcess
