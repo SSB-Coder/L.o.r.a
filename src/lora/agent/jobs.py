@@ -51,11 +51,12 @@ class JobWorker(threading.Thread):
     def _call(self, coro: Any) -> Any:
         return self._loop.run_until_complete(coro)
 
-    def _emit_ws(self, event: dict[str, Any]) -> None:
+    def _emit_ws(self, event: dict[str, Any], origin: str = "mobile") -> None:
         if self._broadcaster is None:
             return
+        payload = {"origin": origin, **event}
         try:
-            self._call(self._broadcaster(event))
+            self._call(self._broadcaster(payload))
         except Exception:
             pass
 
@@ -90,8 +91,9 @@ class JobWorker(threading.Thread):
         started = time.monotonic()
         running = dataclasses.replace(job, status=JobStatus.RUNNING)
         self.queue.set_active_job(running)
-        self._emit_ws({"type": "queue", "position": 0})
-        self._emit_ws({"type": "state", "state": "thinking"})
+        job_origin = str(job.origin.value if hasattr(job.origin, "value") else job.origin)
+        self._emit_ws({"type": "queue", "position": 0}, origin=job_origin)
+        self._emit_ws({"type": "state", "state": "thinking"}, origin=job_origin)
 
         def should_abort() -> str | None:
             cur = self._current(job)
@@ -111,6 +113,11 @@ class JobWorker(threading.Thread):
                 job_kwargs["depth"] = job.depth
             if "checkpoint" in arg_names and job.job_id in self.checkpoints:
                 job_kwargs["checkpoint"] = self.checkpoints[job.job_id]
+            if "on_delta" in arg_names:
+                job_kwargs["on_delta"] = lambda delta: self._emit_ws(
+                    {"type": "partial_text", "job_id": job.job_id, "text": delta},
+                    origin=job_origin,
+                )
             result = self._call(runtime.run_job(job.text, job.run_mode, should_abort, **job_kwargs))
             self.checkpoints.pop(job.job_id, None)
             done = dataclasses.replace(running, status=JobStatus.COMPLETED, result=result)
@@ -131,14 +138,17 @@ class JobWorker(threading.Thread):
                     for i, s in enumerate(result.get("sources") or [])
                     if isinstance(s, dict)
                 ]
-                self._emit_ws({
-                    "type": "answer",
-                    "job_id": job.job_id,
-                    "text": result.get("answer", ""),
-                    "citations": citations,
-                    "confidence": conf,
-                    "unverified": checked.get("unverified") or [],
-                })
+                self._emit_ws(
+                    {
+                        "type": "answer",
+                        "job_id": job.job_id,
+                        "text": result.get("answer", ""),
+                        "citations": citations,
+                        "confidence": conf,
+                        "unverified": checked.get("unverified") or [],
+                    },
+                    origin=job_origin,
+                )
         except JobAborted as exc:
             if exc.reason == "preempted":  # yield to the desktop and run again afterwards
                 self.checkpoints[job.job_id] = {
@@ -152,11 +162,11 @@ class JobWorker(threading.Thread):
                     logger.exception("Could not re-queue preempted job")
                 return
             done = dataclasses.replace(running, status=JobStatus.CANCELLED)
-            self._emit_ws({"type": "state", "state": "idle"})
+            self._emit_ws({"type": "state", "state": "idle"}, origin=job_origin)
         except Exception as exc:
             logger.exception("Job %s failed", job.job_id)
             done = dataclasses.replace(running, status=JobStatus.FAILED, error=f"{type(exc).__name__}: {exc}")
-            self._emit_ws({"type": "error", "job_id": job.job_id, "message": str(exc)})
+            self._emit_ws({"type": "error", "job_id": job.job_id, "message": str(exc)}, origin=job_origin)
         self.queue.set_active_job(done)  # records the final state for GET /v1/jobs/{id}
         self.queue.set_active_job(None)
         self.processed += 1

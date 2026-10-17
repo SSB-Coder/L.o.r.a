@@ -100,15 +100,20 @@ def start_gateway_thread(
     """Launches the FastAPI Gateway inside a dedicated background thread."""
     import socket
 
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        if s.connect_ex((host, port)) == 0:
+        if s.connect_ex((probe_host, port)) == 0:
             logger.info("Gateway daemon already active at http://%s:%d", host, port)
             return None
 
+    from lora.gateway.auth import HostOriginGuard
+
+    host_guard = HostOriginGuard(listener_origin=origin, mobile_ip=host, port=port)
     app = create_gateway_app(
         origin=origin,
         queue=queue,
         token_validator=token_validator,
+        host_guard=host_guard,
         media_db=media_db,
         connection_manager=connection_manager,
     )
@@ -1014,16 +1019,18 @@ def run_desktop_app(
         from lora.gateway.auth import TokenValidator
         from lora.gateway.qr import generate_pairing_qr_terminal, get_pairing_url
 
-        target = bind_str or getattr(args, "mobile_bind", None) or f"{_detect_lan_ip()}:8766"
+        lan_ip = _detect_lan_ip()
+        target = bind_str or getattr(args, "mobile_bind", None) or "0.0.0.0:8766"
         m_host, _, m_port = target.rpartition(":")
         m_port_int = int(m_port or 8766)
+        display_ip = lan_ip if m_host in ("0.0.0.0", "") else m_host
         token_file = Path(cfg_mgr.paths.user_profile_file).parent / "mobile_token.txt"
         token = os.environ.get("LORA_MOBILE_TOKEN") or (
             token_file.read_text(encoding="utf-8").strip() if token_file.exists() else _secrets.token_urlsafe(32)
         )
         token_file.write_text(token, encoding="utf-8")
         srv = start_gateway_thread(
-            m_host,
+            m_host or "0.0.0.0",
             m_port_int,
             queue=job_queue,
             origin="mobile",
@@ -1033,20 +1040,19 @@ def run_desktop_app(
         )
         if srv is not None:
             mobile_server_ref[0] = srv
-        url = get_pairing_url(m_host, m_port_int, token)
+        url = get_pairing_url(display_ip, m_port_int, token)
         mobile_url_ref[0] = url
         try:
-            qr_ascii = generate_pairing_qr_terminal(m_host, m_port_int, token)
+            qr_ascii = generate_pairing_qr_terminal(display_ip, m_port_int, token)
             logger.info("Mobile gateway on %s\n%s", url, qr_ascii)
         except Exception:
             logger.info("Mobile gateway on %s (token saved in %s)", url, token_file)
         return url
 
-    if getattr(args, "mobile_bind", None):
-        try:
-            _ensure_mobile_gateway(args.mobile_bind)
-        except Exception as exc:
-            logger.warning("Could not start the mobile gateway: %s", exc)
+    try:
+        _ensure_mobile_gateway(getattr(args, "mobile_bind", None))
+    except Exception as exc:
+        logger.warning("Could not start the mobile gateway: %s", exc)
 
     def _on_show_mobile_qr() -> None:
         try:

@@ -224,7 +224,18 @@ class ToolLoop:
                 return "Stopped multi-step execution after reaching the 3-minute unattended timeout."
             raw = await self.rt._collect(msgs, role="controller", model=escalated_model)
             action = parse_action(raw)
-            if action is None:
+            if action is None and ('"tool"' in raw or "'tool'" in raw):
+                repair_msgs = [
+                    *msgs,
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content": 'Your previous reply had invalid JSON syntax. Reply with ONLY one valid JSON object: {"tool": "...", "args": {...}} or {"final": "..."}.'},
+                ]
+                raw_retry = await self.rt._collect(repair_msgs, role="controller", model=escalated_model)
+                action = parse_action(raw_retry)
+                if action is None:
+                    return raw.strip()
+                raw = raw_retry
+            elif action is None:
                 return raw.strip()
             if "final" in action:
                 return str(action["final"]).strip()

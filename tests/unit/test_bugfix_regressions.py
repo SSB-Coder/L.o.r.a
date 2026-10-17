@@ -370,3 +370,21 @@ def test_v8_csv_formula_injection_blocked_in_open_path(tmp_path):
     res = open_path(evil_csv, policy_engine=policy)
     assert res["status"] == "error"
     assert "formula" in res["message"].lower() or "dde" in res["message"].lower()
+
+
+
+def test_v8_mobile_qr_websocket_connects_on_real_lan_ip_and_port_8766():
+    from fastapi.testclient import TestClient
+    from lora.gateway.auth import HostOriginGuard, TokenValidator
+    from lora.gateway.server import create_gateway_app
+
+    tv = TokenValidator(desktop_token="desk_tok", mobile_token="mob_tok_xyz")
+    guard = HostOriginGuard(listener_origin="mobile", mobile_ip="0.0.0.0", port=8766)
+    mob_app = create_gateway_app(origin="mobile", token_validator=tv, host_guard=guard)
+
+    # Simulate phone connecting from real Wi-Fi LAN IP (e.g. 192.168.1.42:8766)
+    client = TestClient(mob_app, base_url="http://192.168.1.42:8766")
+    with client.websocket_connect("/v1/events?token=mob_tok_xyz", headers={"Host": "192.168.1.42:8766", "Origin": "http://192.168.1.42:8766"}) as ws:
+        ws.send_json({"type": "auth", "token": "mob_tok_xyz"})
+        reply = ws.receive_json()
+        assert reply == {"type": "auth_ok", "origin": "mobile"}

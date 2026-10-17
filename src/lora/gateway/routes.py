@@ -75,14 +75,17 @@ def create_gateway_router(
                 headers={"Retry-After": str(int(remaining))},
             )
 
-        # 3. Extract and validate token (support both FastAPI Header DI and raw request.headers)
+        # 3. Extract and validate token (support FastAPI Header DI, raw request.headers, and /app pairing cookie)
         auth_val = authorization or request.headers.get("authorization")
         xlora_val = x_lora_token or request.headers.get("x-lora-token")
+        cookie_val = request.cookies.get("lora_mobile_token") if hasattr(request, "cookies") else None
         token: str | None = None
         if auth_val and auth_val.startswith("Bearer "):
             token = auth_val[7:].strip()
         elif xlora_val:
             token = xlora_val.strip()
+        elif cookie_val:
+            token = cookie_val.strip()
 
         if not token or not token_validator.validate_token(token, origin):
             ip_limiter.record_failure(client_ip)

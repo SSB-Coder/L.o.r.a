@@ -80,10 +80,21 @@ def create_gateway_app(
 
     @app.middleware("http")
     async def _reject_foreign_origins(request, call_next):
-        origin = request.headers.get("origin")
-        if origin and not re.fullmatch(LOCAL_ORIGIN_REGEX, origin):
+        req_origin = request.headers.get("origin")
+        if req_origin and req_origin.lower() != "null" and not re.fullmatch(LOCAL_ORIGIN_REGEX, req_origin):
             return JSONResponse({"detail": "Cross-site requests are not allowed."}, status_code=403)
-        return await call_next(request)
+        response = await call_next(request)
+        if request.url.path.startswith("/app"):
+            q_tok = request.query_params.get("token", "").strip()
+            if q_tok:
+                response.set_cookie(
+                    key="lora_mobile_token",
+                    value=q_tok,
+                    path="/",
+                    samesite="lax",
+                    httponly=False,
+                )
+        return response
 
     media_db = media_db or MediaVectorDB()
 

@@ -493,6 +493,7 @@ class AgentRuntime:
         notebook_id: str | None = None,
         depth: str | None = None,
         checkpoint: dict[str, Any] | None = None,
+        on_delta: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         """A phone job: same pipeline, answer returned as data for GET /v1/jobs/{id}."""
         from lora.agent.jobs import JobAborted
@@ -516,11 +517,22 @@ class AgentRuntime:
                     ]
             except Exception as exc:
                 logger.debug("Could not load notebook %s for job: %s", notebook_id, exc)
+        prev_len = [0]
+
+        def _on_job_text(full_text: str, _speak: bool = True) -> None:
+            if on_delta is not None and len(full_text) > prev_len[0]:
+                delta_chunk = full_text[prev_len[0] :]
+                prev_len[0] = len(full_text)
+                try:
+                    on_delta(delta_chunk)
+                except Exception:
+                    pass
+
         effective_mode = run_mode
         if depth and depth.lower() in ("eli5", "simple", "standard", "detailed", "expert") and self.last_raw_sources and text.lower().startswith("rewrite"):
-            res = await self._do_rewrite_depth(depth, lambda _s: None, lambda _t, _sp=True: None)
+            res = await self._do_rewrite_depth(depth, lambda _s: None, _on_job_text)
         else:
-            res = await self.run_turn(text, lambda _s: None, lambda _t, _sp=True: None, mode=effective_mode, should_abort=should_abort)
+            res = await self.run_turn(text, lambda _s: None, _on_job_text, mode=effective_mode, should_abort=should_abort)
         if res.failure and res.kind == "error":
             raise RuntimeError(res.failure)
         return {"answer": res.text, "sources": res.sources, "verification": res.meta, "kind": res.kind, "run_mode": effective_mode}

@@ -28,13 +28,19 @@
   const sheetScrim = document.getElementById('sheet-scrim');
   const closeSheetBtn = document.getElementById('close-sheet-btn');
 
-  // Token retrieval
+  // Token retrieval (URL ?token= -> pairing cookie -> localStorage)
   function getToken() {
     const urlParams = new URLSearchParams(window.location.search);
     const urlToken = urlParams.get('token');
     if (urlToken) {
       localStorage.setItem('lora_mobile_token', urlToken);
       return urlToken;
+    }
+    const cookieMatch = document.cookie.match(/(?:^|;\s*)lora_mobile_token=([^;]+)/);
+    if (cookieMatch && cookieMatch[1]) {
+      const cTok = decodeURIComponent(cookieMatch[1]);
+      localStorage.setItem('lora_mobile_token', cTok);
+      return cTok;
     }
     return localStorage.getItem('lora_mobile_token') || '';
   }
@@ -76,7 +82,7 @@
   function connectWebSocket() {
     const token = getToken();
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/v1/events`;
+    const wsUrl = `${protocol}//${window.location.host}/v1/events${token ? '?token=' + encodeURIComponent(token) : ''}`;
 
     ws = new WebSocket(wsUrl);
 
@@ -94,8 +100,19 @@
       }
     };
 
-    ws.onclose = () => {
-      updateStatus('idle', 'Disconnected');
+    ws.onclose = async () => {
+      try {
+        const r = await fetch('/v1/notebooks', { headers: { 'Authorization': `Bearer ${token}` } });
+        if (r.ok) {
+          updateStatus('idle', 'Connected');
+        } else if (r.status === 401 || r.status === 403) {
+          updateStatus('idle', 'Auth Required - Rescan QR');
+        } else {
+          updateStatus('idle', 'Disconnected');
+        }
+      } catch (_e) {
+        updateStatus('idle', 'Disconnected');
+      }
       setTimeout(connectWebSocket, 3000);
     };
 

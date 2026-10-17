@@ -81,13 +81,15 @@ async def handle_websocket_connection(
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="IP is temporarily banned")
         return
 
-    # 3-Second Authentication Handshake
+    # 3-Second Authentication Handshake (supports auth frame, ?token= query param, or pairing cookie)
+    query_token = websocket.query_params.get("token", "").strip() if hasattr(websocket, "query_params") else ""
+    cookie_token = websocket.cookies.get("lora_mobile_token", "").strip() if hasattr(websocket, "cookies") else ""
     try:
         raw_msg = await asyncio.wait_for(
             websocket.receive_text(), timeout=handshake_timeout
         )
         data = json.loads(raw_msg)
-        token = data.get("token")
+        token = (data.get("token") or query_token or cookie_token or "").strip()
         msg_type = data.get("type")
 
         if msg_type != "auth" or not token or not token_validator.validate_token(token, listener_origin):
