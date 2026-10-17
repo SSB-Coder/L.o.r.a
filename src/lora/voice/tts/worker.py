@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 
 logger = logging.getLogger(__name__)
+logging.getLogger("phonemizer").setLevel(logging.ERROR)
 
 DEFAULT_KOKORO_VOICE = "af_sky"
 

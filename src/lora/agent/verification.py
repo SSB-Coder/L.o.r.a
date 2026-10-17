@@ -18,7 +18,7 @@ from lora.agent.research import Source
 from lora.dialogue import strip_think
 from lora.grounding.cards import EvidenceCard
 from lora.grounding.copycheck import CopyChecker
-from lora.verify.claims import extract_citation_ids
+from lora.verify.claims import ClaimDecomposer, extract_citation_ids
 
 logger = logging.getLogger(__name__)
 
@@ -72,21 +72,28 @@ class VerifierLLM:
         base_opts["temperature"] = 0
         self.client, self.model, self.options = client, model, base_opts
         self.max_calls, self.calls = max_calls, 0
+        self.succeeded = 0
+        self.timed_out = 0
 
     async def generate(self, prompt: str, **_: Any) -> SimpleNamespace:
         if self.calls >= self.max_calls:
             raise RuntimeError("verifier call budget used")
         self.calls += 1
         text = ""
-        async for delta in self.client.stream_chat(
-            self.model,
-            [{"role": "user", "content": prompt}],
-            options=self.options,
-            think=False,
-            keep_alive="24h",
-        ):
-            text += delta
-        return SimpleNamespace(response=strip_think(text))
+        try:
+            async for delta in self.client.stream_chat(
+                self.model,
+                [{"role": "user", "content": prompt}],
+                options=self.options,
+                think=False,
+                keep_alive="24h",
+            ):
+                text += delta
+            self.succeeded += 1
+            return SimpleNamespace(response=strip_think(text))
+        except Exception:
+            self.timed_out += 1
+            raise
 
 
 def _build_eight_stages(
@@ -96,61 +103,92 @@ def _build_eight_stages(
     composite_score: float,
     verdict: str,
     llm_calls: int = 0,
+    llm_succeeded: int = 0,
+    llm_timed_out: int = 0,
 ) -> list[dict[str, Any]]:
     """Build the 8-stage (V1-V8) verification breakdown for the UI Verification Dropdown."""
     total_claims = len(details)
     supported_claims = sum(1 for d in details if getattr(d, "is_supported", False))
 
-    # V1: Citation Existence & Resolution
+    # V1: Citation Existence & Per-Claim Citation Coverage
     cited_ids = set(extract_citation_ids(answer or ""))
     valid_ids = {c.card_id for c in cards}
     phantom_ids = cited_ids - valid_ids
-    v1_score = 1.0 if (cited_ids and not phantom_ids) else (0.80 if not phantom_ids else 0.3)
+    decomposed = ClaimDecomposer().decompose(text=answer or "") if answer else []
+    claims_with_cites = sum(1 for c in decomposed if c.cited_sources)
+    cite_coverage = (claims_with_cites / max(1, len(decomposed))) if decomposed else (1.0 if cited_ids else 0.0)
+    if phantom_ids:
+        v1_score = max(0.20, round(0.60 * cite_coverage - 0.20 * len(phantom_ids), 2))
+    elif cited_ids:
+        v1_score = round(0.75 + 0.25 * cite_coverage, 2)
+    else:
+        v1_score = 0.50
 
-    # V2: Atomic Claim Decomposition
-    v2_score = 1.0 if total_claims > 0 else 0.0
+    # V2: Atomic Claim Decomposition & Support Ratio
+    v2_score = round(supported_claims / max(1, total_claims), 2) if total_claims > 0 else 0.0
 
-    # V3: NLI Semantic Groundedness
+    # V3: NLI Semantic Groundedness (true continuous mean NLI score — never inflated by binary support count)
     avg_nli = (
         sum(float(getattr(d, "nli_score", 0.0)) for d in details) / total_claims
         if total_claims
         else 0.0
     )
-    v3_score = round(min(1.0, max(avg_nli, supported_claims / max(1, total_claims))), 2)
+    v3_score = round(min(1.0, max(0.0, avg_nli)), 2)
 
-    # V4: LLM Entailment Escalation
-    v4_score = round(supported_claims / max(1, total_claims), 2)
+    # V4: LLM Entailment Escalation & Spot-Check Audit
+    if llm_timed_out > 0 and llm_succeeded == 0:
+        v4_score = round(min(0.65, avg_nli * 0.75), 2)
+        v4_detail = (
+            f"LLM probe timed out ({llm_timed_out}/{max(1, llm_calls)}); "
+            f"CPU NLI fallback ({supported_claims}/{total_claims} claims)"
+        )
+    elif llm_succeeded > 0:
+        support_ratio = supported_claims / max(1, total_claims)
+        v4_score = round(min(1.0, 0.65 * support_ratio + 0.35 * avg_nli), 2)
+        timeout_note = f", {llm_timed_out} timed out" if llm_timed_out > 0 else ""
+        v4_detail = f"{supported_claims}/{total_claims} claims verified ({llm_succeeded} LLM probe(s){timeout_note})"
+    else:
+        v4_score = round(min(0.88, avg_nli), 2)
+        v4_detail = f"CPU NLI only (0 LLM probes; {supported_claims}/{total_claims} claims entailed)"
 
-    # V5: Multi-Source Corroboration
-    domains = {c.source_url.split("/")[2] for c in cards if c.source_url and "/" in c.source_url and len(c.source_url.split("/")) > 2}
-    v5_score = 1.0 if len(domains) >= 2 else (0.85 if len(cards) >= 1 else 0.0)
+    # V5: Multi-Source Corroboration (measures actual cited source breadth + domain diversity)
+    domains = {
+        c.source_url.split("/")[2]
+        for c in cards
+        if c.source_url and "/" in c.source_url and len(c.source_url.split("/")) > 2
+    }
+    cited_valid_count = len(cited_ids & valid_ids)
+    cite_source_ratio = cited_valid_count / max(1, len(cards))
+    domain_ratio = min(1.0, len(domains) / max(1, min(3, len(cards)))) if cards else 0.0
+    if len(cards) == 1:
+        v5_score = round(0.85 * cite_source_ratio, 2)
+    else:
+        v5_score = round(0.55 * domain_ratio + 0.45 * cite_source_ratio, 2)
 
     # V6: Numerical & Entity Precision
     num_passed = sum(1 for d in details if getattr(d, "number_check_passed", True))
     v6_score = round(num_passed / max(1, total_claims), 2)
 
-    # V7: CopyChecker (8-gram overlap) & Originality Gate
+    # V7: CopyChecker (8-gram overlap) & Originality Gate (reports true originality %, not snapped to 100%)
     copy_res = CopyChecker(n_gram=8, max_overlap_ratio=0.35).check_overlap(
         answer or "", [c.exact_quote for c in cards]
     )
-    copy_score = 1.0 if copy_res.is_clean else max(0.0, 1.0 - copy_res.overlap_ratio)
-    v7_score = round(min(1.0, copy_score), 2)
+    orig_ratio = max(0.0, 1.0 - copy_res.overlap_ratio)
+    v7_score = round(orig_ratio if copy_res.is_clean else min(0.54, orig_ratio), 2)
 
-    # V8: Composite Faithfulness & Repair Gate
-    v8_score = round(float(composite_score), 2)
+    # V8: Composite Faithfulness & Repair Gate (continuous blend of pipeline score and V1-V7 stage scores)
+    stage_mean = (v1_score + v2_score + v3_score + v4_score + v5_score + v6_score + v7_score) / 7.0
+    v8_score = round(0.55 * float(composite_score) + 0.45 * stage_mean, 2)
+    if llm_timed_out > 0 and llm_succeeded == 0:
+        v8_score = round(min(v8_score, 0.78), 2)
 
     def _st(s: float) -> str:
         return "pass" if s >= 0.80 else ("warn" if s >= 0.55 else "fail")
 
     v3_detail = (
-        f"Mean entailment {int(v3_score * 100)}% across {total_claims} claim(s)"
+        f"Mean entailment {int(round(v3_score * 100))}% across {total_claims} claim(s)"
         if avg_nli > 0
-        else f"Lexical entailment {int(v3_score * 100)}% across {total_claims} claim(s)"
-    )
-    v4_detail = (
-        f"{supported_claims}/{total_claims} claims verified ({llm_calls} LLM probe(s))"
-        if llm_calls > 0
-        else f"{supported_claims}/{total_claims} claims verified (0 probes - entailed)"
+        else f"Lexical entailment {int(round(v3_score * 100))}% across {total_claims} claim(s)"
     )
 
     return [
@@ -159,14 +197,14 @@ def _build_eight_stages(
             "name": "Citation Integrity",
             "score": round(v1_score, 2),
             "status": _st(v1_score),
-            "detail": f"{len(cited_ids & valid_ids)} valid citation(s), {len(phantom_ids)} phantom",
+            "detail": f"{cited_valid_count} valid source(s) cited ({claims_with_cites}/{max(1, len(decomposed))} claims), {len(phantom_ids)} phantom",
         },
         {
             "id": "V2",
             "name": "Claim Decomposition",
             "score": round(v2_score, 2),
             "status": _st(v2_score),
-            "detail": f"{total_claims} atomic claim(s) extracted",
+            "detail": f"{supported_claims}/{total_claims} atomic claim(s) supported",
         },
         {
             "id": "V3",
@@ -187,7 +225,7 @@ def _build_eight_stages(
             "name": "Source Corroboration",
             "score": round(v5_score, 2),
             "status": _st(v5_score),
-            "detail": f"{len(cards)} evidence source(s) across {max(1, len(domains))} domain(s)",
+            "detail": f"{cited_valid_count}/{len(cards)} source(s) cited across {max(1, len(domains))} domain(s)",
         },
         {
             "id": "V6",
@@ -201,14 +239,14 @@ def _build_eight_stages(
             "name": "Critic & Copy Gate",
             "score": v7_score,
             "status": _st(v7_score),
-            "detail": f"Copy & Originality Gate ({int((1.0 - copy_res.overlap_ratio) * 100)}% original)",
+            "detail": f"Copy & Originality Gate ({int(round(orig_ratio * 100))}% original)",
         },
         {
             "id": "V8",
             "name": "Composite Truthfulness",
             "score": v8_score,
             "status": _st(v8_score),
-            "detail": f"Verdict: {verdict} ({int(v8_score * 100)}% composite score)",
+            "detail": f"Verdict: {verdict} ({int(round(v8_score * 100))}% composite score)",
         },
     ]
 
@@ -219,7 +257,8 @@ async def verify_answer(answer: str, sources: list[Source], llm: VerifierLLM | N
     cards = cards_from_sources(sources)
     if not cards or not answer.strip():
         return Verification("unchecked", 0.0, 0, 0)
-    report = await VerificationPipeline(ollama_client=llm).verify(answer, cards)
+    pipe = VerificationPipeline(ollama_client=llm)
+    report = await pipe.verify(answer, cards)
     details = list(report.claim_details)
     claims = [
         {
@@ -233,26 +272,33 @@ async def verify_answer(answer: str, sources: list[Source], llm: VerifierLLM | N
     ]
     verdict_str = str(report.verdict.value)
     comp_score = float(report.composite_faithfulness_score)
+    v4_stats = pipe.last_v4_stats
+    llm_calls = max(v4_stats.get("attempted", 0), getattr(llm, "calls", 0) if llm else 0)
+    llm_succeeded = v4_stats.get("succeeded", getattr(llm, "succeeded", 0) if llm else 0)
+    llm_timed_out = v4_stats.get("timed_out", getattr(llm, "timed_out", 0) if llm else 0)
     stages = _build_eight_stages(
         answer=answer,
         cards=cards,
         details=details,
         composite_score=comp_score,
         verdict=verdict_str,
-        llm_calls=getattr(llm, "calls", 0) if llm else 0,
+        llm_calls=llm_calls,
+        llm_succeeded=llm_succeeded,
+        llm_timed_out=llm_timed_out,
     )
+    v8_stage_score = float(stages[-1]["score"]) if stages else comp_score
     supported_cnt = sum(1 for d in details if d.is_supported)
     logger.info(
         "8-Way Verification: verdict=%s score=%.2f (%d/%d claims) [%s]",
         verdict_str,
-        comp_score,
+        v8_stage_score,
         supported_cnt,
         len(details),
-        ", ".join(f"{s['id']}={int(s['score']*100)}%" for s in stages),
+        ", ".join(f"{s['id']}={int(round(s['score']*100))}%" for s in stages),
     )
     return Verification(
         verdict=verdict_str,
-        score=comp_score,
+        score=v8_stage_score,
         supported=supported_cnt,
         total=len(details),
         unverified=list(report.unverified_claims),

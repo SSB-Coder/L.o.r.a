@@ -545,3 +545,31 @@ def test_foreign_websites_cannot_call_the_local_api():
         headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "POST"},
     )
     assert "access-control-allow-origin" not in {k.lower() for k in pre.headers}
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_deep_mode_second_opinion_timeout_is_reported_and_penalized(tmp_path, monkeypatch):
+    class TimeoutReviewerLLM(FakeLLM):
+        def __call__(self, request):
+            body = json.loads(request.content)
+            text = "\n".join(m["content"] for m in body["messages"])
+            if "strict reviewer" in text:
+                raise httpx.ReadTimeout("granite4.2:8b timed out")
+            return super().__call__(request)
+
+    llm = TimeoutReviewerLLM(GOOD)
+    mock_ollama(llm)
+    rt = make_runtime(tmp_path, monkeypatch)
+    res, _ = await turn(rt, "deep research on mamba models and how they compare to transformers")
+    assert res.meta["roundtable"]["timed_out"] is True
+    assert res.meta["roundtable"]["independent"] is False
+    assert res.meta["roundtable"]["opinion_verdict"] == "timeout"
+    vl = res.meta["verification_loop"]
+    assert vl["passed_checks"] < vl["total_checks"]
+    assert vl["score"] < 1.0
+    v7 = next(s for s in vl["stages"] if s["id"] == "V7")
+    assert v7["status"] == "warn"
+    assert "timed out" in v7["detail"]
+    v4 = next(s for s in vl["stages"] if s["id"] == "V4")
+    assert "1 LLM probe(s)" in v4["detail"]

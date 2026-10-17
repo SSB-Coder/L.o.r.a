@@ -594,9 +594,10 @@ class AgentRuntime:
         chosen = model or plan.model
         opts = dict(plan.options)
         if options_override:
-            # Never override num_ctx to a different value on the same model (prevents Ollama VRAM reload thrashing)
+            # Never override num_ctx to a different value on the same model (prevents Ollama VRAM reload thrashing),
+            # but allow smaller num_ctx when switching to a different judge/verifier model so 8B models fit in 6GB VRAM.
             for k, v in options_override.items():
-                if k != "num_ctx" or "num_ctx" not in opts:
+                if k != "num_ctx" or "num_ctx" not in opts or chosen != plan.model:
                     opts[k] = v
         self.last_model_used = chosen
         logger.info("Model (%s): %s (options=%s think=%s)", role, chosen, opts, plan.think)
@@ -823,13 +824,10 @@ class AgentRuntime:
         if trace:
             trace.record("critic_verifier", "Running 8-stage verification (V1-V8)")
         on_status("Checking the facts…")
-        if deep:
-            installed_for_ver = await client.installed_models()
-            verifier_model, _ = pick_judge_model(installed_for_ver, plan.model) if installed_for_ver else (plan.model, False)
-            ver_llm = VerifierLLM(client, verifier_model, plan.options, max_calls=2)
-        else:
-            verifier_model = plan.model
-            ver_llm = VerifierLLM(client, plan.model, plan.options, max_calls=2)
+        # Use the already-loaded writer model for fast inline V4 claim probes so we do not trigger
+        # an extra VRAM model swap before the Deep Mode second-opinion judge step.
+        verifier_model = plan.model
+        ver_llm = VerifierLLM(client, verifier_model, plan.options, max_calls=2)
         ver = await verify_answer(draft, found.sources, ver_llm)
         baseline_score = ver.score
         meta: dict[str, Any] = {"checked": ver.for_ui()}
@@ -875,7 +873,8 @@ class AgentRuntime:
             installed = await client.installed_models()
             judge, independent = pick_judge_model(installed, plan.model)
             on_status("Getting a second opinion…")
-            opinion = Opinion(independent=independent)
+            opinion_timeout = float(os.environ.get("LORA_OPINION_TIMEOUT", "75.0"))
+            judge_opts = {"num_ctx": 4096, "temperature": 0.2} if independent else {"temperature": 0.2}
             try:
                 raw = await asyncio.wait_for(
                     self._collect(
@@ -883,14 +882,30 @@ class AgentRuntime:
                         plan_pair,
                         model=judge,
                         keep_alive="5m",
+                        role="verifier",
+                        options_override=judge_opts,
                     ),
-                    timeout=25.0,
+                    timeout=opinion_timeout,
                 )
                 parsed = parse_opinion(raw)
-                opinion = Opinion(parsed.issues, parsed.verdict, independent)
+                opinion = Opinion(parsed.issues, parsed.verdict, independent, timed_out=False)
             except Exception as exc:
-                logger.info("Second opinion unavailable or timed out: %s", exc)
-            logger.info("Second opinion from %s (independent=%s): %s", judge, independent, opinion.issues)
+                logger.warning("Second opinion unavailable or timed out: %s", exc)
+                opinion = Opinion(
+                    issues=[f"Second-opinion model ({judge}) timed out or was unavailable."],
+                    verdict="timeout",
+                    independent=False,
+                    timed_out=True,
+                    error=str(exc) or "timeout",
+                )
+            logger.info(
+                "Second opinion from %s (independent=%s, verdict=%s, timed_out=%s): %s",
+                judge,
+                opinion.independent,
+                opinion.verdict,
+                opinion.timed_out,
+                opinion.issues,
+            )
             table = roundtable(draft, ver, found.sources, plan.model, judge, opinion)
             meta["roundtable"] = table
             self._check_abort()

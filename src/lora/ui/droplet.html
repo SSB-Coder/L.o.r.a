@@ -651,7 +651,7 @@ function renderMeta(m,meta){
  const rt=meta.roundtable;
  const ok=!(c.unverified&&c.unverified.length);
  let line=(ok?'Checked':'Partly checked')+' · '+c.supported+' of '+c.total+' claims supported';
- if(rt)line+=' · second opinion '+(rt.independent?'':'(same model) ')+(rt.decision==='approve'?'agrees':'suggested changes');
+ if(rt)line+=' · second opinion '+(rt.timed_out?'timed out':((rt.independent?'':'(same model) ')+(rt.decision==='approve'?'agrees':'suggested changes')));
  if(meta.improved)line+=' · improved';
  const items=[].concat((c.unverified||[]).map(x=>'Not confirmed: '+x),(rt&&rt.changes)||[]);
  const el=document.createElement(items.length?'details':'div');el.className='chk';
