@@ -1,4 +1,9 @@
-"""Async Playwright Browser Driver for L.O.R.A."""
+"""Async Playwright Browser Driver for L.O.R.A.
+
+v1.5 Plan §4.9: Separates ephemeral clean browser contexts (for general web reading `fetch_page`,
+with zero cookies/session state) from the persistent user profile context (`_ensure_context`, used
+exclusively for `ask_other_ai`).
+"""
 
 from pathlib import Path
 from typing import Any
@@ -10,7 +15,7 @@ from lora.tools.browser.extractor import ContentExtractor
 
 
 class PlaywrightBrowserDriver:
-    """Headless Chromium browser controller with profile isolation and egress policy."""
+    """Headless Chromium browser controller with ephemeral vs. persistent profile isolation and egress policy."""
 
     DEFAULT_USER_DATA_DIR = Path("cache/browser_profile")
 
@@ -29,17 +34,24 @@ class PlaywrightBrowserDriver:
 
         self._playwright = None
         self._context: BrowserContext | None = None
+        self._ephemeral_browser = None
         self._loop = None
 
     async def _reset_context(self) -> None:
         """Safely discard broken or closed Playwright handles."""
-        ctx, pw = self._context, self._playwright
+        ctx, br, pw = self._context, self._ephemeral_browser, self._playwright
         self._context = None
+        self._ephemeral_browser = None
         self._playwright = None
         self._loop = None
         if ctx is not None:
             try:
                 await ctx.close()
+            except Exception:
+                pass
+        if br is not None:
+            try:
+                await br.close()
             except Exception:
                 pass
         if pw is not None:
@@ -49,19 +61,17 @@ class PlaywrightBrowserDriver:
                 pass
 
     async def _ensure_context(self) -> BrowserContext:
-        """Initialize or reuse persistent browser context, recovering if loop or window closed."""
+        """Initialize or reuse persistent browser context (for `ask_other_ai`), recovering if loop or window closed."""
         import asyncio
 
         current_loop = asyncio.get_running_loop()
         if self._context is not None:
             if self._loop is not None and self._loop is not current_loop:
-                # Previous asyncio.run() loop was closed; transport pipe is dead
                 self._context = None
                 self._playwright = None
                 self._loop = None
             else:
                 try:
-                    # Probe whether the browser context / pipe is still alive
                     _ = self._context.pages
                     br = getattr(self._context, "browser", None)
                     if br is not None and hasattr(br, "is_connected") and not br.is_connected():
@@ -70,7 +80,8 @@ class PlaywrightBrowserDriver:
                     await self._reset_context()
 
         if self._context is None:
-            self._playwright = await async_playwright().start()
+            if self._playwright is None:
+                self._playwright = await async_playwright().start()
             self._context = await self._playwright.chromium.launch_persistent_context(
                 user_data_dir=str(self.user_data_dir),
                 headless=self.headless,
@@ -80,9 +91,29 @@ class PlaywrightBrowserDriver:
             self._loop = current_loop
         return self._context
 
+    async def _new_ephemeral_context(self) -> tuple[BrowserContext, bool]:
+        """Return a clean, zero-cookie ephemeral BrowserContext for general web reading (`fetch_page`)."""
+        import asyncio
+
+        current_loop = asyncio.get_running_loop()
+        if self._playwright is None or (self._loop is not None and self._loop is not current_loop):
+            await self._reset_context()
+            self._playwright = await async_playwright().start()
+            self._loop = current_loop
+        try:
+            if self._ephemeral_browser is None or not self._ephemeral_browser.is_connected():
+                self._ephemeral_browser = await self._playwright.chromium.launch(headless=True)
+            ctx = await self._ephemeral_browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            )
+            return ctx, True
+        except Exception:
+            ctx = await self._ensure_context()
+            return ctx, False
+
     async def fetch_page(self, url: str) -> dict[str, Any]:
-        """Navigate to URL, render page, and extract clean text and metadata."""
-        # 1. Egress security verification
+        """Navigate to URL in a clean ephemeral context, render page, and extract clean text and metadata."""
         egress_check = self.egress_filter.check_egress(url, require_typing_allowlist=False)
         if not egress_check.allowed:
             return {
@@ -94,10 +125,9 @@ class PlaywrightBrowserDriver:
         target_url = egress_check.cleaned_url
 
         try:
-            context = await self._ensure_context()
+            context, is_ephemeral = await self._new_ephemeral_context()
             page = await context.new_page()
 
-            # Abort media and font requests to accelerate extraction
             async def intercept_route(route):
                 if route.request.resource_type in ["image", "media", "font"]:
                     await route.abort()
@@ -107,14 +137,17 @@ class PlaywrightBrowserDriver:
             await page.route("**/*", intercept_route)
 
             try:
-                # Wait for domcontentloaded (timeout 15 seconds)
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
                 html = await page.content()
                 page_title = await page.title()
             finally:
                 await page.close()
+                if is_ephemeral:
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
 
-            # 2. Extract clean content
             extracted = self.extractor.extract_from_html(html, source_url=target_url)
 
             return {

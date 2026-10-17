@@ -1,16 +1,20 @@
 """Action Gate & Provenance Tracker for L.O.R.A.
 
 Enforces execution budgets, repetitive loop detection, taint tracking,
-and dry-run modes before tool calls reach the operating system.
+audit logging, and dry-run modes before tool calls reach the operating system.
 """
 
+import logging
 import threading
 from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any
 
+from lora.core.logging import scrub_sensitive_data
 from lora.safety.killswitch import KillSwitch
 from lora.safety.policy import ActionRiskTier, PolicyEngine, PolicyResult, PolicyVerdict
+
+logger = logging.getLogger("lora.safety.gate")
 
 
 class DataProvenance(StrEnum):
@@ -38,7 +42,7 @@ class ActionGate:
         self,
         policy_engine: PolicyEngine,
         kill_switch: KillSwitch | None = None,
-        max_actions_per_task: int = 40,
+        max_actions_per_task: int = 15,  # v1.5 Plan §9.1: tightened default action budget to 15
         max_repeated_actions: int = 3,
         dry_run: bool = False,
     ) -> None:
@@ -57,6 +61,19 @@ class ActionGate:
             self.action_count = 0
             self.action_history.clear()
 
+    def _log_audit(self, tool: str, origin: str, tier: int, res: PolicyResult, params: dict[str, Any]) -> None:
+        if tier >= 1 or not res.allowed:
+            scrubbed = scrub_sensitive_data(params)
+            logger.info(
+                "AUDIT origin=%s tool=%s tier=%d verdict=%s allowed=%s params=%s",
+                origin,
+                tool,
+                tier,
+                res.verdict,
+                res.allowed,
+                scrubbed,
+            )
+
     def verify_and_gate(
         self,
         tool: str,
@@ -73,22 +90,26 @@ class ActionGate:
 
         # 1. Kill Switch verification
         if self.kill_switch.is_halted():
-            return PolicyResult(
+            res = PolicyResult(
                 allowed=False,
                 verdict=PolicyVerdict.HARD_DENY,
                 reason=f"Emergency kill switch is active ({self.kill_switch.halt_reason})",
                 rule_matched="killswitch_halted",
             )
+            self._log_audit(tool, origin, tier_int, res, params_dict)
+            return res
 
         with self._lock:
             # 2. Action Budget enforcement
             if self.action_count >= self.max_actions_per_task:
-                return PolicyResult(
+                res = PolicyResult(
                     allowed=False,
                     verdict=PolicyVerdict.HARD_DENY,
                     reason=f"Task action budget exceeded (limit: {self.max_actions_per_task})",
                     rule_matched="action_budget_exceeded",
                 )
+                self._log_audit(tool, origin, tier_int, res, params_dict)
+                return res
 
             # 3. Repetitive action loop detection
             current_signature = {"tool": tool_lower, "params": params_dict}
@@ -100,7 +121,7 @@ class ActionGate:
                     break
 
             if recent_matches >= self.max_repeated_actions:
-                return PolicyResult(
+                res = PolicyResult(
                     allowed=False,
                     verdict=PolicyVerdict.ASK,
                     reason=(
@@ -109,27 +130,30 @@ class ActionGate:
                     ),
                     rule_matched="repetitive_loop_detected",
                 )
+                self._log_audit(tool, origin, tier_int, res, params_dict)
+                return res
 
         # 4. Taint Tracking (Prompt Injection Defense)
-        # Check recursively if any parameter or nested payload carries UNTRUSTED taint
         if has_untrusted_taint(provenance_dict):
-            # Rule 4.1: Untrusted taint cannot drive Tier >= 1 actions
             if tier_int >= ActionRiskTier.TIER1:
-                return PolicyResult(
+                res = PolicyResult(
                     allowed=False,
                     verdict=PolicyVerdict.HARD_DENY,
                     reason=f"Untrusted tainted parameter cannot be used in Tier {tier_int} action '{tool}'",
                     rule_matched="taint_tracking_tier_denied",
                 )
+                self._log_audit(tool, origin, tier_int, res, params_dict)
+                return res
 
-            # Rule 4.2: Untrusted taint cannot be typed into browser or external sites
             if tool_lower in ["browser_type", "ask_other_ai", "open_app", "open_path"]:
-                return PolicyResult(
+                res = PolicyResult(
                     allowed=False,
                     verdict=PolicyVerdict.HARD_DENY,
                     reason=f"Untrusted tainted input cannot be typed or executed by tool '{tool}'",
                     rule_matched="taint_tracking_typing_denied",
                 )
+                self._log_audit(tool, origin, tier_int, res, params_dict)
+                return res
 
         # 5. Path checks for filesystem tools
         path_arg = params_dict.get("path") or params_dict.get("file_path") or params_dict.get("target")
@@ -137,6 +161,7 @@ class ActionGate:
             path_mode = "write" if tool_lower in ["export_report", "write_file", "create_note"] else "read"
             path_result = self.policy_engine.check_path(path=path_arg, origin=origin, mode=path_mode)
             if not path_result.allowed:
+                self._log_audit(tool, origin, tier_int, path_result, params_dict)
                 return path_result
 
         # 6. Evaluate via PolicyEngine
@@ -152,4 +177,5 @@ class ActionGate:
                 self.action_count += 1
                 self.action_history.append(current_signature)
 
+        self._log_audit(tool, origin, tier_int, policy_result, params_dict)
         return policy_result

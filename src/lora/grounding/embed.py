@@ -9,18 +9,25 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+
 def _resolve_default_embedding_path() -> str:
     env_path = os.getenv("LORA_EMBEDDING_MODEL_PATH")
     if env_path and Path(env_path).exists():
-        return env_path
+        return str(Path(env_path).resolve())
+    repo_root = Path(__file__).resolve().parents[3]
     for cand in (
+        Path("models/embeddinggemma2"),
         Path("models/embeddinggemma-2"),
         Path("models/embedding-gemma-2"),
+        repo_root / "models" / "embeddinggemma2",
+        repo_root / "models" / "embeddinggemma-2",
+        repo_root / "models" / "embedding-gemma-2",
+        Path(r"C:\Models\embeddinggemma2"),
         Path(r"C:\Models\embeddinggemma-2"),
     ):
         if cand.exists():
             return str(cand.resolve())
-    return env_path or str(Path("models/embeddinggemma-2").resolve())
+    return env_path or str(Path("models/embeddinggemma2").resolve())
 
 
 DEFAULT_MODEL_PATH = _resolve_default_embedding_path()
@@ -31,11 +38,17 @@ class EmbeddingEngine:
 
     def __init__(
         self,
-        model_name_or_path: str = DEFAULT_MODEL_PATH,
+        model_name_or_path: str | None = None,
         device: str = "cpu",
         batch_size: int = 16,
     ) -> None:
-        self.model_path = model_name_or_path
+        resolved = model_name_or_path or _resolve_default_embedding_path()
+        # If caller passed legacy "C:/Models/embeddinggemma-2" that doesn't exist, resolve to local models/embeddinggemma2
+        if not Path(resolved).exists():
+            alt = _resolve_default_embedding_path()
+            if Path(alt).exists():
+                resolved = alt
+        self.model_path = resolved
         self.device = device
         self.batch_size = batch_size
         self._model: Any = None
@@ -46,10 +59,15 @@ class EmbeddingEngine:
         if self._model is None and not self._use_fallback:
             path = Path(self.model_path)
             if not path.exists():
-                logger.warning(
-                    "Embedding model path '%s' does not exist. Falling back to CPU embedder.",
-                    self.model_path,
-                )
+                alt = _resolve_default_embedding_path()
+                if Path(alt).exists():
+                    self.model_path = alt
+                    path = Path(alt)
+                else:
+                    logger.warning(
+                        "Embedding model path '%s' does not exist. Falling back to CPU embedder.",
+                        self.model_path,
+                    )
             try:
                 from sentence_transformers import SentenceTransformer
 

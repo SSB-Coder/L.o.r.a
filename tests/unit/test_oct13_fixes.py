@@ -89,6 +89,7 @@ def test_persona_no_longer_tells_the_model_it_cannot_browse():
     low = PERSONA.lower()
     assert "cannot browse" not in low.replace("never say you cannot browse", "")
     assert "research the web" in low and "open apps" in low
+    assert "tony stark" not in low and "never call the user 'stark'" in low
 
 
 # ---- fuzzy names, launching ------------------------------------------------------------------------------------------
@@ -190,7 +191,7 @@ def test_voice_server_speaks_through_the_separate_environment(voice_env, monkeyp
     monkeypatch.setenv("LORA_TTS_FAKE", "1")
     w = voice_env.Qwen3TtsWorkerProcess(models_dir=r"C:\nowhere")
     assert w.preload() is True
-    chunk = w.synthesize("Hello there, boss.", voice="vivian")
+    chunk = w.synthesize("Hello there, friend.", voice="vivian")
     assert len(chunk.samples) > 1000 and chunk.sample_rate == 22050
     assert abs(float(chunk.samples.max())) <= 1.0
     diag = w.diagnosis()
@@ -333,19 +334,19 @@ async def test_skill_trigger_adds_instructions_and_persona_file_replaces_the_per
     (skills / "skill.yaml").write_text("name: paper-summary\ntriggers: [summarise this paper]\nsystem_prompt_addon: Always end with a one-line TL;DR.\ndefault_depth: quick\n")
     agents = tmp_path / "agents"
     agents.mkdir()
-    (agents / "persona.md").write_text("You are Jarvis. Address the user as sir.")
+    (agents / "persona.md").write_text("You are a chill study buddy. Keep replies casual.")
     rt = make_rt(tmp_path, monkeypatch, skills_dir=tmp_path / "skills", agents_dir=agents)
     bodies = []
 
     def llm(request):
         bodies.append(json.loads(request.content)["messages"])
-        return httpx.Response(200, content=nd("Sure, sir."))
+        return httpx.Response(200, content=nd("Got it!"))
 
     respx.get(f"{URL}/api/tags").respond(200, json={"models": [{"name": "m:1"}]})
     respx.post(f"{URL}/api/chat").mock(side_effect=llm)
     await turn(rt, "please summarise this paper about attention")
     system = bodies[-1][0]["content"]
-    assert system.startswith("You are Jarvis") and "one-line TL;DR" in system
+    assert system.startswith("You are a chill study buddy") and "one-line TL;DR" in system
     await turn(rt, "explain gradient descent briefly")
     assert "TL;DR" not in bodies[-1][0]["content"]  # only when the trigger phrase matches
 
@@ -357,7 +358,7 @@ def test_roles_from_lora_yaml_choose_the_other_model_families():
     role = load_role("verifier")
     assert role.get("name")
     assert candidate_names(None, role, "verifier")[0] == role["name"]  # that role's own model comes first
-    assert candidate_names(None, load_role("writer"))[0] == "spark-x25-4b"  # the writer stays Spark
+    assert candidate_names(None, load_role("writer"))[0] == "spark-x25-4b"  # the base writer stays Spark 4B
     installed = ["spark-x25-4b-8k:latest", role["name"], "granite4.2:8b"]
     judge, independent = pick_judge_model(installed, "spark-x25-4b-8k:latest")
     assert independent and judge != "spark-x25-4b-8k:latest"
@@ -429,16 +430,17 @@ async def test_open_wikipedia_on_page_and_open_chatgpt_and_ask(tmp_path, monkeyp
 
 
 def test_manual_and_automatic_model_selection():
-    from lora.models.selection import candidate_names, is_complex_query, pick_escalation_model
+    from lora.models.selection import QWYTHOS_MODEL, candidate_names, is_complex_query, pick_escalation_model
 
     cands_manual = candidate_names("ornith-1.5:9b", {"name": "spark-x25-4b"}, role="writer", manual_model="granite4.2:8b")
     assert cands_manual[0] == "granite4.2:8b"
 
     cands_complex = candidate_names(None, {}, role="complex")
     assert cands_complex[0] == "granite4.2:8b"
+    assert QWYTHOS_MODEL in cands_complex
 
     cands_vision = candidate_names(None, {}, role="vision")
-    assert "gemma3:4b" in cands_vision[:2] or "llava" in cands_vision[:3]
+    assert "gemma4:e4b" in cands_vision[:2] and "gemma3:4b" in cands_vision[:3]
 
     esc = pick_escalation_model(["SparkLLM/Spark-X2.5-4B:latest", "granite4.2:8b"], "SparkLLM/Spark-X2.5-4B:latest")
     assert esc == "granite4.2:8b"
@@ -469,7 +471,7 @@ async def test_eight_way_verification_scorecard_and_iterations(tmp_path, monkeyp
     rt = make_rt(tmp_path, monkeypatch)
     page_text = "Mamba is a selective state space architecture that scales linearly with sequence length. " * 4
 
-    async def _fake_res(q, st, queries=None):
+    async def _fake_res(q, st, queries=None, topic_type="background"):
         return ResearchResult(q, [Source("S1", "Mamba Paper", "https://arxiv.org/abs/2312.00752", text=page_text)])
 
     rt._research_fn = _fake_res

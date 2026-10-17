@@ -4,6 +4,7 @@ import respx
 from lora.models.ollama_client import OllamaClient
 from lora.models.selection import (
     MAX_INTERACTIVE_CTX,
+    QWYTHOS_MODEL,
     build_options,
     candidate_names,
     choose_model,
@@ -45,6 +46,11 @@ def test_spark_is_always_first_even_when_the_user_config_says_otherwise(monkeypa
     assert names.index("gemma4:e4b") < names.index("granite4.2:8b")
     monkeypatch.setenv("LORA_MODEL", "my-model")
     assert candidate_names(None, {})[0] == "my-model"
+
+    # gemma4:26b (18 GB) must be excluded from auto-selection
+    installed = ["gemma4:26b", "granite4.2:8b", "spark-x25-4b-8k:latest"]
+    assert choose_model(["gemma4", "granite4.2:8b"], installed) == ("granite4.2:8b", True)
+    assert QWYTHOS_MODEL in candidate_names(None, {}, role="complex")
 
 
 def test_prefers_the_small_context_variant_of_spark():

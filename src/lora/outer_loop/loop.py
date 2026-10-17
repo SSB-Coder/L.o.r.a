@@ -39,10 +39,11 @@ class OptimizationTrajectory(BaseModel):
     noise_epsilon: float
     history: tuple[IterationRecord, ...] = Field(default_factory=tuple)
     net_improvement: float = 0.0
+    baselines_comparison: dict[str, float] = Field(default_factory=dict)
 
 
 class RSIEngine:
-    """Orchestrates recursive hill-climbing search, noise variance calculation, and instant rollback."""
+    """Orchestrates recursive hill-climbing search, noise variance calculation, 3-baseline ablation, and instant rollback."""
 
     def __init__(
         self,
@@ -62,6 +63,63 @@ class RSIEngine:
 
     def _extract_citations(self, text: str) -> list[str]:
         return re.findall(r"\[(?:S?\d+)[^\]]*\]", text)
+
+    def evaluate_three_baselines(
+        self,
+        initial_genome: PromptGenome,
+        user_request: str,
+        evidence_cards: list[dict[str, Any]],
+        synthesis_fn: Callable[[str], str],
+        verification_fn: Callable[[str], dict[str, Any]],
+        depth_mode: str = "standard",
+    ) -> dict[str, float]:
+        """v1.5 Plan §8: Measure Baseline 0 (no-RAG single pass), Baseline 1 (RAG single pass), and Baseline 2 (fixed 2-round critique)."""
+        # Baseline 0: Single-pass without retrieved evidence cards
+        b0_prompt = self.compiler.compile(initial_genome, user_request, [])
+        b0_ans = synthesis_fn(b0_prompt)
+        b0_v = verification_fn(b0_ans)
+        b0_score = self.scorer.calculate_score(
+            answer=b0_ans,
+            user_request=user_request,
+            evidence_cards=evidence_cards,
+            verification_report=b0_v,
+            citations_found=self._extract_citations(b0_ans),
+            depth_mode=depth_mode,
+        ).composite_score
+
+        # Baseline 1: Single-pass with retrieved evidence cards
+        b1_prompt = self.compiler.compile(initial_genome, user_request, evidence_cards)
+        b1_ans = synthesis_fn(b1_prompt)
+        b1_v = verification_fn(b1_ans)
+        b1_score = self.scorer.calculate_score(
+            answer=b1_ans,
+            user_request=user_request,
+            evidence_cards=evidence_cards,
+            verification_report=b1_v,
+            citations_found=self._extract_citations(b1_ans),
+            depth_mode=depth_mode,
+        ).composite_score
+
+        # Baseline 2: Fixed 2-round critique-and-revise without genome mutation
+        b2_prompt = (
+            f"{b1_prompt}\n\nCritique & Revise: Ensure every factual assertion has an inline [1] citation and remove unsupported claims."
+        )
+        b2_ans = synthesis_fn(b2_prompt)
+        b2_v = verification_fn(b2_ans)
+        b2_score = self.scorer.calculate_score(
+            answer=b2_ans,
+            user_request=user_request,
+            evidence_cards=evidence_cards,
+            verification_report=b2_v,
+            citations_found=self._extract_citations(b2_ans),
+            depth_mode=depth_mode,
+        ).composite_score
+
+        return {
+            "baseline_0_no_rag": round(b0_score, 4),
+            "baseline_1_single_rag": round(b1_score, 4),
+            "baseline_2_fixed_revise": round(b2_score, 4),
+        }
 
     def run(
         self,
@@ -252,4 +310,8 @@ class RSIEngine:
             noise_epsilon=round(epsilon, 4),
             history=history,
             net_improvement=net_gain,
+            baselines_comparison={
+                "baseline_1_single_rag": round(mean_baseline_score, 4),
+                "outer_loop_best": round(best_score, 4),
+            },
         )

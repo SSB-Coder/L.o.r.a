@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
+from lora.agent.commands import parse_command
 from lora.voice.capture import AudioCapture
 from lora.voice.vad import SpeechState, VoiceActivityDetector
 from lora.voice.wakeword import WakeWordDetector
@@ -32,6 +33,39 @@ def test_vad_isolated_clicks_never_count_as_speech():
         chunk = (rng.standard_normal(512) * (0.05 if i % 40 == 0 else 0.002)).astype(np.float32)
         state, _ = vad.process_chunk(chunk)
         assert state == SpeechState.SILENCE
+
+
+def test_vad_tolerates_inter_syllable_dip_during_hey_lora():
+    """A 1-2 frame consonant/glottal dip between 'Hey' and 'LORA' must not wipe the recorded onset."""
+    vad = VoiceActivityDetector(
+        sample_rate=16000,
+        threshold=0.35,
+        silence_duration_seconds=0.15,
+        min_speech_duration_seconds=0.16,
+    )
+    quiet = np.zeros(512, dtype=np.float32)
+    loud = np.ones(512, dtype=np.float32) * 0.05
+
+    # Pre-roll silence
+    for _ in range(4):
+        vad.process_chunk(quiet)
+    # "Hey" (3 frames = 96ms < 160ms)
+    for _ in range(3):
+        st, _ = vad.process_chunk(loud)
+    assert st == SpeechState.SILENCE
+    # Brief 2-frame inter-syllable dip between "Hey" and "LORA"
+    vad.process_chunk(quiet)
+    vad.process_chunk(quiet)
+    # "LORA" (4 frames = 128ms -> total speech frames = 7 >= 160ms)
+    for _ in range(4):
+        st, _ = vad.process_chunk(loud)
+    assert st == SpeechState.SPEAKING
+    for _ in range(6):
+        st, _ = vad.process_chunk(quiet)
+    assert st == SpeechState.ENDED
+    utterance = vad.get_and_reset_utterance()
+    # Utterance includes pre-roll + "Hey" + 2-frame dip + "LORA" + trailing silence
+    assert len(utterance) >= (4 + 3 + 2 + 4) * 512
 
 
 def test_vad_utterance_includes_preroll():
@@ -121,6 +155,18 @@ def test_wake_word_match_text():
     det = WakeWordDetector(transcriber=None)
     assert det.match_text("Hey LORA what's the weather", False) == (True, "what's the weather")
     assert det.match_text("hey laura", False) == (True, "")
+    assert det.match_text("Hey, Flora, open Chrome", False) == (True, "open Chrome")
+    assert det.match_text("Hey, Lauren! What time is it?", False) == (True, "What time is it")
     assert det.match_text("we should get lunch", False) == (False, "")
     assert det.match_text("Awaken Lora", True) == (True, "")
     assert det.match_text("hey lora", True) == (False, "")  # sleeping needs the awaken phrase
+
+
+def test_power_off_requires_explicit_lora_target():
+    """Bare 'turn off' from background speech must not trigger app shutdown."""
+    assert parse_command("turn off") is None
+    assert parse_command("turn off the lights") is None
+    cmd = parse_command("turn off lora")
+    assert cmd is not None and cmd.kind == "turn_off"
+    cmd2 = parse_command("shut down lora")
+    assert cmd2 is not None and cmd2.kind == "turn_off"

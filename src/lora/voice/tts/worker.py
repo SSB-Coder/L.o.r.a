@@ -161,13 +161,14 @@ def _windows_speech_synth(text: str, voice: str = DEFAULT_KOKORO_VOICE) -> tuple
 _CACHED_KOKORO_MODEL: Any = None
 _KOKORO_STATUS: dict[str, str] = {"state": "unloaded", "reason": "", "fix": "", "dir": ""}
 _KOKORO_LOAD_LOCK = threading.Lock()
+_KOKORO_SYNTH_LOCK = threading.Lock()
 FIX_KOKORO = (
-    r"run: uv pip install --python .\.venv\Scripts\python.exe -U kokoro-onnx soundfile "
-    r"and place kokoro-v1.0.onnx + voices-v1.0.bin in C:\Models\kokoro"
+    r"run: python scripts\download_models.py --kokoro-only "
+    r"(places kokoro-v1.0.onnx + voices-v1.0.bin in models\kokoro)"
 )
 
 
-def candidate_kokoro_dirs(models_dir: str = r"C:\Models\kokoro") -> list[Path]:
+def candidate_kokoro_dirs(models_dir: str = "models/kokoro") -> list[Path]:
     """Locate directories that may contain kokoro-v1.0.onnx and voices-v1.0.bin."""
     cands: list[Path] = []
     for env_key in ("LORA_KOKORO_DIR", "LORA_TTS_MODEL_DIR"):
@@ -181,10 +182,10 @@ def candidate_kokoro_dirs(models_dir: str = r"C:\Models\kokoro") -> list[Path]:
         cands.append(base)
         cands.append(base.parent / "kokoro")
     cands.extend([
-        Path(r"C:\Models\kokoro"),
-        Path(r"C:\Models"),
         Path("models/kokoro"),
         Path("models/voice"),
+        Path(r"C:\Models\kokoro"),
+        Path(r"C:\Models"),
     ])
     out: list[Path] = []
     seen: set[str] = set()
@@ -196,7 +197,7 @@ def candidate_kokoro_dirs(models_dir: str = r"C:\Models\kokoro") -> list[Path]:
     return out
 
 
-def find_kokoro_files(models_dir: str = r"C:\Models\kokoro") -> tuple[Path, Path] | None:
+def find_kokoro_files(models_dir: str = "models/kokoro") -> tuple[Path, Path] | None:
     """Return (onnx_model_path, voices_bin_path) if present on disk."""
     for folder in candidate_kokoro_dirs(models_dir):
         if not folder.is_dir():
@@ -220,7 +221,7 @@ def find_kokoro_files(models_dir: str = r"C:\Models\kokoro") -> tuple[Path, Path
     return None
 
 
-def get_kokoro_model(models_dir: str = r"C:\Models\kokoro") -> Any:
+def get_kokoro_model(models_dir: str = "models/kokoro") -> Any:
     """Load and cache the Kokoro-ONNX TTS model on CPU (0 MB GPU VRAM)."""
     global _CACHED_KOKORO_MODEL
     if _CACHED_KOKORO_MODEL is not None:
@@ -279,16 +280,17 @@ def get_kokoro_model(models_dir: str = r"C:\Models\kokoro") -> Any:
 
 
 def _kokoro_generate(model: Any, text: str, voice: str = DEFAULT_KOKORO_VOICE) -> tuple[np.ndarray, int]:
-    """Synthesize speech with Kokoro-ONNX using the requested voice (defaults to af_sky)."""
+    """Synthesize speech with Kokoro-ONNX under lock (protects non-reentrant espeak-ng C state)."""
     target_voice = resolve_kokoro_voice(voice)
-    try:
-        available = list(model.get_voices()) if hasattr(model, "get_voices") else []
-        if available and target_voice not in available:
-            target_voice = DEFAULT_KOKORO_VOICE if DEFAULT_KOKORO_VOICE in available else available[0]
-    except Exception:
-        pass
-    lang = "en-gb" if target_voice.startswith("b") else "en-us"
-    samples, sr = model.create(text, voice=target_voice, speed=1.0, lang=lang)
+    with _KOKORO_SYNTH_LOCK:
+        try:
+            available = list(model.get_voices()) if hasattr(model, "get_voices") else []
+            if available and target_voice not in available:
+                target_voice = DEFAULT_KOKORO_VOICE if DEFAULT_KOKORO_VOICE in available else available[0]
+        except Exception:
+            pass
+        lang = "en-gb" if target_voice.startswith("b") else "en-us"
+        samples, sr = model.create(text, voice=target_voice, speed=1.0, lang=lang)
     return np.asarray(samples, dtype=np.float32).reshape(-1), int(sr)
 
 
@@ -474,7 +476,7 @@ def _qwen_generate(model: Any, text: str, voice: str) -> tuple[np.ndarray, int]:
     return np.asarray(wav, dtype=np.float32).reshape(-1), int(sr)
 
 
-def tts_diagnosis(models_dir: str = r"C:\Models\kokoro") -> dict[str, Any]:
+def tts_diagnosis(models_dir: str = "models/kokoro") -> dict[str, Any]:
     """Plain-language status of the natural voice, for 'run diagnostics' and the startup log."""
     if _CACHED_KOKORO_MODEL is not None or _KOKORO_STATUS["state"] == "loaded":
         return {
@@ -597,7 +599,7 @@ class Qwen3TtsWorkerProcess:
 
     def __init__(
         self,
-        models_dir: str = r"C:\Models\kokoro",
+        models_dir: str = "models/kokoro",
         tokenizer_dir: str = r"C:\Models\Qwen3-TTS-Tokenizer-12Hz",
         default_voice: str = DEFAULT_KOKORO_VOICE,
         spawn_process: bool = False,

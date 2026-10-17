@@ -39,13 +39,13 @@ htmlcov/
 *.swo
 
 # Local runtime data & caches (keep local within project)
-data/
-logs/
-cache/
-models/
+/data/
+/logs/
+/cache/
+/models/
 *.db-shm
 *.db-wal
-outputs/
+/outputs/
 
 # Secrets
 .env

@@ -15,7 +15,7 @@ import faiss
 import numpy as np
 
 from lora.grounding.chunk import DocumentChunk, DocumentChunker
-from lora.grounding.embed import EmbeddingEngine
+from lora.grounding.embed import DEFAULT_MODEL_PATH, EmbeddingEngine
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ class MediaVectorDB:
     ) -> None:
         self._lock = threading.RLock()
         self.embedding_engine = embedding_engine or EmbeddingEngine(
-            model_name_or_path=os.getenv("LORA_EMBEDDING_MODEL_PATH", "C:/Models/embeddinggemma-2")
+            model_name_or_path=os.getenv("LORA_EMBEDDING_MODEL_PATH") or DEFAULT_MODEL_PATH
         )
         self.storage_dir = Path(storage_dir) if storage_dir else DEFAULT_MEDIA_STORAGE
         self.chunker = DocumentChunker(target_chunk_tokens=350, overlap_tokens=50)

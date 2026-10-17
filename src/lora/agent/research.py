@@ -1,7 +1,7 @@
 """Web research: search -> fetch pages -> chunk & rank passages -> numbered sources for a cited answer.
 
 No browser needed: DuckDuckGo's HTML endpoint for search (+ Wikipedia/arXiv/PubMed/Crossref fallbacks),
-httpx + trafilatura to read pages, and semantic/lexical chunk selection for long articles.
+httpx + trafilatura to read pages, and SessionVectorIndex + CrossEncoderReranker chunk selection for long articles.
 All fetches go through the egress filter (http/https only, no private/loopback hosts).
 """
 
@@ -27,6 +27,27 @@ PREPRINT_DOMAINS = {"arxiv.org", "biorxiv.org", "medrxiv.org", "chemrxiv.org", "
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LORA/0.1 (+local research assistant)"
 MAX_BYTES = 1_500_000
 PAGE_CHARS = 2400
+
+_SHARED_EMBEDDER = None
+_SHARED_RERANKER = None
+
+
+def _get_rag_components():
+    """Lazy-initialize shared EmbeddingEngine and CrossEncoderReranker for SessionVectorIndex chunk selection."""
+    global _SHARED_EMBEDDER, _SHARED_RERANKER
+    if _SHARED_EMBEDDER is None:
+        try:
+            from lora.grounding.embed import EmbeddingEngine
+            from lora.grounding.rerank import CrossEncoderReranker
+
+            _SHARED_EMBEDDER = EmbeddingEngine()
+            _SHARED_RERANKER = CrossEncoderReranker()
+        except Exception:
+            _SHARED_EMBEDDER = False
+            _SHARED_RERANKER = False
+    return (_SHARED_EMBEDDER if _SHARED_EMBEDDER is not False else None), (
+        _SHARED_RERANKER if _SHARED_RERANKER is not False else None
+    )
 
 
 @dataclass
@@ -260,17 +281,46 @@ def extract_text(html: str) -> str:
 
 
 def select_best_passages(full_text: str, query: str = "", max_chars: int = PAGE_CHARS) -> str:
-    """Select the most query-relevant semantic chunks from a long article instead of blindly truncating."""
+    """Select the most query-relevant semantic chunks from a long article using SessionVectorIndex + CrossEncoderReranker."""
     if len(full_text) <= max_chars or not query.strip():
         return full_text[:max_chars]
     try:
         from lora.grounding.chunk import DocumentChunker
+        from lora.grounding.session_index import SessionVectorIndex
 
         chunks = DocumentChunker(target_chunk_tokens=180, overlap_tokens=25).chunk_text(
             full_text[:18000], source_url="", title=""
         )
         if len(chunks) <= 2:
             return full_text[:max_chars]
+
+        embedder, reranker = _get_rag_components()
+        if embedder is not None:
+            try:
+                sess = SessionVectorIndex(session_id="page-rag", embedding_engine=embedder)
+                sess.add_chunks(chunks)
+                sem_hits = sess.search(query, top_k=min(6, len(chunks)))
+                cand_chunks = [c for c, _sc in sem_hits] or chunks[:6]
+                if reranker is not None and len(cand_chunks) > 2:
+                    cand_chunks = reranker.rerank(query, cand_chunks, top_k=min(4, len(cand_chunks)))
+                sess.clear()
+                # Preserve original document order among the top selected chunks
+                idx_map = {c.chunk_id: i for i, c in enumerate(chunks)}
+                chosen: list[tuple[int, str]] = []
+                total_len = 0
+                for c in cand_chunks:
+                    if total_len + len(c.text) + 2 > max_chars and chosen:
+                        continue
+                    chosen.append((idx_map.get(c.chunk_id, 0), c.text))
+                    total_len += len(c.text) + 2
+                    if total_len >= max_chars - 200:
+                        break
+                if chosen:
+                    chosen.sort(key=lambda x: x[0])
+                    return "\n".join(t for _i, t in chosen)[:max_chars]
+            except Exception:
+                pass
+
         q_words = {w for w in re.sub(r"[^\w\s]", " ", query.lower()).split() if len(w) > 2}
         scored = []
         for idx, c in enumerate(chunks):
@@ -279,7 +329,7 @@ def select_best_passages(full_text: str, query: str = "", max_chars: int = PAGE_
             lead_bonus = 0.15 if idx == 0 else (0.05 if idx == 1 else 0.0)
             scored.append((overlap + lead_bonus, idx, c.text))
         scored.sort(key=lambda x: x[0], reverse=True)
-        chosen: list[tuple[int, str]] = []
+        chosen = []
         total_len = 0
         for _sc, idx, txt in scored:
             if total_len + len(txt) + 2 > max_chars and chosen:
@@ -312,6 +362,20 @@ async def fetch_text(url: str, client: httpx.AsyncClient, query: str = "") -> st
         logger.info("Fetch failed for %s: %s", url, exc)
         return ""
     raw_text = extract_text(html)
+    # Inspect with Spotlighter to strip any active prompt injection payloads from scraped web prose
+    try:
+        from lora.tools.web.spotlight import Spotlighter
+
+        inj, _flags = Spotlighter().detect_injection(raw_text)
+        if inj:
+            logger.warning("Prompt injection pattern detected in %s; sanitizing instruction lines.", url)
+            raw_text = re.sub(
+                r"(?i)(?:ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions|system\s+override|disregard\s+(?:all\s+)?(?:safety|rules|guidelines)).*",
+                "[redacted-untrusted-instruction]",
+                raw_text,
+            )
+    except Exception:
+        pass
     return select_best_passages(raw_text, query=query, max_chars=PAGE_CHARS)
 
 
@@ -320,6 +384,7 @@ async def research(
     status=lambda _t: None,
     max_pages: int = 4,
     queries: list[str] | None = None,
+    topic_type: str = "background",
 ) -> ResearchResult:
     """Search the web and read the best few pages. ``queries`` are the prompt engineer's search phrases."""
     phrases = list(dict.fromkeys(q.strip() for q in (queries or [query]) if q and q.strip()))[:2] or [query]

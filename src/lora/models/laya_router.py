@@ -1,4 +1,4 @@
-"""Typed decision router for L.O.R.A using Convai Laya (Hugging Face / PyPI `laya`).
+"""Typed decision router for L.O.R.A using Convai Laya (local `models/laya-lora-ft` on CPU).
 
 Provides fast, non-autoregressive, calibrated decision routing on CPU (0 MB GPU VRAM):
 - Intent: research | control | chat
@@ -7,16 +7,22 @@ Provides fast, non-autoregressive, calibrated decision routing on CPU (0 MB GPU 
 - Run Mode: quick | standard | deep
 - Topic Type: background | scholarly | biomedical | physics_astro | cs | tech_community | books | current_events | local_files
 - Prompt Injection Flag: boolean safety gate (`noul` / heuristic scanner)
+
+Strictly loads from local `models/laya-lora-ft` (or offline HF cache) with ZERO outbound Hugging Face downloads at startup.
 """
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import logging
 import os
 import re
 from pathlib import Path
 from typing import Any
+
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 try:
     import laya
@@ -26,6 +32,22 @@ except ImportError:  # optional until the Laya router is actually used
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+_VALID_LAYA_VARIANTS = {
+    "english",
+    "multilingual",
+    "typed-decisions",
+    "decisions",
+    "default",
+    "en",
+    "laya",
+    "laya-multilingual",
+    "laya-typed-decisions",
+    "ml",
+    "multi",
+    "typed",
+    "typed_decisions",
+}
 
 
 class LayaDecision(BaseModel):
@@ -73,39 +95,124 @@ def infer_topic_type(utterance: str) -> str:
     return "background"
 
 
+def _resolve_laya_checkpoint(explicit: str | None = None) -> str:
+    env_ckpt = explicit or os.environ.get("LORA_LAYA_CHECKPOINT")
+    if env_ckpt and Path(env_ckpt).exists():
+        return str(Path(env_ckpt).resolve())
+    repo_root = Path(__file__).resolve().parents[3]
+    for cand in (
+        Path("models/laya-lora-ft"),
+        repo_root / "models" / "laya-lora-ft",
+        Path("models/laya"),
+        repo_root / "models" / "laya",
+        Path(r"C:\Models\laya-lora-ft"),
+        Path(r"C:\Models\laya"),
+        Path(r"C:\Models\laya-typed-decisions"),
+    ):
+        if cand.exists():
+            return str(cand.resolve())
+    return env_ckpt or "models/laya-lora-ft"
+
+
+@contextmanager
+def _local_laya_hf_intercept(ckpt_dir: Path):
+    """Redirect `laya`'s internal `huggingface_hub.hf_hub_download` calls to local `models/laya-lora-ft`
+    and enforce `local_files_only=True` so `laya.Router` NEVER downloads from huggingface.co at startup.
+    """
+    try:
+        import huggingface_hub
+    except ImportError:
+        yield
+        return
+
+    orig_download = getattr(huggingface_hub, "hf_hub_download", None)
+    if orig_download is None:
+        yield
+        return
+
+    def _patched_download(*args: Any, **kwargs: Any) -> str:
+        filename = kwargs.get("filename") or (args[1] if len(args) > 1 else "")
+        subfolder = kwargs.get("subfolder") or ""
+        rel_path = f"{subfolder}/{filename}".strip("/") if subfolder else str(filename)
+
+        if ckpt_dir.is_dir() and rel_path:
+            # 1. Exact relative path inside models/laya-lora-ft (e.g. models/laya-lora-ft/typed-decisions/rl_agent_config.json)
+            cand_exact = ckpt_dir / rel_path
+            if cand_exact.is_file():
+                return str(cand_exact.resolve())
+            # 2. Path with variant prefix stripped (e.g. models/laya-lora-ft/rl_agent_config.json, models/laya-lora-ft/tokenizer/tokenizer.json)
+            parts = Path(rel_path).parts
+            if len(parts) > 1:
+                cand_stripped = ckpt_dir.joinpath(*parts[1:])
+                if cand_stripped.is_file():
+                    return str(cand_stripped.resolve())
+            # 3. Direct basename inside models/laya-lora-ft
+            cand_base = ckpt_dir / Path(rel_path).name
+            if cand_base.is_file():
+                return str(cand_base.resolve())
+
+        # Otherwise check local HF cache ONLY (never make outbound HTTP calls during startup)
+        kwargs["local_files_only"] = True
+        return orig_download(*args, **kwargs)
+
+    huggingface_hub.hf_hub_download = _patched_download
+    # Also patch inside any already-imported laya submodules that imported hf_hub_download directly
+    patched_mods: list[tuple[Any, Any]] = []
+    for mod_name, mod_obj in list(__import__("sys").modules.items()):
+        if mod_name.startswith("laya") and hasattr(mod_obj, "hf_hub_download"):
+            patched_mods.append((mod_obj, getattr(mod_obj, "hf_hub_download")))
+            setattr(mod_obj, "hf_hub_download", _patched_download)
+    try:
+        yield
+    finally:
+        huggingface_hub.hf_hub_download = orig_download
+        for mod_obj, orig_fn in patched_mods:
+            setattr(mod_obj, "hf_hub_download", orig_fn)
+
+
 class LayaDecisionRouter:
-    """Wrapper around `laya.Router` (Hugging Face Convai Innovations Laya) with temperature calibration."""
+    """Wrapper around `laya.Router` using local `models/laya-lora-ft` weights with temperature calibration."""
 
     def __init__(
         self,
         confidence_threshold: float = 0.70,
         risky_threshold: float = 0.30,
-        model_variant: str = "english",
+        model_variant: str = "typed-decisions",
         checkpoint_path: str | None = None,
         calibration_file: str | None = None,
     ) -> None:
         self.confidence_threshold = confidence_threshold
         self.risky_threshold = risky_threshold
-        self.model_variant = model_variant
-        self.checkpoint_path = checkpoint_path or os.environ.get("LORA_LAYA_CHECKPOINT", "models/laya-lora-ft")
+        self.model_variant = model_variant if model_variant in _VALID_LAYA_VARIANTS else "typed-decisions"
+        self.checkpoint_path = _resolve_laya_checkpoint(checkpoint_path)
         self.calibration_file = calibration_file or "config/laya_calibration.json"
         self.temperatures: dict[str, float] = {"intent": 1.0, "action_risk": 1.0, "depth_mode": 1.0}
         self._load_calibration()
+        self.agent: Any = None
         self.router: Any = None
-        self.backend = "laya-calibrated"
-        if laya is not None and hasattr(laya, "Router"):
-            try:
-                # Prefer local fine-tuned checkpoint if present on disk, else model_variant ("english" / HF)
-                target_variant = model_variant
-                for cand in (self.checkpoint_path, r"C:\Models\laya", r"C:\Models\laya-typed-decisions"):
-                    if cand and Path(cand).exists():
-                        target_variant = str(cand)
-                        break
-                self.router = laya.Router(default=target_variant)
-                self.backend = f"laya-hf ({target_variant})"
-            except Exception as exc:
-                logger.warning("Laya HF router init deferred (%s); using calibrated CPU router.", exc)
-                self.router = None
+        ckpt_dir = Path(self.checkpoint_path)
+        self.backend = f"laya-local ({ckpt_dir.name})" if ckpt_dir.exists() else "laya-calibrated"
+
+        if laya is not None:
+            # 1. Prefer direct local Agent load from checkpoint on disk (0 downloads, 100% offline)
+            if ckpt_dir.exists() and (ckpt_dir / "model.safetensors").exists() and hasattr(laya, "Agent"):
+                try:
+                    self.agent = laya.Agent(str(ckpt_dir.resolve()))
+                    self.backend = f"laya-local ({ckpt_dir.name})"
+                except Exception as exc:
+                    logger.warning("Local Laya Agent load failed (%s); trying fallback router.", exc)
+                    self.agent = None
+
+            # 2. Fall back to Router if local Agent was not loaded
+            if self.agent is None and hasattr(laya, "Router"):
+                with _local_laya_hf_intercept(ckpt_dir):
+                    for variant in dict.fromkeys((self.model_variant, "typed-decisions", "english")):
+                        try:
+                            self.router = laya.Router(default=variant)
+                            self.backend = f"laya-hf ({variant})"
+                            break
+                        except Exception:
+                            self.router = None
         self._setup_questions()
 
     def _load_calibration(self) -> None:
@@ -175,7 +282,7 @@ class LayaDecisionRouter:
                 },
                 "usage": {"engine": "laya-calibrated"},
             }
-        if any(low.startswith(v) or f" {v} " in f" {low} " for v in ("open", "launch", "focus", "switch to", "start", "go to", "visit", "sleep", "wake up", "turn off")):
+        if any(low.startswith(v) or f" {v} " in f" {low} " for v in ("open", "launch", "focus", "switch to", "start", "activate", "go to", "visit", "sleep", "wake up", "turn off")):
             return {
                 "answers": {
                     "intent": {"choice": "control", "answer_confidence": 0.95, "probabilities": {"control": 0.95, "research": 0.03, "chat": 0.02}},
@@ -216,20 +323,27 @@ class LayaDecisionRouter:
         """Classify a user utterance into structured decision parameters."""
         raw: dict[str, Any] = {}
         used_backend = self.backend
-        if self.router is not None:
+        if self.agent is not None:
             try:
-                raw = self.router.predict(state=utterance, questions=self.questions) or {}
+                raw = self.agent.predict(state=utterance, questions=self.questions) or {}
                 ans_intent = raw.get("answers", {}).get("intent", {})
                 if ans_intent.get("answer_confidence", 0.0) < self.confidence_threshold and "probabilities" not in ans_intent:
                     raw = self._heuristic_predict(utterance)
-                    used_backend = "laya-calibrated"
+            except Exception as exc:
+                logger.debug("Laya agent predict fallback: %s", exc)
+                raw = self._heuristic_predict(utterance)
+        elif self.router is not None:
+            try:
+                with _local_laya_hf_intercept(Path(self.checkpoint_path)):
+                    raw = self.router.predict(state=utterance, questions=self.questions) or {}
+                ans_intent = raw.get("answers", {}).get("intent", {})
+                if ans_intent.get("answer_confidence", 0.0) < self.confidence_threshold and "probabilities" not in ans_intent:
+                    raw = self._heuristic_predict(utterance)
             except Exception as exc:
                 logger.debug("Laya router predict fallback: %s", exc)
                 raw = self._heuristic_predict(utterance)
-                used_backend = "laya-calibrated"
         else:
             raw = self._heuristic_predict(utterance)
-            used_backend = "laya-calibrated"
 
         answers = raw.get("answers", {})
 
@@ -252,8 +366,8 @@ class LayaDecisionRouter:
         depth_info = answers.get("depth_mode", {})
         depth_choice = depth_info.get("choice", "standard")
 
-        # 4. Infer run mode
-        run_mode = "quick"
+        # 4. Infer run mode from neural depth + explicit user request
+        run_mode = "deep" if depth_choice in ("detailed", "expert") else "quick"
         lower_utt = utterance.lower()
         if any(w in lower_utt for w in ("deep research", "with refinement", "outer loop", "fact-check", "fact check", "double-check", "thoroughly")):
             run_mode = "deep"

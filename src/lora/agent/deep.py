@@ -21,7 +21,12 @@ from lora.agent.verification import Verification
 from lora.outer_loop.scorer import OuterLoopScorer
 from lora.supervisor.roundtable import RoundTableEvaluator, get_model_family
 
-JUDGE_PREFERENCE = ("granite4.2:8b", "gemma4:e4b", "ornith-1.5:9b")
+JUDGE_PREFERENCE = (
+    "hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest",
+    "granite4.2:8b",
+    "ornith-1.5:9b",
+    "gemma4:e4b",
+)
 
 # 8 distinct prompt refinement strategies used across outer/inner verification loops
 PROMPT_REFINEMENT_STRATEGIES: tuple[tuple[str, str], ...] = (
@@ -39,15 +44,16 @@ PROMPT_REFINEMENT_STRATEGIES: tuple[tuple[str, str], ...] = (
 def pick_judge_model(installed: list[str], writer: str) -> tuple[str, bool]:
     """A model from a different family than the writer if one is installed. (model, is_independent)"""
     from lora.models.ollama_client import match_models
-    from lora.models.selection import load_role
+    from lora.models.selection import is_excluded_model, load_role
 
+    safe_installed = [m for m in installed if not is_excluded_model(m)] or list(installed)
     writer_family = get_model_family(writer)
     configured = [load_role(r).get("name") for r in ("verifier", "supervisor")]
     for pref in (*[c for c in configured if c], *JUDGE_PREFERENCE):
-        for found in match_models(pref, installed):
+        for found in match_models(pref, safe_installed):
             if get_model_family(found) != writer_family:
                 return found, True
-    for name in installed:
+    for name in safe_installed:
         if get_model_family(name) != writer_family:
             return name, True
     return writer, False

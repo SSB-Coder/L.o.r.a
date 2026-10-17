@@ -5,11 +5,31 @@ import os
 import re
 from typing import Any
 
+import numpy as np
 from pydantic import BaseModel, ConfigDict
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_NLI_MODEL = os.getenv("LORA_NLI_MODEL", "vectara/hallucination_evaluation_model")
+_SHARED_EMBEDDER: Any = None
+
+
+def _get_shared_embedder() -> Any:
+    """Lazy-load the local EmbeddingGemma-2 engine (`models/embeddinggemma2`) for semantic entailment scoring."""
+    global _SHARED_EMBEDDER
+    if _SHARED_EMBEDDER is None:
+        try:
+            from lora.grounding.embed import EmbeddingEngine
+
+            eng = EmbeddingEngine()
+            eng._ensure_model()
+            if not eng._use_fallback and eng._model is not None:
+                _SHARED_EMBEDDER = eng
+            else:
+                _SHARED_EMBEDDER = False
+        except Exception:
+            _SHARED_EMBEDDER = False
+    return _SHARED_EMBEDDER if _SHARED_EMBEDDER is not False else None
 
 
 class NliScoreResult(BaseModel):
@@ -69,7 +89,6 @@ class NliGroundednessChecker:
         w_set = set(w_tokens)
         w_stems = {w[:5] for w in w_set if len(w) >= 5}
 
-        # Deduplicate hypothesis words so repeating one shared noun cannot mask missing predicate words
         unique_h = list(dict.fromkeys(h_words))
         matched = sum(
             1 for w in unique_h
@@ -77,8 +96,6 @@ class NliGroundednessChecker:
         )
         ratio = matched / len(unique_h)
 
-        # Only penalize negation polarity mismatch when comparing against a short single-sentence premise
-        # (prevents long multi-paragraph web articles containing "not" in an unrelated sentence from failing all claims)
         if check_neg and len(w_tokens) <= 28:
             w_has_neg = bool(w_set & self._NEGATIONS)
             if w_has_neg != h_has_neg:
@@ -91,7 +108,7 @@ class NliGroundednessChecker:
         return min(1.0, max(0.0, float(score)))
 
     def _heuristic_entailment_score(self, premise: str, hypothesis: str) -> float:
-        """Sentence-window & full-premise semantic containment score on CPU (handles long web articles & paraphrasing)."""
+        """Sentence-window semantic + lexical containment score on CPU (uses EmbeddingGemma-2 when loaded)."""
         h_clean = re.sub(r"[^\w\s]", " ", hypothesis.lower())
         h_tokens = h_clean.split()
         h_has_neg = bool(set(h_tokens) & self._NEGATIONS)
@@ -111,6 +128,22 @@ class NliGroundednessChecker:
                 sc2 = self._score_window(pair, h_words, h_has_neg, check_neg=False)
                 if sc2 > best:
                     best = sc2
+
+        # Blend with neural EmbeddingGemma-2 cosine similarity when available and no negation conflict exists
+        embedder = _get_shared_embedder()
+        if embedder is not None and best > 0.25:
+            try:
+                windows = (sents[:12] if sents else [premise[:1200]])
+                vecs = embedder.encode([hypothesis, *windows])
+                if len(vecs) >= 2:
+                    h_vec = vecs[0]
+                    w_vecs = vecs[1:]
+                    max_cos = float(np.max(w_vecs @ h_vec))
+                    if max_cos >= 0.68:
+                        neural_score = min(1.0, 0.80 + (max_cos - 0.68) * 0.60)
+                        best = max(best, neural_score)
+            except Exception:
+                pass
         return best
 
     def check_entailment(

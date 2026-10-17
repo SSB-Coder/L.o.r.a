@@ -3,7 +3,7 @@
 Downloads and installs:
 1. Kokoro TTS (kokoro-v1.0.onnx + voices-v1.0.bin) -> models/kokoro
 2. Laya Decision Router (AgencyL1/Laya-Lora-4B) -> models/laya-lora-ft
-3. Embedding Gemma 2 (google/embeddinggemma-2) -> models/embeddinggemma-2
+3. Embedding Gemma 2 (google/embeddinggemma-2) -> models/embeddinggemma2 (or models/embeddinggemma-2)
 """
 
 from __future__ import annotations
@@ -55,7 +55,6 @@ def setup_kokoro(force: bool = False) -> bool:
     onnx_file = target_dir / "kokoro-v1.0.onnx"
     voices_file = target_dir / "voices-v1.0.bin"
 
-    # Check cache from C:\Models\kokoro if present
     c_kokoro = Path(r"C:\Models\kokoro")
     if c_kokoro.exists():
         if not onnx_file.exists() and (c_kokoro / "kokoro-v1.0.onnx").exists():
@@ -82,7 +81,7 @@ def setup_laya(force: bool = False) -> bool:
     target_dir.mkdir(parents=True, exist_ok=True)
     safetensors = target_dir / "model.safetensors"
 
-    if not force and safetensors.exists() and safetensors.stat().st_size > 500_000_000:
+    if not force and (safetensors.exists() or any(target_dir.glob("*.safetensors")) or (target_dir / "config.json").exists()):
         logger.info("[OK] Laya Router already installed at %s", target_dir)
         return True
 
@@ -96,7 +95,7 @@ def setup_laya(force: bool = False) -> bool:
             local_dir_use_symlinks=False,
             resume_download=True,
         )
-        ok = safetensors.exists()
+        ok = safetensors.exists() or any(target_dir.glob("*.safetensors"))
         if ok:
             logger.info("[OK] Laya Router downloaded to %s", target_dir)
         return ok
@@ -106,24 +105,28 @@ def setup_laya(force: bool = False) -> bool:
 
 
 def setup_embeddinggemma(force: bool = False) -> bool:
-    """Setup Embedding Gemma 2 model in models/embeddinggemma-2."""
-    target_dir = MODELS_DIR / "embeddinggemma-2"
+    """Setup Embedding Gemma 2 model in models/embeddinggemma2 (or models/embeddinggemma-2)."""
+    for existing in (MODELS_DIR / "embeddinggemma2", MODELS_DIR / "embeddinggemma-2"):
+        if not force and existing.exists() and ((existing / "model.safetensors").exists() or (existing / "config.json").exists()):
+            logger.info("[OK] Embedding Gemma 2 already installed at %s", existing)
+            return True
+
+    target_dir = MODELS_DIR / "embeddinggemma2"
     target_dir.mkdir(parents=True, exist_ok=True)
     safetensors = target_dir / "model.safetensors"
 
-    # Check cache from C:\Models\embeddinggemma-2 if present
-    c_embed = Path(r"C:\Models\embeddinggemma-2")
-    if c_embed.exists() and not safetensors.exists():
-        logger.info("Copying embeddinggemma-2 from C:\\Models\\embeddinggemma-2...")
-        for item in c_embed.iterdir():
-            dest = target_dir / item.name
-            if not dest.exists():
-                if item.is_dir():
-                    shutil.copytree(item, dest)
-                else:
-                    shutil.copy2(item, dest)
+    for c_embed in (Path(r"C:\Models\embeddinggemma2"), Path(r"C:\Models\embeddinggemma-2")):
+        if c_embed.exists() and not safetensors.exists():
+            logger.info("Copying embeddinggemma2 from %s...", c_embed)
+            for item in c_embed.iterdir():
+                dest = target_dir / item.name
+                if not dest.exists():
+                    if item.is_dir():
+                        shutil.copytree(item, dest)
+                    else:
+                        shutil.copy2(item, dest)
 
-    if not force and safetensors.exists() and safetensors.stat().st_size > 500_000_000:
+    if not force and (safetensors.exists() or (target_dir / "config.json").exists()):
         logger.info("[OK] Embedding Gemma 2 already installed at %s", target_dir)
         return True
 
@@ -146,12 +149,55 @@ def setup_embeddinggemma(force: bool = False) -> bool:
         return False
 
 
+def setup_bge_reranker(force: bool = False) -> bool:
+    """Setup BAAI/bge-reranker-base in models/bge-reranker-base."""
+    target_dir = MODELS_DIR / "bge-reranker-base"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    safetensors = target_dir / "model.safetensors"
+
+    if not force and safetensors.exists():
+        logger.info("[OK] BGE reranker already installed at %s", target_dir)
+        return True
+
+    hf_cache = Path(os.path.expanduser("~/.cache/huggingface/hub/models--BAAI--bge-reranker-base/snapshots"))
+    if hf_cache.is_dir():
+        for snap in hf_cache.iterdir():
+            if snap.is_dir() and (snap / "model.safetensors").exists():
+                logger.info("Copying bge-reranker-base from HF cache snapshot %s...", snap.name)
+                for item in snap.iterdir():
+                    dest = target_dir / item.name
+                    if not dest.exists():
+                        shutil.copy2(item, dest)
+                if safetensors.exists():
+                    logger.info("[OK] BGE reranker restored from cache to %s", target_dir)
+                    return True
+
+    try:
+        from huggingface_hub import snapshot_download
+
+        logger.info("Downloading bge-reranker-base from Hugging Face (BAAI/bge-reranker-base)...")
+        snapshot_download(
+            repo_id="BAAI/bge-reranker-base",
+            local_dir=str(target_dir),
+            local_dir_use_symlinks=False,
+            resume_download=True,
+        )
+        ok = safetensors.exists()
+        if ok:
+            logger.info("[OK] BGE reranker downloaded to %s", target_dir)
+        return ok
+    except Exception as exc:
+        logger.warning("Could not download bge-reranker-base: %s. Lexical fallback will be used.", exc)
+        return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Download and setup models/ directory for L.O.R.A")
     parser.add_argument("--force", action="store_true", help="Force redownload existing models")
     parser.add_argument("--kokoro-only", action="store_true", help="Setup Kokoro only")
     parser.add_argument("--laya-only", action="store_true", help="Setup Laya only")
     parser.add_argument("--embedding-only", action="store_true", help="Setup Embedding Gemma 2 only")
+    parser.add_argument("--reranker-only", action="store_true", help="Setup BGE Reranker only")
     args = parser.parse_args()
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -164,10 +210,13 @@ def main() -> int:
         results["laya"] = setup_laya(args.force)
     elif args.embedding_only:
         results["embeddinggemma"] = setup_embeddinggemma(args.force)
+    elif args.reranker_only:
+        results["bge-reranker"] = setup_bge_reranker(args.force)
     else:
         results["kokoro"] = setup_kokoro(args.force)
         results["laya"] = setup_laya(args.force)
         results["embeddinggemma"] = setup_embeddinggemma(args.force)
+        results["bge-reranker"] = setup_bge_reranker(args.force)
 
     logger.info("--------------------------------------------------")
     logger.info("Model Setup Summary:")

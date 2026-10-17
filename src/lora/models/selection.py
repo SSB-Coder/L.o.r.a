@@ -2,9 +2,15 @@
 
 Supports:
 - Manual model selection (`manual_model` override from UI or voice/text command)
-- Automatic complexity & modality routing (`writer` -> 4B fast, `complex`/`agent` -> 8B/9B, `vision` -> multimodal)
-- Runtime auto-escalation (`pick_escalation_model`) when a task is too complex for the current model
-- Strict 6 GB VRAM KV-cache protection (`num_ctx` capped to 8192 for `-8k` models and interactive roles)
+- Automatic complexity & modality routing tailored to installed local Ollama models:
+  - `writer` (Base fast model) -> `spark-x25-4b` (`spark-x25-4b-8k:latest`, 2.6 GB, fast everyday turns)
+  - `planner` / `controller` / `verifier` -> `granite4.2:8b` (smart 8B for intent, planning, and verification)
+  - `complex` / `supervisor` / `deep` -> `hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest` (Mythos 9B thinking) -> `ornith-1.5:9b` -> `granite4.2:8b`
+  - `vision` / `optimizer` -> `gemma4:e4b`
+  - `reader` -> `spark-x25-4b-32k:latest` (32k long-context map-reduce)
+- Hard-excludes oversized models (`gemma4:26b`, 18 GB) from automatic selection on 16 GB RAM
+- Strict v1.5 Plan rule: ONE fixed `num_ctx` per model tag (8192 for interactive models, 32768 only for `-32k` reader)
+  so Ollama never unloads/reloads the same model between steps.
 """
 
 from __future__ import annotations
@@ -22,20 +28,35 @@ from lora.models.ollama_client import OllamaClient, match_models
 
 logger = logging.getLogger(__name__)
 
-# Smaller models first for quick turns: an 8B+ model spills out of 6 GB VRAM and is slower.
-PREFERRED_MODEL = "spark-x25-4b"  # Spark-X2.5-4B is the base fast model
+# Base fast model for quick everyday turns (2.6 GB in 6 GB VRAM); complex prompts escalate to 8B/9B
+PREFERRED_MODEL = "spark-x25-4b"
+QWYTHOS_MODEL = "hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest"
+
+# Oversized models (>12 GB) that must never be auto-selected on a 6 GB VRAM / 16 GB RAM laptop
+EXCLUDED_MODELS: tuple[str, ...] = (
+    "gemma4:26b",
+    "26b",
+    "27b",
+    "32b",
+    "70b",
+)
+
 DEFAULT_FALLBACKS: tuple[str, ...] = (
     "gemma4:e4b",
     "granite4.2:8b",
+    QWYTHOS_MODEL,
     "ornith-1.5:9b",
+    "granite4.2:3b",
 )
 COMPLEX_PREFERENCE: tuple[str, ...] = (
     "granite4.2:8b",
+    QWYTHOS_MODEL,
     "ornith-1.5:9b",
     "gemma4:e4b",
     PREFERRED_MODEL,
 )
 VISION_PREFERENCE: tuple[str, ...] = (
+    "gemma4:e4b",
     "gemma3:4b",
     "gemma3",
     "llava",
@@ -43,7 +64,6 @@ VISION_PREFERENCE: tuple[str, ...] = (
     "minicpm-v",
     "llama3.2-vision",
     "moondream",
-    "gemma4:e4b",
     "granite4.2:8b",
     PREFERRED_MODEL,
 )
@@ -60,6 +80,12 @@ class ChatPlan:
     note: str = ""
     role: str = "writer"
     escalated: bool = False
+
+
+def is_excluded_model(model_name: str) -> bool:
+    """True if `model_name` is too large for 6 GB VRAM / 16 GB RAM automatic selection (e.g., gemma4:26b)."""
+    low = (model_name or "").strip().lower()
+    return any(tok in low for tok in EXCLUDED_MODELS)
 
 
 def find_config_file(name: str = "lora.yaml") -> Path | None:
@@ -87,17 +113,18 @@ _COMPLEX_QUERY_RE = re.compile(
     r"\b(in[- ]?depth|deep(?:ly)?|thorough(?:ly)?|detailed|comprehensive(?:ly)?|compare|contrast|"
     r"architecture|mechanism|derive|derivation|prove|proof|algorithm|implement|debug|refactor|"
     r"step[- ]by[- ]step|analyze|analysis|evaluate|trade[- ]?offs?|multi[- ]?step|synthesize|"
-    r"critique|benchmark|formal|mathematical|system design)\b",
+    r"critique|benchmark|formal|mathematical|system design|why\s+(?:does|do|is|are|did|would)|"
+    r"how\s+(?:does|do|would|can\s+we)|explain\s+how|what\s+if|reason(?:ing)?|mythos)\b",
     re.IGNORECASE,
 )
 
 
 def is_complex_query(query: str) -> bool:
-    """True when the user request warrants scaling up from the 4B writer to an 8B/9B or 32k model."""
+    """True when the user request warrants scaling up from the 4B base writer to Granite-8B / Qwythos-9B."""
     q = (query or "").strip()
-    if len(q.split()) >= 18:
+    if len(q.split()) >= 14:
         return True
-    if q.count("\n") >= 3 or "```" in q:
+    if q.count("\n") >= 2 or "```" in q:
         return True
     return bool(_COMPLEX_QUERY_RE.search(q))
 
@@ -105,18 +132,19 @@ def is_complex_query(query: str) -> bool:
 def is_vision_Capable(model_name: str) -> bool:
     """True if the Ollama model tag is a known multimodal vision model."""
     low = (model_name or "").lower()
-    return any(v in low for v in ("llava", "gemma3", "vl", "vision", "minicpm-v", "moondream", "bakllava", "pixtral"))
+    return any(v in low for v in ("gemma4", "llava", "gemma3", "vl", "vision", "minicpm-v", "moondream", "bakllava", "pixtral"))
 
 
 def pick_escalation_model(installed: list[str], current_model: str) -> str | None:
-    """Choose a stronger 8B/9B model when the current model is 4B or failed a complex step."""
+    """Choose a stronger 8B/9B model (Granite-8B, Qwythos-9B, Ornith-9B) when the 4B model is insufficient."""
     cur_low = (current_model or "").lower()
-    for pref in ("granite4.2:8b", "ornith-1.5:9b", "gemma4:e4b"):
-        for found in match_models(pref, installed):
+    safe_installed = [m for m in installed if not is_excluded_model(m)]
+    for pref in ("granite4.2:8b", QWYTHOS_MODEL, "qwythos", "ornith-1.5:9b", "gemma4:e4b"):
+        for found in match_models(pref, safe_installed):
             if found.lower() != cur_low:
                 return found
-    for cand in installed:
-        if cand.lower() != cur_low and any(k in cand.lower() for k in ("8b", "9b", "7b", "14b", "12b", "granite", "ornith")):
+    for cand in safe_installed:
+        if cand.lower() != cur_low and any(k in cand.lower() for k in ("8b", "9b", "qwythos", "granite", "ornith")):
             return cand
     return None
 
@@ -147,11 +175,12 @@ def candidate_names(
                 names.append(name)
         return names
 
-    if role != "writer":  # planner / verifier / supervisor / reader: that role's own model first
+    if role != "writer":  # planner / verifier / supervisor / controller / reader: that role's own model first
         for name in (role_cfg.get("name"), *(role_cfg.get("fallback") or [])):
             if name and name not in names:
                 names.append(name)
-    # Spark first for standard fast writer. LORA_MODEL overrides; a stale default in the user config comes after it.
+
+    # Spark 4B first for fast base writer; LORA_MODEL or manual_model overrides.
     for name in (
         PREFERRED_MODEL,
         role_cfg.get("name"),
@@ -164,6 +193,16 @@ def candidate_names(
     return names
 
 
+def fixed_num_ctx_for_model(model_name: str, role: str = "writer", configured_ctx: int | None = None) -> int:
+    """v1.5 Plan §3.3: Return ONE fixed num_ctx per model tag so Ollama never reloads on role transitions."""
+    m_low = (model_name or "").lower()
+    if "32k" in m_low:
+        return 32768 if role == "reader" else MAX_INTERACTIVE_CTX
+    if configured_ctx is not None and not model_name:
+        return min(int(configured_ctx), MAX_INTERACTIVE_CTX)
+    return MAX_INTERACTIVE_CTX
+
+
 def build_options(
     role_cfg: dict[str, Any],
     role: str = "writer",
@@ -172,37 +211,38 @@ def build_options(
     options: dict[str, Any] = {}
     if "temperature" in role_cfg:
         options["temperature"] = float(role_cfg["temperature"])
-    num_ctx = int(role_cfg.get("num_ctx") or 4096)
-    m_low = (model_name or "").lower()
-    # Never allocate a 32k KV cache on an -8k model or on interactive 6 GB VRAM turns unless explicitly using a 32k tag
-    if "8k" in m_low:
-        ctx_cap = 8192
-    elif role == "reader" and "32k" in m_low:
-        ctx_cap = 32768
-    elif role in ("planner", "verifier", "supervisor", "optimizer"):
-        ctx_cap = 6144
+    raw_ctx = role_cfg.get("num_ctx")
+    if model_name:
+        options["num_ctx"] = fixed_num_ctx_for_model(model_name, role=role, configured_ctx=raw_ctx)
+    elif raw_ctx:
+        options["num_ctx"] = min(int(raw_ctx), 32768 if role == "reader" else MAX_INTERACTIVE_CTX)
     else:
-        ctx_cap = MAX_INTERACTIVE_CTX
-    options["num_ctx"] = min(num_ctx, ctx_cap)
+        options["num_ctx"] = 4096
     think = role_cfg.get("think", False)
     if isinstance(think, bool) or isinstance(think, str):
         return options, think
     return options, None
 
 
-def choose_model(candidates: list[str], installed: list[str]) -> tuple[str | None, bool]:
-    """Return (model, was_configured). Falls back to the first installed model."""
+def choose_model(candidates: list[str], installed: list[str], allow_excluded: bool = False) -> tuple[str | None, bool]:
+    """Return (model, was_configured). Excludes oversized models (e.g. gemma4:26b) unless explicitly requested."""
+    pool = list(installed) if allow_excluded else [m for m in installed if not is_excluded_model(m)]
+    if not pool and installed:
+        pool = list(installed)
     for cand in candidates:
-        found = match_models(cand, installed)
+        search_pool = list(installed) if is_excluded_model(cand) else pool
+        found = match_models(cand, search_pool)
         if found:
             return min(found, key=_variant_rank), True
-    return (installed[0], False) if installed else (None, False)
+    return (pool[0], False) if pool else (None, False)
 
 
-def _variant_rank(name: str) -> tuple[bool, bool, int]:
-    """Among several tags of one model prefer the small-context build (faster, less VRAM)."""
+def _variant_rank(name: str) -> tuple[bool, bool, bool, int]:
+    """Among several tags of one model prefer the 8k / native tag over 32k or duplicate HF GGUF builds."""
     low = name.lower()
-    return (any(k in low for k in ("32k", "16k", "128k")), "8k" not in low, len(low))
+    is_long_ctx = any(k in low for k in ("32k", "16k", "128k"))
+    is_dup_spark_hf = "hf.co/xhtoken/spark" in low
+    return (is_long_ctx, is_dup_spark_hf, "8k" not in low, len(low))
 
 
 async def plan_chat(
@@ -216,7 +256,8 @@ async def plan_chat(
     installed = await client.installed_models()
     role_cfg = load_role(role, config_path)
     cands = candidate_names(user_default, role_cfg, role, manual_model=manual_model)
-    model, configured = choose_model(cands, installed)
+    allow_excl = bool(manual_model and is_excluded_model(manual_model))
+    model, configured = choose_model(cands, installed, allow_excluded=allow_excl)
     if model is None:
         return None
     options, think = build_options(role_cfg, role=role, model_name=model)
@@ -229,5 +270,5 @@ async def plan_chat(
         think=think,
         note=note,
         role=role,
-        escalated=(role in ("complex", "agent", "vision")),
+        escalated=(role in ("complex", "agent", "vision", "supervisor")),
     )

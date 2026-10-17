@@ -108,3 +108,41 @@ def test_dual_activation_sleep_and_idle():
     res_sleep_ignore = detector.process_audio(audio_clip, current_state="sleep")
     assert res_sleep_ignore.detected is False
 
+
+def test_speaker_verifier_disabled_and_env_override(tmp_path: Path, monkeypatch):
+    profile_file = tmp_path / "test_user.json"
+    verifier = SpeakerVerifier(profile_path=profile_file, threshold=0.70)
+    # Save a profile
+    audio = np.ones(16000, dtype=np.float32) * 0.1
+    verifier.save_profile([verifier.extract_features(audio).tolist()])
+
+    # Distinct audio would normally fail
+    bad_audio = np.zeros(16000, dtype=np.float32)
+    verifier.threshold = 0.99
+
+    # 1. When enabled=False directly
+    verifier.enabled = False
+    is_ver, sim = verifier.verify(bad_audio)
+    assert is_ver is True
+    assert sim == 1.0
+
+    # 2. When env var LORA_SPEAKER_VERIFY_ENABLED=0
+    monkeypatch.setenv("LORA_SPEAKER_VERIFY_ENABLED", "0")
+    verifier2 = SpeakerVerifier(profile_path=profile_file)
+    assert verifier2.enabled is False
+    is_ver2, sim2 = verifier2.verify(bad_audio)
+    assert is_ver2 is True
+
+
+def test_speaker_verifier_slices_active_speech(tmp_path: Path):
+    verifier = SpeakerVerifier(profile_path=tmp_path / "test.json")
+    t = np.linspace(0, 0.8, int(16000 * 0.8), endpoint=False)
+    tone = (np.sin(2 * np.pi * 440 * t) * 0.2).astype(np.float32)
+    # Tone padded with silence on both sides (total 32000 samples = 2s)
+    padded = np.concatenate([np.zeros(4000, dtype=np.float32), tone, np.zeros(15200, dtype=np.float32)])
+    feat = verifier.extract_features(padded)
+    # Norm should be 1.0 and features should have non-zero components in speech bins
+    assert np.linalg.norm(feat) > 0.99
+    assert np.sum(feat) > 0.0
+
+

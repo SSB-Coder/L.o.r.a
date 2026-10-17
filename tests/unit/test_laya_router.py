@@ -13,6 +13,7 @@ def mock_laya_router():
     with patch("lora.models.laya_router.laya") as mock_laya_mod:
         mock_instance = MagicMock()
         mock_laya_mod.Router.return_value = mock_instance
+        mock_laya_mod.Agent.return_value = mock_instance
         router = LayaDecisionRouter(confidence_threshold=0.70, risky_threshold=0.30)
         yield router, mock_instance
 

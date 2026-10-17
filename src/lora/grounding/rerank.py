@@ -2,13 +2,18 @@
 
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 from lora.grounding.chunk import DocumentChunk
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_RERANKER_MODEL = os.getenv("LORA_RERANKER_MODEL", "BAAI/bge-reranker-base")
+LOCAL_RERANKER_PATH = Path("models/bge-reranker-base")
+DEFAULT_RERANKER_MODEL = os.getenv(
+    "LORA_RERANKER_MODEL",
+    str(LOCAL_RERANKER_PATH.resolve()) if LOCAL_RERANKER_PATH.is_dir() else "BAAI/bge-reranker-base",
+)
 
 
 class CrossEncoderReranker:
@@ -16,10 +21,17 @@ class CrossEncoderReranker:
 
     def __init__(
         self,
-        model_name: str = DEFAULT_RERANKER_MODEL,
+        model_name: str | None = None,
         device: str = "cpu",
     ) -> None:
-        self.model_name = model_name
+        if model_name is None:
+            self.model_name = (
+                str(LOCAL_RERANKER_PATH.resolve())
+                if LOCAL_RERANKER_PATH.is_dir()
+                else DEFAULT_RERANKER_MODEL
+            )
+        else:
+            self.model_name = model_name
         self.device = device
         self._model: Any = None
         self._model_failed: bool = False
@@ -30,7 +42,12 @@ class CrossEncoderReranker:
                 from sentence_transformers import CrossEncoder
 
                 logger.info("Loading cross-encoder reranker '%s' on %s", self.model_name, self.device)
-                self._model = CrossEncoder(self.model_name, device=self.device)
+                is_local = Path(self.model_name).is_dir()
+                self._model = CrossEncoder(
+                    self.model_name,
+                    device=self.device,
+                    local_files_only=is_local,
+                )
             except Exception as e:
                 logger.warning("Failed to load cross-encoder model '%s': %s. Using lexical fallback.", self.model_name, e)
                 self._model_failed = True

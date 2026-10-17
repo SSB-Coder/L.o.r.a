@@ -1,11 +1,16 @@
 """Wake Word Detection ('Awaken LORA') and Personalized Speaker Verification."""
 
 import json
+import logging
+import os
+import re
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict
+
+logger = logging.getLogger("lora.voice.wakeword")
 
 
 class WakeWordResult(BaseModel):
@@ -24,9 +29,19 @@ class WakeWordResult(BaseModel):
 class SpeakerVerifier:
     """Verifies that the speaker's vocal acoustics match the enrolled owner."""
 
-    def __init__(self, profile_path: Path | str | None = None, threshold: float = 0.70) -> None:
-        self.threshold = threshold
+    def __init__(
+        self,
+        profile_path: Path | str | None = None,
+        threshold: float = 0.55,
+        enabled: bool | None = None,
+    ) -> None:
+        env_thresh = os.environ.get("LORA_SPEAKER_VERIFY_THRESHOLD")
+        self.threshold = float(env_thresh) if env_thresh else threshold
         self.profile_path = Path(profile_path) if profile_path else Path("data/voice/user_verifier.json")
+        if enabled is not None:
+            self.enabled = enabled
+        else:
+            self.enabled = os.environ.get("LORA_SPEAKER_VERIFY_ENABLED", "1").lower() not in ("0", "false", "no")
         self.reference_embeddings: list[list[float]] = []
         self._load_profile()
 
@@ -36,6 +51,9 @@ class SpeakerVerifier:
             try:
                 data = json.loads(self.profile_path.read_text(encoding="utf-8"))
                 self.reference_embeddings = data.get("embeddings", [])
+                if "threshold" in data and "LORA_SPEAKER_VERIFY_THRESHOLD" not in os.environ:
+                    file_thresh = float(data["threshold"])
+                    self.threshold = min(self.threshold, file_thresh) if file_thresh > 0 else self.threshold
             except Exception:
                 self.reference_embeddings = []
 
@@ -56,8 +74,22 @@ class SpeakerVerifier:
         if len(audio) < 512:
             return np.zeros(32, dtype=np.float32)
 
-        # Compute FFT energy distribution across frequency bins
-        chunk = audio[-16000:] if len(audio) > 16000 else audio
+        # Slice the highest-energy 1.0s window rather than trailing post-speech silence
+        chunk_len = min(len(audio), sample_rate)
+        if len(audio) > chunk_len:
+            step = max(256, sample_rate // 10)  # 100ms stride
+            best_idx = 0
+            best_energy = -1.0
+            for start in range(0, len(audio) - chunk_len + 1, step):
+                w = audio[start : start + chunk_len]
+                energy = float(np.mean(w**2))
+                if energy > best_energy:
+                    best_energy = energy
+                    best_idx = start
+            chunk = audio[best_idx : best_idx + chunk_len]
+        else:
+            chunk = audio
+
         fft_vals = np.abs(np.fft.rfft(chunk))
         num_bins = 32
         bin_size = max(1, len(fft_vals) // num_bins)
@@ -76,8 +108,8 @@ class SpeakerVerifier:
 
     def verify(self, audio: np.ndarray, sample_rate: int = 16000) -> tuple[bool, float]:
         """Verify if the audio matches enrolled owner voice (returns is_verified, similarity)."""
-        if not self.reference_embeddings:
-            # If no enrolled voice profile exists yet, allow with default baseline
+        if not self.enabled or not self.reference_embeddings:
+            # If verifier is disabled or no enrolled voice profile exists yet, allow with default baseline
             return True, 1.0
 
         feat = self.extract_features(audio, sample_rate)
@@ -108,6 +140,7 @@ class WakeWordDetector:
       1. From SLEEP: 'Awaken LORA' (or 'Wake up LORA') wakes the system into IDLE.
       2. From IDLE: 'Hey LORA' activates listening to chat.
     - Real-time keyword transcription verification via FasterWhisperTranscriber.
+    - Phonetic tolerance for common Whisper near-homophones of 'LORA'.
     - Integrated speaker acoustic verification.
     """
 
@@ -138,14 +171,23 @@ class WakeWordDetector:
                 self._oww_model = None
 
     SLEEP_KEYWORDS = (
-        "awaken lora", "awaken laura", "awaken lola", "awaken lara", "awaken nora", "awaken",
-        "wake up lora", "wake up laura", "wake up lola", "wake up", "wake lora", "wake laura",
+        "awaken lora", "awaken laura", "awaken lola", "awaken lara", "awaken nora", "awaken flora",
+        "awaken lauren", "awaken lyra", "awaken aura", "awaken",
+        "wake up lora", "wake up laura", "wake up lola", "wake up lara", "wake up", "wake lora", "wake laura",
     )
     IDLE_KEYWORDS = (
-        "hey lora", "hey laura", "hey lola", "hey lara", "hey nora", "hey dora",
-        "hi lora", "hi laura", "hi lola", "hello lora", "hello laura",
+        "hey lora", "hey laura", "hey lola", "hey lara", "hey nora", "hey dora", "hey flora", "hey clara",
+        "hey lauren", "hey lyra", "hey aura", "hey lotta", "hey rory", "hey lore", "hey lord", "hey lorra",
+        "hi lora", "hi laura", "hi lola", "hi lara", "hi nora", "hello lora", "hello laura", "hello lola",
         "awaken lora", "awaken laura", "ok lora", "okay lora", "ok laura", "okay laura",
-        "lora", "laura",
+        "yo lora", "yo laura", "halo lora", "halo laura", "a lora", "a laura",
+        "lora", "laura", "lorra",
+    )
+    _IDLE_PHONETIC_RE = re.compile(
+        r"^\s*(?:(?:hey|hi|hello|yo|ok|okay|awaken|wake(?:\s+up)?|halo|aye)[,.\s]+)?"
+        r"(?:lora|laura|lorra|lola|lara|nora|dora|flora|clara|lauren|lyra|aura|lotta|lore)\b"
+        r"[,.:;!?\s]*(?P<rest>.*)$",
+        re.IGNORECASE,
     )
 
     def match_text(self, text: str, is_sleeping: bool) -> tuple[bool, str]:
@@ -154,15 +196,30 @@ class WakeWordDetector:
         Returns (matched, query_after_the_phrase). Lets callers transcribe once
         instead of once for the wake check and again for the query.
         """
-        txt = (text or "").strip().lower()
+        raw_clean = re.sub(r"\s+", " ", (text or "").strip())
+        txt = raw_clean.lower()
         if not txt:
             return False, ""
+        # Normalize punctuation between prefix ("Hey,") and name ("Lora")
+        txt_norm = re.sub(r"[,.;:!?]+", " ", txt)
+        txt_norm = re.sub(r"\s+", " ", txt_norm).strip()
         if is_sleeping:
-            return any(kw in txt for kw in self.SLEEP_KEYWORDS), ""
+            return any(kw in txt_norm for kw in self.SLEEP_KEYWORDS), ""
+
+        m = self._IDLE_PHONETIC_RE.match(raw_clean)
+        if m:
+            return True, (m.group("rest") or "").strip(" ,.:;!?")
+
         for kw in self.IDLE_KEYWORDS:
-            if kw in txt:
-                after = txt[txt.find(kw) + len(kw):].strip(" ,.:;!?")
-                return True, after
+            if kw in txt_norm:
+                idx = txt_norm.find(kw)
+                # Ensure word-boundary match so "floral" doesn't match "flora"
+                before_ok = idx == 0 or not txt_norm[idx - 1].isalnum()
+                after_idx = idx + len(kw)
+                after_ok = after_idx >= len(txt_norm) or not txt_norm[after_idx].isalnum()
+                if before_ok and after_ok:
+                    after = txt_norm[after_idx:].strip(" ,.:;!?")
+                    return True, after
         return False, ""
 
     def evaluate_text(
@@ -256,4 +313,3 @@ class WakeWordDetector:
             speaker_similarity=0.0,
             extracted_query="",
         )
-

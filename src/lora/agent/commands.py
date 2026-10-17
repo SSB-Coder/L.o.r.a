@@ -1,16 +1,18 @@
-"""Deterministic parser for imperative requests ("open Chrome", "open wikipedia on ...", "open chatgpt and ask ...").
+"""Deterministic & LLM-assisted parser for imperative requests ("open Chrome", "open wikipedia on ...", "open chatgpt and ask ...").
 
 Handles unambiguous desktop, web-app, site-topic, external-AI, model-switch, skill-switch, depth-rewrite,
-notebook, and power/stop intents while allowing compound or multi-step requests to flow into the multi-agent harness.
+notebook, and power/stop intents while allowing natural/compound requests to use structured LLM intent parsing or flow into the multi-agent harness.
 """
 
 from __future__ import annotations
 
+import json
 import random
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 _POLITE = r"^(?:(?:(?:hey|hi|hello|ok|okay)[, ]+)?(?:lora|laura|lara|lola|lorra)[, ]+)?(?:please |kindly )?(?:(?:can|could|would|will) you (?:please )?|i (?:want|need|'d like) you to )?"
 
@@ -42,11 +44,12 @@ _REWRITE_DEPTH = re.compile(
     re.IGNORECASE,
 )
 _POWER_SLEEP = re.compile(
-    _POLITE + r"(?:go\s+to\s+sleep|sleep(?:\s+mode)?|stand\s*by)[\s.!?]*$",
+    _POLITE + r"(?:go\s+to\s+sleep|sleep\s+mode|sleep\s+lora|stand\s*by\s+lora)[\s.!?]*$",
     re.IGNORECASE,
 )
+# Require explicit "lora" or "shut down lora" / "exit lora" / "quit lora" / "turn off lora" so stray Whisper transcripts never exit the app
 _POWER_OFF = re.compile(
-    _POLITE + r"(?:turn\s+off|shut\s*down(?:\s+lora)?|exit\s+lora|quit\s+lora)[\s.!?]*$",
+    _POLITE + r"(?:turn\s+off\s+lora|shut\s*down\s+lora|exit\s+lora|quit\s+lora|close\s+lora)[\s.!?]*$",
     re.IGNORECASE,
 )
 _SAVE_LAST = re.compile(
@@ -218,6 +221,55 @@ def parse_command(text: str) -> Command | None:
         cmd = _parse(variant)
         if cmd is not None:
             return cmd
+    return None
+
+
+async def parse_natural_intent_llm(text: str, collect_fn: Any) -> Command | None:
+    """Use the 8B/9B model (`granite4.2:8b` / `Qwythos-9B`) to parse natural/indirect imperative phrasing
+    into a structured Command when regex fast-paths do not match.
+    """
+    q = (text or "").strip()
+    if len(q) < 6 or len(q) > 280:
+        return None
+    # Only invoke LLM intent parser when the utterance plausibly hints at a desktop/web/note action
+    action_hints = (
+        "open", "launch", "pull up", "bring up", "check out", "put on", "throw on", "play",
+        "youtube", "wikipedia", "arxiv", "spotify", "chatgpt", "perplexity", "gemini",
+        "downloads", "documents", "desktop", "folder", "notepad", "vs code", "vscode", "chrome",
+    )
+    low = q.lower()
+    if not any(h in low for h in action_hints):
+        return None
+    prompt = (
+        "Classify if the user is asking to perform one of these immediate desktop/browser actions:\n"
+        '- {"kind": "open", "target": "<app, folder, file, or website>"}\n'
+        '- {"kind": "site_search", "target": "<youtube|wikipedia|arxiv|github|reddit|spotify|amazon|google>", "query": "<topic>"}\n'
+        '- {"kind": "ask_ai", "service": "<chatgpt|perplexity|gemini>", "prompt": "<question>"}\n'
+        '- {"kind": "none"} if it is a general question, research request, or conversation.\n'
+        "Return ONLY valid JSON.\n\n"
+        f"User utterance: {q}"
+    )
+    try:
+        raw = await collect_fn([{"role": "user", "content": prompt}])
+        m = re.search(r"\{.*\}", raw or "", re.DOTALL)
+        if not m:
+            return None
+        data = json.loads(m.group(0))
+        kind = str(data.get("kind", "none")).strip().lower()
+        if kind == "open" and data.get("target"):
+            return Command("open", target=_clean_target(str(data["target"])), args={"verb": "open"})
+        if kind == "site_search" and data.get("target") and data.get("query"):
+            return Command(
+                "site_search",
+                target=_normalize_site_key(str(data["target"])),
+                args={"query": str(data["query"]).strip()},
+            )
+        if kind == "ask_ai" and data.get("service") and data.get("prompt"):
+            svc = re.sub(r"\s+", "", str(data["service"]).lower())
+            if svc in ("chatgpt", "perplexity", "gemini", "claude"):
+                return Command("ask_ai", args={"service": svc, "prompt": str(data["prompt"]).strip()})
+    except Exception:
+        return None
     return None
 
 

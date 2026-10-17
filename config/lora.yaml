@@ -1,14 +1,16 @@
-# LORA Master Configuration (Phase 0 Baseline + v5 Agentic Harness & Kokoro TTS)
-models_dir: 'C:\Models'
+# LORA Master Configuration (v1.5 Plan Aligned — Local models/ + Spark 4B Base + 8B/9B Escalation)
+models_dir: "models"
 
 voice:
   mode: quality                     # quality | fast | auto
+  headset_mode: false               # false = pause wake/VAD during speaker TTS to prevent self-interruption
   wake:
     engine: openwakeword
     model: models/voice/hey_lora.onnx
     threshold: 0.65
     consecutive: 2
     vad_gate: true
+    preroll_ms: 500
     speaker_verifier:
       enabled: true
       model: models/voice/user_verifier.onnx
@@ -17,17 +19,19 @@ voice:
   vad: silero
   stt:
     engine: faster-whisper
-    model: distil-small.en
+    model: base.en
     device: cpu
     compute: int8
-    beam: 1
-    vad_filter: true
-    initial_prompt: "LORA, arXiv, RAG, Ollama, Python, VS Code, GitHub, Hugging Face, Granite, Gemma, Spark, Kokoro, Wikipedia, ChatGPT"
+    beam: 3
+    vad_filter: false
+    min_avg_logprob: -0.70
+    max_no_speech_prob: 0.60
+    initial_prompt: "Hey LORA, Awaken LORA, arXiv, RAG, Ollama, Python, VS Code, GitHub, Hugging Face, Granite, Gemma, Qwythos, Spark, Kokoro, Wikipedia, ChatGPT"
   stt_fallback: [moonshine, parakeet-sherpa-onnx]
   tts_quality:
     engine: kokoro-onnx
-    model_path: "C:\\Models\\kokoro\\kokoro-v1.0.onnx"
-    voices_path: "C:\\Models\\kokoro\\voices-v1.0.bin"
+    model_path: "models/kokoro/kokoro-v1.0.onnx"
+    voices_path: "models/kokoro/voices-v1.0.bin"
     speaker: af_sky
     lang: en-us
     speed: 1.0
@@ -35,7 +39,7 @@ voice:
     engine: kokoro-onnx
     voice: af_sky
 
-decision:                         # Laya decision model
+decision:                         # Laya decision model (local models/laya-lora-ft on CPU, 0 MB VRAM)
   checkpoint: models/laya-lora-ft
   base_fallback: convaiinnovations/laya
   device: cpu
@@ -57,55 +61,62 @@ gateway:
     allow_uploads: false
     allow_local_files: false
 
-models:                           # Model role assignments
+models:                           # Model role assignments (Spark 4B base + 8B/9B smart escalation, fixed num_ctx=8192)
   planner:
-    name: "gemma4:e4b"
+    name: "granite4.2:8b"
     think: false
-    num_ctx: 6144
+    num_ctx: 8192
+    fallback: ["hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest", "gemma4:e4b", "spark-x25-4b-8k:latest"]
   controller:
     name: "granite4.2:8b"
     think: false
-    num_ctx: 6144
-    fallback: ["ornith-1.5:9b", "gemma4:e4b", "spark-x25-4b-q4"]
+    num_ctx: 8192
+    fallback: ["hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest", "ornith-1.5:9b", "gemma4:e4b", "spark-x25-4b-8k:latest"]
   writer:
     name: "spark-x25-4b-q4"
     family: spark
     think: false
     temperature: 0.3
-    num_ctx: 8192                      # 8k context cap for writer
-    fallback: ["gemma4:e4b", "granite4.2:8b", "ornith-1.5:9b"]
+    num_ctx: 8192                      # 8k context cap for fast base writer
+    fallback: ["gemma4:e4b", "granite4.2:8b", "hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest", "ornith-1.5:9b", "granite4.2:3b"]
   complex:
     name: "granite4.2:8b"
     think: false
     temperature: 0.2
     num_ctx: 8192
-    fallback: ["ornith-1.5:9b", "gemma4:e4b", "spark-x25-4b-q4"]
+    fallback: ["hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest", "ornith-1.5:9b", "gemma4:e4b", "spark-x25-4b-q4"]
   vision:
-    name: "gemma3:4b"
+    name: "gemma4:e4b"
     think: false
     temperature: 0.2
     num_ctx: 8192
-    fallback: ["llava:latest", "qwen2.5vl:latest", "minicpm-v:latest", "gemma4:e4b", "granite4.2:8b", "spark-x25-4b-q4"]
+    fallback: ["gemma3:4b", "llava:latest", "qwen2.5vl:latest", "granite4.2:8b", "spark-x25-4b-q4"]
   reader:
-    name: "spark-x25-4b-q4"
+    name: "spark-x25-4b-32k:latest"
     family: spark
     think: false
     temperature: 0.2
-    num_ctx: 32768                     # 32k context for long-doc map-reduce
+    num_ctx: 32768                     # 32k context exclusively for long-doc map-reduce
+    fallback: ["spark-x25-4b-q4", "granite4.2:8b"]
   verifier:
     name: "granite4.2:8b"
     think: false
-    num_ctx: 6144
+    num_ctx: 8192
     temperature: 0.0
+    fallback: ["hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest", "ornith-1.5:9b", "gemma4:e4b"]
   supervisor:
-    name: "granite4.2:8b"
-    think: low
-    num_ctx: 6144
+    name: "hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest"
+    think: false
+    num_ctx: 8192
     temperature: 0.0
+    fallback: ["granite4.2:8b", "ornith-1.5:9b"]
   optimizer:
     name: "gemma4:e4b"
     think: false
-    num_ctx: 6144
+    num_ctx: 8192
+    fallback: ["granite4.2:8b", "hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest"]
+  excluded:
+    - "gemma4:26b"
   ollama_env:
     OLLAMA_MAX_LOADED_MODELS: 1
     base_url: "http://127.0.0.1:11434"
@@ -113,8 +124,8 @@ models:                           # Model role assignments
 grounding:
   nli_fast: vectara-hhem-2.1-open
   nli_secondary: minicheck
-  embedder: "C:\\Models\\embeddinggemma-2"  # sentence-transformers on CPU (fallback: bge-small)
-  vector_store: faiss                       # faiss-cpu session-bound index (optional sqlite-vec)
+  embedder: "models/embeddinggemma2"         # local repo models/embeddinggemma2 (or models/embeddinggemma-2)
+  vector_store: faiss                        # faiss-cpu session-bound index
   reranker: bge-reranker-base
 
 research:
@@ -130,12 +141,22 @@ outerloop:
   wallclock_minutes: 20
   faithfulness_floor: 0.85
 
+mcp:
+  enabled: false                             # v1.5 Plan: disabled by default in v1
+
+browser:
+  ask_other_ai_tier: 2                       # v1.5 Plan: Tier 2 (requires user confirmation)
+  enabled_services:
+    chatgpt: true
+    perplexity: true
+    gemini: true
+    claude: false                            # v1.5 Plan: claude.ai disabled by default
+
 safety:
-  max_actions_per_task: 40
+  max_actions_per_task: 15                   # v1.5 Plan: tightened from 40 to 15
   dry_run_over: 3
   killswitch: "ctrl+alt+shift+esc"
   allowed_roots:
-    - "C:\\Thought\\Projects\\LORA"
     - "C:\\Users"
   safe_extensions:
     - ".pdf"

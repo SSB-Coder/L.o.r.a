@@ -21,11 +21,11 @@ class VoiceActivityDetector:
     def __init__(
         self,
         sample_rate: int = 16000,
-        threshold: float = 0.35,
+        threshold: float = 0.30,
         silence_duration_seconds: float = 0.6,
-        min_speech_duration_seconds: float = 0.25,
+        min_speech_duration_seconds: float = 0.16,
         onnx_model_path: str | None = None,
-        preroll_chunks: int = 10,
+        preroll_chunks: int = 16,  # ~512ms pre-roll at 512 samples / 16kHz (v1.5 Plan)
     ) -> None:
         self.sample_rate = sample_rate
         self.threshold = threshold
@@ -34,36 +34,50 @@ class VoiceActivityDetector:
         self.state = SpeechState.SILENCE
 
         self._session: Any = None
+        self._silero_vad: Any = None
         if onnx_model_path:
-            try:
-                import onnxruntime as ort
-                self._session = ort.InferenceSession(onnx_model_path)
-            except Exception:
-                self._session = None
+            if str(onnx_model_path).lower() in ("silero", "builtin", "faster-whisper", "auto"):
+                try:
+                    from faster_whisper.vad import get_vad_model
+                    self._silero_vad = get_vad_model()
+                except Exception:
+                    self._silero_vad = None
+            else:
+                try:
+                    import onnxruntime as ort
+                    self._session = ort.InferenceSession(onnx_model_path)
+                except Exception:
+                    self._session = None
 
         self._consecutive_speech_frames = 0
         self._consecutive_silence_frames = 0
         self._total_speech_samples = 0
         self._recorded_utterance_chunks: list[np.ndarray] = []
-        # Audio just before speech was detected, so the first syllable is not clipped.
+        # 500ms pre-roll ring buffer before speech onset so the first syllable ("Hey") is never clipped.
         self._preroll: deque[np.ndarray] = deque(maxlen=max(0, preroll_chunks))
 
     def compute_energy_prob(self, chunk: np.ndarray) -> float:
         """Heuristic fallback RMS energy-based voice activity score (0.0 to 1.0).
 
         Calibrated for standard laptop microphones (e.g., Realtek Audio):
-        - Ambient silence: ~0.001 - 0.006 RMS -> score 0.0
-        - Conversational speech: ~0.012 - 0.040 RMS -> score ~0.35 - 0.90
-        - Assertive / close speech: >= 0.050 RMS -> score 1.0
+        - Ambient silence: ~0.001 - 0.008 RMS -> score 0.0
+        - Conversational speech: ~0.015 - 0.035 RMS -> score ~0.30 - 0.95
+        - Assertive / close speech: >= 0.040 RMS -> score 1.0
         """
         if len(chunk) == 0:
             return 0.0
         rms = float(np.sqrt(np.mean(chunk**2)))
-        scaled = (rms - 0.006) / 0.020
+        scaled = (rms - 0.008) / 0.024
         return float(np.clip(scaled, 0.0, 1.0))
 
     def evaluate_chunk(self, chunk: np.ndarray) -> float:
         """Calculate speech probability for a single audio frame (typically 512 samples / 32ms)."""
+        if self._silero_vad is not None and len(chunk) == 512:
+            try:
+                probs = self._silero_vad(chunk)
+                return float(probs[0])
+            except Exception:
+                pass
         if self._session is not None:
             try:
                 # Prepare tensor for Silero VAD ONNX: shape (1, len(chunk))
@@ -96,12 +110,20 @@ class VoiceActivityDetector:
         else:
             self._consecutive_silence_frames += 1
             if self.state == SpeechState.SILENCE:
-                # Isolated clicks must not add up across seconds of silence.
-                self._consecutive_speech_frames = 0
-                self._total_speech_samples = 0
-                self._recorded_utterance_chunks.clear()
-                self._preroll.append(chunk)
-            if self.state == SpeechState.SPEAKING:
+                # If we already had >= 2 consecutive speech frames (e.g. "Hey" before "LORA"),
+                # tolerate a brief inter-syllable dip (up to 6 frames / ~192ms) without wiping the onset buffer.
+                # Isolated 1-frame clicks (_consecutive_speech_frames == 1) reset immediately.
+                if self._consecutive_speech_frames >= 2 and self._consecutive_silence_frames <= 6:
+                    self._recorded_utterance_chunks.append(chunk)
+                else:
+                    if self._recorded_utterance_chunks:
+                        for c in self._recorded_utterance_chunks:
+                            self._preroll.append(c)
+                        self._recorded_utterance_chunks.clear()
+                    self._consecutive_speech_frames = 0
+                    self._total_speech_samples = 0
+                    self._preroll.append(chunk)
+            elif self.state == SpeechState.SPEAKING:
                 self._recorded_utterance_chunks.append(chunk)
                 silence_elapsed = self._consecutive_silence_frames * chunk_duration
                 if silence_elapsed >= self.silence_duration_seconds:

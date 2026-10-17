@@ -27,6 +27,7 @@ from lora.agent.commands import (
     looks_like_url,
     note_title,
     parse_command,
+    parse_natural_intent_llm,
     quick_reply,
     resolve_folder,
 )
@@ -328,7 +329,10 @@ class AgentRuntime:
 
         try:
             if agents_dir and (_P(agents_dir) / "persona.md").is_file():
-                self.persona = (_P(agents_dir) / "persona.md").read_text(encoding="utf-8")[:2000].strip() or None
+                raw_p = (_P(agents_dir) / "persona.md").read_text(encoding="utf-8")[:2000].strip()
+                # Strip legacy "Think JARVIS to their Tony Stark" from any persisted persona.md
+                raw_p = re.sub(r"Think\s+JARVIS\s+to\s+their\s+Tony\s+Stark\s*:?\s*", "", raw_p, flags=re.IGNORECASE).strip()
+                self.persona = raw_p or None
             from lora.skills.loader import SkillLoader
 
             self.skills = SkillLoader(_P(skills_dir) if skills_dir else None, include_builtin=True)
@@ -419,6 +423,11 @@ class AgentRuntime:
                     return TurnResult(text=canned, kind="smalltalk")
 
             cmd = parse_command(q) if not attachments else None
+            if cmd is None and not attachments and self.allow_actions and decision.intent == "control" and not is_research(q):
+                cmd = await parse_natural_intent_llm(
+                    q,
+                    lambda msgs: self._collect(msgs, role="controller"),
+                )
             if cmd is not None and not self.allow_actions and cmd.kind not in ("rewrite_depth", "list_notebooks"):
                 msg = "That kind of request only works from the desktop app."
                 on_text(msg, True)
@@ -543,7 +552,10 @@ class AgentRuntime:
         chosen = model or plan.model
         opts = dict(plan.options)
         if options_override:
-            opts.update(options_override)
+            # Never override num_ctx to a different value on the same model (prevents Ollama VRAM reload thrashing)
+            for k, v in options_override.items():
+                if k != "num_ctx" or "num_ctx" not in opts:
+                    opts[k] = v
         self.last_model_used = chosen
         logger.info("Model (%s): %s (options=%s think=%s)", role, chosen, opts, plan.think)
         text = ""
@@ -715,24 +727,28 @@ class AgentRuntime:
             from lora.agent.research import research as _research
 
             self._research_fn = _research
-        # Always use 8k-capped writer plan so 6 GB GPU never spills a 32k KV cache into system RAM
+        # Always use 8k-capped writer plan with one fixed num_ctx=8192 across planner, writer, and verifier
         plan_pair = await self._plan(role="writer")
         on_status("Planning the search…")
         rplan: ResearchPlan = await make_plan(
-            lambda msgs: self._collect(msgs, plan_pair=plan_pair, role="planner", options_override={"num_ctx": 4096}),
+            lambda msgs: self._collect(msgs, plan_pair=plan_pair, role="planner"),
             q,
             self.history.messages(),
         )
         logger.info("Prompt engineer: %r -> question=%r queries=%s", q, rplan.question, rplan.queries)
         try:
-            takes_queries = "queries" in inspect.signature(self._research_fn).parameters
+            sig_params = inspect.signature(self._research_fn).parameters
+            takes_queries = "queries" in sig_params
+            takes_topic = "topic_type" in sig_params
         except (TypeError, ValueError):
             takes_queries = False
-        found = await (
-            self._research_fn(rplan.question, on_status, queries=rplan.queries)
-            if takes_queries
-            else self._research_fn(rplan.question, on_status)
-        )
+            takes_topic = False
+        r_kwargs: dict[str, Any] = {}
+        if takes_queries:
+            r_kwargs["queries"] = rplan.queries
+        if takes_topic and decision is not None:
+            r_kwargs["topic_type"] = decision.topic_type
+        found = await self._research_fn(rplan.question, on_status, **r_kwargs)
         self._check_abort()
         mine = await self._user_sources(rplan.question, start_index=len(found.sources) + 1)
         found.sources = list(found.sources) + mine
@@ -796,7 +812,6 @@ class AgentRuntime:
             return await self._collect(
                 build_revise_messages(rplan.question, found.prompt_block(), current, feedback),
                 plan_pair,
-                options_override={"num_ctx": 6144},
             )
 
         if not deep and ver.total and not ver.clean:
@@ -826,7 +841,6 @@ class AgentRuntime:
                         plan_pair,
                         model=judge,
                         keep_alive="5m",
-                        options_override={"num_ctx": 4096},
                     ),
                     timeout=25.0,
                 )
@@ -1460,6 +1474,13 @@ class AgentRuntime:
         service = cmd.args["service"]
         pretty = {"chatgpt": "ChatGPT", "claude": "Claude", "gemini": "Gemini", "perplexity": "Perplexity"}[service]
         raw_prompt = cmd.args["prompt"]
+        # v1.5 Plan §4.9: Tier 2 user confirmation before sending prompts to external web AIs
+        if self.confirm is not _deny:
+            preview = raw_prompt if len(raw_prompt) <= 240 else raw_prompt[:237] + "…"
+            if not await self.confirm(f"Send this prompt to {pretty}?\n\n{preview}"):
+                msg = f"Okay, I won't send anything to {pretty}."
+                on_text(msg, True)
+                return TurnResult(text=msg, kind="command")
         simple = is_simple_prompt(raw_prompt)
         on_status(f"Asking {pretty}…" if simple else f"Engineering prompt for {pretty}…")
         reg = self._get_registry()

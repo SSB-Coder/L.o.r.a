@@ -66,7 +66,9 @@ class VerifierLLM:
 
     def __init__(self, client: Any, model: str, options: dict[str, Any] | None = None, max_calls: int = 4) -> None:
         base_opts = dict(options or {})
-        base_opts["num_ctx"] = min(int(base_opts.get("num_ctx", 4096)), 4096)
+        # v1.5 Plan §3.3: Keep the model's exact num_ctx (8192) instead of shrinking to 4096,
+        # otherwise Ollama unloads and reloads the model in VRAM on every verification step!
+        base_opts["num_ctx"] = int(base_opts.get("num_ctx", 8192))
         base_opts["temperature"] = 0
         self.client, self.model, self.options = client, model, base_opts
         self.max_calls, self.calls = max_calls, 0
