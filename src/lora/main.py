@@ -11,9 +11,16 @@ import uvicorn
 from lora.config.manager import ConfigManager, LoraUserConfig
 from lora.gateway.server import create_gateway_app
 from lora.ui.audio_cues import AudioCueManager, SoundCue
-from lora.ui.hud import LoraDesktopHUD
-from lora.ui.tray import LoraSystemTray
-from lora.ui.widget import AmbientDropletWidget, WidgetState
+
+try:
+    from lora.ui.hud import LoraDesktopHUD
+    from lora.ui.tray import LoraSystemTray
+    from lora.ui.widget import AmbientDropletWidget, WidgetState
+except Exception:  # pragma: no cover - headless environment without PySide6
+    LoraDesktopHUD = None  # type: ignore[assignment,misc]
+    LoraSystemTray = None  # type: ignore[assignment,misc]
+    AmbientDropletWidget = None  # type: ignore[assignment,misc]
+    WidgetState = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger("lora")
 
@@ -459,6 +466,15 @@ def run_desktop_app(
     def on_query_submitted(query: str, depth: str = "") -> None:
         """Runs on the GUI thread. Starts one assistant turn in the background."""
         query = (query or "").strip()
+        depth_clean = (depth or "").strip().lower()
+        if depth_clean in ("quick", "standard", "deep", "deep_with_refinement"):
+            mode_override: str | None = depth_clean
+        elif depth_clean in ("eli5", "simple"):
+            mode_override = "standard"
+        elif depth_clean in ("detailed", "expert"):
+            mode_override = "deep"
+        else:
+            mode_override = None
         turn_attachments = list(getattr(hud, "pending_attachments", []) or [])
         hud.pending_attachments = []
         if not query and not turn_attachments:
@@ -516,7 +532,16 @@ def run_desktop_app(
 
             try:
                 turn_timeout = float(os.environ.get("LORA_TURN_TIMEOUT", "600.0"))
-                result = _run_coro(runtime.run_turn(query, on_status, on_text, attachments=turn_attachments or None), timeout=turn_timeout)
+                result = _run_coro(
+                    runtime.run_turn(
+                        query,
+                        on_status,
+                        on_text,
+                        mode=mode_override,
+                        attachments=turn_attachments or None,
+                    ),
+                    timeout=turn_timeout,
+                )
             except Exception as exc:
                 logger.exception("Turn crashed")
                 result = TurnResult(text="Something went wrong on my side. Try again in a moment.", kind="error", failure=str(exc))
@@ -640,7 +665,6 @@ def run_desktop_app(
                 onnx_model_path="silero",
                 preroll_chunks=16,
             )
-            threading.Thread(target=transcriber.preload, daemon=True).start()
 
             is_transcribing = threading.Event()
             is_ptt_active = threading.Event()
@@ -660,11 +684,39 @@ def run_desktop_app(
                     )
                     ui.post(lambda: hud.append_message("L.O.R.A", msg))
 
-            def _submit_voice_query(q: str) -> None:
+            def _is_low_stt_confidence(stt_res: object) -> bool:
+                if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+                    return False
+                low_flag = getattr(stt_res, "low_confidence", False)
+                if low_flag is True:
+                    return True
+                avg_lp = getattr(stt_res, "avg_logprob", 0.0)
+                if isinstance(avg_lp, (int, float)) and not isinstance(avg_lp, bool):
+                    return float(avg_lp) < -0.85
+                return False
+
+            def _submit_voice_query(q: str, low_confidence: bool = False) -> None:
                 """GUI thread."""
                 hud.append_message("You", q)
                 hud.set_input_text(q)
-                on_query_submitted(q, active_voice[0])
+                if low_confidence:
+                    from lora.agent.commands import parse_command
+
+                    maybe_cmd = parse_command(q)
+                    if maybe_cmd is not None or not runtime.laya_router.check_stt_plausible(q):
+                        from PySide6.QtWidgets import QMessageBox
+
+                        ans = QMessageBox.question(
+                            hud,
+                            "Confirm Voice Command",
+                            f"Low audio confidence — did you mean:\n\n\"{q}\"?",
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        )
+                        if ans != QMessageBox.StandardButton.Yes:
+                            hud.append_message("L.O.R.A", "Cancelled low-confidence voice command.")
+                            hud.set_voice_state("idle")
+                            return
+                on_query_submitted(q, getattr(hud, "_depth_mode", ""))
 
             def _trigger_transcription(audio_samples: np.ndarray) -> None:
                 if is_transcribing.is_set():
@@ -690,7 +742,8 @@ def run_desktop_app(
                         if query_text:
                             logger.info("Transcribed voice input: '%s' (conf=%.2f)", query_text, res.confidence)
                             submitted = True
-                            ui.post(lambda q=query_text: _submit_voice_query(q))
+                            is_low = _is_low_stt_confidence(res)
+                            ui.post(lambda q=query_text, lc=is_low: _submit_voice_query(q, low_confidence=lc))
                         else:
                             logger.info("No speech detected in audio segment.")
                             ui.post(lambda: hud.append_message("L.O.R.A", "I didn't catch that. Try again?"))
@@ -721,7 +774,8 @@ def run_desktop_app(
 
                         if not sleeping and time.monotonic() < armed_until[0]:
                             armed_until[0] = 0.0
-                            ui.post(lambda q=text: _submit_voice_query(q))
+                            is_low = _is_low_stt_confidence(res)
+                            ui.post(lambda q=text, lc=is_low: _submit_voice_query(q, low_confidence=lc))
                             return
 
                         wake = wakeword.evaluate_text(text, audio_clip, current_state=current_st)
@@ -735,14 +789,26 @@ def run_desktop_app(
                                 )
                             return
                         speech_cooldown_until[0] = time.monotonic() + 0.35
-                        audio.play_cue(SoundCue.WAKE)
+                        is_low = _is_low_stt_confidence(res)
                         if sleeping:
                             logger.info("Wake word detected while sleeping. Waking up.")
-                            ui.post(lambda: on_sleep_toggled(False))
+                            if wake.extracted_query:
+                                logger.info("Wake from sleep with trailing query: '%s'", wake.extracted_query)
+                                ui.post(
+                                    lambda q=wake.extracted_query, lc=is_low: (
+                                        on_sleep_toggled(False),
+                                        _submit_voice_query(q, low_confidence=lc),
+                                    )
+                                )
+                            else:
+                                armed_until[0] = time.monotonic() + ARM_SECONDS
+                                ui.post(lambda: (on_sleep_toggled(False), hud.set_voice_state("listening")))
                         elif wake.extracted_query:
+                            audio.play_cue(SoundCue.WAKE)
                             logger.info("Wake word with trailing query: '%s'", wake.extracted_query)
-                            ui.post(lambda q=wake.extracted_query: _submit_voice_query(q))
+                            ui.post(lambda q=wake.extracted_query, lc=is_low: _submit_voice_query(q, low_confidence=lc))
                         else:
+                            audio.play_cue(SoundCue.WAKE)
                             logger.info("Wake word detected. Listening for the query...")
                             armed_until[0] = time.monotonic() + ARM_SECONDS
                             ui.post(lambda: hud.set_voice_state("listening"))
@@ -902,6 +968,7 @@ def run_desktop_app(
 
     job_queue = JobQueue()
     ws_manager = ConnectionManager()
+    mobile_ws_manager = ConnectionManager()
     gateway_server = start_gateway_thread(
         host=args.host,
         port=args.port,
@@ -922,11 +989,18 @@ def run_desktop_app(
             notebook_db_path=Path(cfg_mgr.paths.user_profile_file).parent / "notebooks.db",
         )
 
+    async def _broadcast_by_origin(event: dict) -> None:
+        origin = str(event.get("origin", "mobile")).lower()
+        if origin == "desktop":
+            await ws_manager.broadcast(event)
+        else:
+            await mobile_ws_manager.broadcast(event)
+
     job_worker = JobWorker(
         job_queue,
         _make_job_runtime,
         desktop_busy=inflight.is_set,
-        broadcaster=ws_manager.broadcast,
+        broadcaster=_broadcast_by_origin,
     )
     job_worker.start()
 
@@ -955,7 +1029,7 @@ def run_desktop_app(
             origin="mobile",
             token_validator=TokenValidator(mobile_token=token),
             media_db=media_db,
-            connection_manager=ws_manager,
+            connection_manager=mobile_ws_manager,
         )
         if srv is not None:
             mobile_server_ref[0] = srv
@@ -1001,7 +1075,17 @@ def run_desktop_app(
         max(0, (screen_geo.width() - hud.width()) // 2),
         max(0, (screen_geo.height() - hud.height()) // 2),
     )
+    snap_x, snap_y = widget.calculate_snap_position(
+        screen_geo.width() - widget.width() - 24,
+        screen_geo.height() - widget.height() - 24,
+        screen_geo.width(),
+        screen_geo.height(),
+        screen_geo.left(),
+        screen_geo.top(),
+    )
+    widget.move(snap_x, snap_y)
     hud.show()
+    widget.show()
     tray.show()
     speech_cooldown_until[0] = time.monotonic() + 0.8
     audio.play_cue(SoundCue.WAKE)
@@ -1053,14 +1137,49 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg_mgr, user_cfg = init_platform(base_dir=args.config_dir)
 
+    if getattr(args, "offline", False) or getattr(user_cfg.security, "offline_only", False):
+        os.environ["LORA_OFFLINE"] = "1"
+        os.environ["LORA_VERIFY_OFFLINE"] = "1"
+        logger.info("Offline mode enabled (--offline / security.offline_only).")
+
     if args.headless:
+        from lora.agent.jobs import JobWorker
+        from lora.agent.runtime import AgentRuntime
+        from lora.dialogue import ConversationHistory
+        from lora.gateway.queue import JobQueue
+        from lora.gateway.ws import ConnectionManager
+        from lora.grounding.media_vector_db import MediaVectorDB
+
         logger.info("Starting L.O.R.A in headless daemon mode...")
-        server = start_gateway_thread(host=args.host, port=args.port)
+        h_queue = JobQueue()
+        h_ws = ConnectionManager()
+        h_media = MediaVectorDB()
+        h_worker = JobWorker(
+            h_queue,
+            lambda origin: AgentRuntime(
+                ollama_url=user_cfg.models.ollama_url,
+                user_default_model=user_cfg.models.default_model,
+                history=ConversationHistory(max_turns=4),
+                media_db=h_media,
+                allow_actions=(origin == "desktop"),
+                notebook_db_path=Path(cfg_mgr.paths.user_profile_file).parent / "notebooks.db",
+            ),
+            broadcaster=h_ws.broadcast,
+        )
+        h_worker.start()
+        server = start_gateway_thread(
+            host=args.host,
+            port=args.port,
+            queue=h_queue,
+            media_db=h_media,
+            connection_manager=h_ws,
+        )
         try:
             while server and not server.should_exit:
                 time.sleep(0.5)
         except KeyboardInterrupt:
             logger.info("Shutting down L.O.R.A headless daemon...")
+            h_worker.stop()
             if server is not None:
                 server.should_exit = True
         return 0

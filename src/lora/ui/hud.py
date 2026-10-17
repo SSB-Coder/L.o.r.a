@@ -109,7 +109,7 @@ class LoraDesktopHUD(QMainWindow):
         self.setMinimumSize(860, 580)
 
         self.media_db = media_db or MediaVectorDB()
-        self._depth_mode = "deep"
+        self._depth_mode = ""
         self._current_voice_state = "idle"
         self.status_label = _DummyLabel()
         self._last_level = 0.0
@@ -238,7 +238,7 @@ class LoraDesktopHUD(QMainWindow):
             self.exit_requested.emit()
         elif action == "on_rewrite":
             direction = payload.get("direction", 1)
-            depth = payload.get("depth", self._depth_mode)
+            depth = payload.get("depth") or self._depth_mode or "detailed"
             self.rewrite_requested.emit(direction, depth)
         elif action == "on_add_media_file":
             self._add_media_paths([str(payload.get("path", "")).strip()])

@@ -43,6 +43,7 @@ class JobWorker(threading.Thread):
         self._broadcaster = broadcaster
         self._stop_evt = threading.Event()
         self.processed = 0
+        self.checkpoints: dict[str, dict[str, Any]] = {}
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -101,7 +102,17 @@ class JobWorker(threading.Thread):
             return None
 
         try:
-            result = self._call(runtime.run_job(job.text, job.run_mode, should_abort))
+            sig = getattr(runtime.run_job, "__code__", None)
+            arg_names = sig.co_varnames if sig else ()
+            job_kwargs: dict[str, Any] = {}
+            if "notebook_id" in arg_names:
+                job_kwargs["notebook_id"] = job.notebook_id
+            if "depth" in arg_names:
+                job_kwargs["depth"] = job.depth
+            if "checkpoint" in arg_names and job.job_id in self.checkpoints:
+                job_kwargs["checkpoint"] = self.checkpoints[job.job_id]
+            result = self._call(runtime.run_job(job.text, job.run_mode, should_abort, **job_kwargs))
+            self.checkpoints.pop(job.job_id, None)
             done = dataclasses.replace(running, status=JobStatus.COMPLETED, result=result)
             logger.info("Job %s done in %.1fs (%s)", job.job_id, time.monotonic() - started, job.run_mode)
             if isinstance(result, dict):
@@ -130,6 +141,10 @@ class JobWorker(threading.Thread):
                 })
         except JobAborted as exc:
             if exc.reason == "preempted":  # yield to the desktop and run again afterwards
+                self.checkpoints[job.job_id] = {
+                    "last_sources": list(getattr(runtime, "last_raw_sources", []) or []),
+                    "last_question": getattr(runtime, "last_question", job.text),
+                }
                 self.queue.set_active_job(None)
                 try:
                     self._call(self.queue.enqueue(dataclasses.replace(job, status=JobStatus.QUEUED, preempt_requested=False)))

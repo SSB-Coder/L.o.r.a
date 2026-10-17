@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from lora.agent.notes import create_note
 from lora.grounding.media_vector_db import MediaVectorDB
-from lora.safety.gate import ActionGate, DataProvenance
+from lora.safety.gate import ActionGate, DataProvenance, has_untrusted_taint
 from lora.safety.policy import ActionRiskTier, PolicyEngine
 from lora.tools.browser.ask_ai import AskOtherAiTool
 from lora.tools.browser.driver import PlaywrightBrowserDriver
@@ -182,11 +182,11 @@ class ToolRegistry:
             parameters_schema={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
         )
 
-        # 12. Ask Other AI
+        # 12. Ask Other AI (Tier 2 external browser typing per Plan §4.3.1 & §5.1)
         self.register(
             name="ask_other_ai",
             description="Ask an external AI chatbot (ChatGPT, Claude, Gemini, Perplexity) a question via DOM automation with prompt engineering.",
-            tier=ActionRiskTier.TIER1,
+            tier=ActionRiskTier.TIER2,
             handler=self.ask_other_ai_tool.ask,
             parameters_schema={
                 "type": "object",
@@ -338,8 +338,7 @@ class ToolRegistry:
         try:
             # Pass provenance to ask_other_ai if expected
             if tool_name == "ask_other_ai" and provenance:
-                prov_val = provenance.get("provenance")
-                if prov_val == "untrusted":
+                if has_untrusted_taint(provenance):
                     params_dict["provenance"] = DataProvenance.UNTRUSTED
 
             res = tool.handler(**params_dict)
@@ -386,8 +385,7 @@ class ToolRegistry:
 
         try:
             if tool_name == "ask_other_ai" and provenance:
-                prov_val = provenance.get("provenance")
-                if prov_val == "untrusted":
+                if has_untrusted_taint(provenance):
                     params_dict["provenance"] = DataProvenance.UNTRUSTED
 
             res = tool.handler(**params_dict)

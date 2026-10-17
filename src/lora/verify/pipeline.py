@@ -200,6 +200,7 @@ class VerificationPipeline:
             len(atomic_claims),
         )
 
+        all_contradictions = self.v5_corroborate.detect_contradictions(cards)
         return VerificationReport(
             verdict=verdict,
             composite_faithfulness_score=float(composite_score),
@@ -207,5 +208,6 @@ class VerificationPipeline:
             claim_details=claim_details,
             repaired_answer=repaired_answer,
             unverified_claims=unverified_list,
+            contradictions=all_contradictions,
             requires_abstention=requires_abstain,
         )

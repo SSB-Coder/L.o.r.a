@@ -213,7 +213,14 @@ class ConfigManager:
             )
             return True
 
+        import getpass
+
         username = os.environ.get("USERNAME") or os.environ.get("USER")
+        if not username:
+            try:
+                username = getpass.getuser()
+            except Exception:
+                username = None
         if not username:
             logger.warning(
                 "USERNAME environment variable not found; skipping icacls."

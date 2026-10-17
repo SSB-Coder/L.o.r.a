@@ -299,7 +299,7 @@ def select_best_passages(full_text: str, query: str = "", max_chars: int = PAGE_
             try:
                 sess = SessionVectorIndex(session_id="page-rag", embedding_engine=embedder)
                 sess.add_chunks(chunks)
-                sem_hits = sess.search(query, top_k=min(6, len(chunks)))
+                sem_hits = sess.search_hybrid(query, top_k=min(6, len(chunks)))
                 cand_chunks = [c for c, _sc in sem_hits] or chunks[:6]
                 if reranker is not None and len(cand_chunks) > 2:
                     cand_chunks = reranker.rerank(query, cand_chunks, top_k=min(4, len(cand_chunks)))
@@ -391,6 +391,26 @@ async def research(
     async with async_client(HEADERS, httpx.Timeout(12.0, connect=6.0)) as client:
         status("Searching the web…")
         lists = [await web_search(q, client) for q in phrases]
+        if topic_type in ("scholarly", "biomedical", "physics_astro"):
+            try:
+                from lora.tools.web.search import WebSearchDispatcher
+
+                disp = WebSearchDispatcher()
+                conn_res = await disp.search(phrases[0], source="auto", limit=4)
+                conn_hits = [
+                    Source(
+                        id=f"S{idx + 1}",
+                        title=str(h.get("title", "")),
+                        url=str(h.get("url", "")),
+                        snippet=str(h.get("snippet", "")),
+                    )
+                    for idx, h in enumerate(conn_res.get("hits") or [])
+                    if h.get("url")
+                ]
+                if conn_hits:
+                    lists.append(conn_hits)
+            except Exception as exc:
+                logger.debug("Knowledge connector search skipped: %s", exc)
         hits: list[Source] = []
         seen_urls: set[str] = set()
         for i in range(max((len(x) for x in lists), default=0)):  # interleave so each query contributes its best hits

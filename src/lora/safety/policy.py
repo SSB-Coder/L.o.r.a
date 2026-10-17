@@ -160,8 +160,13 @@ class PolicyEngine:
         typing_domain_allowlist: list[str] | None = None,
     ) -> None:
         self.config: PolicyConfig | None = None
-        if config_path and Path(config_path).exists():
-            self.config = ConfigManager().load_policy(config_path)
+        default_policy_path = Path("config/policy.yaml")
+        resolved_cfg_path = config_path or (default_policy_path if default_policy_path.exists() else None)
+        if resolved_cfg_path and Path(resolved_cfg_path).exists():
+            try:
+                self.config = ConfigManager().load_policy(resolved_cfg_path)
+            except Exception:
+                self.config = None
 
         # Resolve allowed roots to absolute canonical paths
         roots = allowed_roots if allowed_roots is not None else self.DEFAULT_ALLOWED_ROOTS
@@ -184,10 +189,13 @@ class PolicyEngine:
         else:
             self.typing_domain_allowlist = [
                 "google.com",
+                "gemini.google.com",
                 "duckduckgo.com",
+                "perplexity.ai",
                 "chat.deepseek.com",
-                "claude.ai",
                 "chatgpt.com",
+                "chat.openai.com",
+                "claude.ai",
             ]
 
     def check_action(
@@ -386,9 +394,16 @@ class PolicyEngine:
                 rule_matched="blocked_extension",
             )
 
-        # Resolve path to canonical absolute path (expanding 8.3 short names and symlinks)
+        # Resolve path to canonical absolute path (expanding %VAR%, $VAR, ~, 8.3 short names, and symlinks)
         try:
-            expanded = os.path.expandvars(os.path.expanduser(path_str))
+            import re as _re
+
+            expanded = _re.sub(
+                r"%([^%]+)%",
+                lambda m: os.environ.get(m.group(1), m.group(0)),
+                path_str,
+            )
+            expanded = os.path.expandvars(os.path.expanduser(expanded))
             real_path = os.path.realpath(expanded)
             resolved = Path(real_path).resolve()
         except Exception as e:
@@ -401,10 +416,17 @@ class PolicyEngine:
 
         resolved_str = str(resolved).lower()
 
-        # Rule 5: Check protected operating system directories
+        # Rule 5: Check protected operating system directories (against both resolved and raw normalized path)
+        norm_raw = path_lower.replace("/", "\\")
         for sys_dir in self.PROTECTED_SYSTEM_DIRECTORIES:
             sys_clean = sys_dir.lower()
-            if resolved_str == sys_clean or resolved_str.startswith(sys_clean + "\\") or resolved_str.startswith(sys_clean + "/"):
+            if (
+                resolved_str == sys_clean
+                or resolved_str.startswith(sys_clean + "\\")
+                or resolved_str.startswith(sys_clean + "/")
+                or norm_raw == sys_clean
+                or norm_raw.startswith(sys_clean + "\\")
+            ):
                 return PolicyResult(
                     allowed=False,
                     verdict=PolicyVerdict.HARD_DENY,

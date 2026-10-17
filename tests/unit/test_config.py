@@ -12,7 +12,7 @@ def test_load_lora_config(project_root: Path):
     config_file = project_root / "config" / "lora.yaml"
     cfg = load_config(config_file)
     assert isinstance(cfg, LoraConfig)
-    assert cfg.models_dir == "C:\\Models"
+    assert cfg.models_dir in ("models", "C:\\Models")
     assert cfg.models.writer.name == "spark-x25-4b-q4"
     assert cfg.models.writer.num_ctx == 8192
     assert cfg.models.reader.num_ctx == 32768

@@ -54,6 +54,7 @@ class ActionGate:
         self.action_count = 0
         self.action_history: list[dict[str, Any]] = []
         self._lock = threading.Lock()
+        self.audit_db_path = "logs/audit.db"
 
     def reset_task(self) -> None:
         """Reset per-task counters for a new task session."""
@@ -73,6 +74,40 @@ class ActionGate:
                 res.allowed,
                 scrubbed,
             )
+            try:
+                import json as _json
+                import sqlite3 as _sqlite3
+                import uuid as _uuid
+                from datetime import UTC, datetime
+                from pathlib import Path as _P
+
+                db_file = _P(self.audit_db_path)
+                db_file.parent.mkdir(parents=True, exist_ok=True)
+                with _sqlite3.connect(str(db_file), timeout=2.0) as conn:
+                    conn.execute(
+                        "CREATE TABLE IF NOT EXISTS audit_log ("
+                        "id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, task_id TEXT NOT NULL, "
+                        "action TEXT NOT NULL, tool TEXT NOT NULL, tier INTEGER NOT NULL, "
+                        "args TEXT, gate_decision TEXT NOT NULL, result TEXT)"
+                    )
+                    conn.execute(
+                        "INSERT INTO audit_log (id, timestamp, task_id, action, tool, tier, args, gate_decision, result) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            str(_uuid.uuid4()),
+                            datetime.now(UTC).isoformat(),
+                            origin,
+                            f"{origin}:{tool}",
+                            tool,
+                            int(tier),
+                            _json.dumps(scrubbed if isinstance(scrubbed, dict) else {"raw": str(scrubbed)}),
+                            str(res.verdict),
+                            res.reason,
+                        ),
+                    )
+                    conn.commit()
+            except Exception:
+                pass
 
     def verify_and_gate(
         self,

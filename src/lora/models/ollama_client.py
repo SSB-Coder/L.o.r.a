@@ -149,7 +149,7 @@ class OllamaClient:
         from lora.models.selection import plan_chat
 
         target_model = model
-        options: dict[str, Any] = {"temperature": temperature, "num_ctx": 4096}
+        options: dict[str, Any] = {"temperature": temperature, "num_ctx": 8192}
         if not target_model:
             plan = await plan_chat(self, role="optimizer")
             if plan is None:
@@ -286,7 +286,7 @@ class OllamaClient:
         response_model: type[T],
         system_prompt: str | None = None,
         temperature: float = 0.0,
-        num_ctx: int = 4096,
+        num_ctx: int = 8192,
     ) -> T:
         """
         Generate structured output adhering to a Pydantic schema with automatic repair retry.

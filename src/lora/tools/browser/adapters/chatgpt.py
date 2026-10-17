@@ -3,8 +3,10 @@
 import asyncio
 from typing import Any
 
+from lora.tools.browser.adapters.base import ChatbotAdapter
 
-class ChatGPTAdapter:
+
+class ChatGPTAdapter(ChatbotAdapter):
     """DOM Adapter for ChatGPT (chatgpt.com) using Playwright role and CSS locators."""
 
     name = "chatgpt"

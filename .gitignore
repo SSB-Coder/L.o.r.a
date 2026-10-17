@@ -46,6 +46,10 @@ htmlcov/
 *.db-shm
 *.db-wal
 /outputs/
+.coverage
+.coverage.*
+htmlcov/
+scratch/
 
 # Secrets
 .env

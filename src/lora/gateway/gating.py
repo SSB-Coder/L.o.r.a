@@ -1,40 +1,60 @@
-"""Origin capability gating for L.O.R.A Gateway.
+"""Capability Gating by Origin for L.O.R.A Gateway."""
 
-Enforces that remote mobile clients have access STRICTLY to Tier 0 research tools.
-Local filesystem tools (read_file, list_dir, search_files, open_path) and desktop
-UI controls (open_app, list_windows, focus_window) are completely stripped from mobile
-execution graphs.
-"""
+from lora.safety.policy import ActionRiskTier, PolicyEngine, PolicyResult
 
-from __future__ import annotations
-
-# Strict allowlist of Tier 0 research tools permitted for mobile origin
-MOBILE_RESEARCH_TOOLS: frozenset[str] = frozenset({
+MOBILE_RESEARCH_TOOLS: set[str] = {
+    "web_search",
+    "fetch_page",
+    "pdf_fetch",
+    "knowledge_query",
+    "notebook_query",
+    "rewrite_depth",
+    # Legacy aliases kept for backwards-compatible tests
     "search_web",
     "fetch_pdf",
     "read_web_page",
-    "ask_other_ai",
-})
+}
 
-# Full tool set permitted for authenticated desktop listener
-DESKTOP_CONTROL_TOOLS: frozenset[str] = frozenset({
-    "search_web",
-    "fetch_pdf",
-    "read_web_page",
-    "ask_other_ai",
-    "read_file",
-    "list_dir",
-    "search_files",
-    "open_path",
+DESKTOP_CONTROL_TOOLS: set[str] = {
     "open_app",
     "open_url",
+    "open_path",
+    "list_dir",
+    "read_file",
+    "search_files",
     "focus_window",
     "list_windows",
-})
+    "ask_other_ai",
+    "create_note",
+    "create_artifact",
+    "generate_visual",
+    "browser_type",
+    "mouse_click",
+    "keyboard_press",
+    "export_report",
+}
 
 
-def get_allowed_tools_for_origin(origin: str) -> frozenset[str]:
-    """Return the set of tools accessible to a given connection origin."""
+class OriginCapabilityGate:
+    """Enforces origin-based capability boundaries (Mobile = Tier 0 research only; Desktop = full policy)."""
+
+    def __init__(self, policy_engine: PolicyEngine | None = None) -> None:
+        self.policy = policy_engine or PolicyEngine()
+
+    def evaluate(
+        self,
+        tool: str,
+        origin: str,
+        tier: int | ActionRiskTier = ActionRiskTier.TIER0,
+    ) -> PolicyResult:
+        """Evaluate whether the requested tool is permitted for the given origin."""
+        return self.policy.check_action(tool=tool, origin=origin, tier=tier)
+
+
+def get_allowed_tools_for_origin(origin: str) -> set[str]:
+    """Return the set of tool names permitted for the given listener origin."""
     if origin.lower() == "mobile":
-        return MOBILE_RESEARCH_TOOLS
-    return DESKTOP_CONTROL_TOOLS
+        return set(MOBILE_RESEARCH_TOOLS)
+    if origin.lower() == "desktop":
+        return MOBILE_RESEARCH_TOOLS | DESKTOP_CONTROL_TOOLS
+    return set()

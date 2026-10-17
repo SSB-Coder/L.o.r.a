@@ -114,19 +114,13 @@ class EgressFilter:
         except Exception:
             pass
 
-        # Standard IP
+        # Standard IP (IPv4 & IPv6)
         try:
             ip = ipaddress.ip_address(clean)
             if ip.is_loopback or ip.is_unspecified:
                 return True, f"Loopback IP '{clean}' is blocked."
-            if ip.is_private and (
-                str(ip).endswith(".1")
-                or str(ip).endswith(".254")
-                or str(ip).startswith("127.")
-                or str(ip).startswith("10.")
-                or str(ip).startswith("192.168.")
-            ):
-                return True, f"Internal gateway/private IP '{clean}' is blocked."
+            if ip.is_private or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+                return True, f"Internal/private/link-local IP '{clean}' is blocked."
         except ValueError:
             pass
 
@@ -137,9 +131,7 @@ class EgressFilter:
             ip_sock = ipaddress.ip_address(ip_str)
             if ip_sock.is_loopback or ip_sock.is_unspecified:
                 return True, f"Loopback IP '{ip_str}' is blocked."
-            if ip_sock.is_private and (
-                ip_str.endswith(".1") or ip_str.endswith(".254") or ip_str.startswith("127.")
-            ):
+            if ip_sock.is_private or ip_sock.is_link_local or ip_sock.is_multicast or ip_sock.is_reserved:
                 return True, f"Internal network address '{ip_str}' is blocked."
         except (OSError, ValueError):
             pass

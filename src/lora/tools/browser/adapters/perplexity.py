@@ -3,8 +3,10 @@
 import asyncio
 from typing import Any
 
+from lora.tools.browser.adapters.base import ChatbotAdapter
 
-class PerplexityAdapter:
+
+class PerplexityAdapter(ChatbotAdapter):
     """DOM Adapter for Perplexity AI (perplexity.ai) using Playwright role and CSS locators."""
 
     name = "perplexity"

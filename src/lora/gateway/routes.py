@@ -75,12 +75,14 @@ def create_gateway_router(
                 headers={"Retry-After": str(int(remaining))},
             )
 
-        # 3. Extract and validate token
+        # 3. Extract and validate token (support both FastAPI Header DI and raw request.headers)
+        auth_val = authorization or request.headers.get("authorization")
+        xlora_val = x_lora_token or request.headers.get("x-lora-token")
         token: str | None = None
-        if authorization and authorization.startswith("Bearer "):
-            token = authorization[7:].strip()
-        elif x_lora_token:
-            token = x_lora_token.strip()
+        if auth_val and auth_val.startswith("Bearer "):
+            token = auth_val[7:].strip()
+        elif xlora_val:
+            token = xlora_val.strip()
 
         if not token or not token_validator.validate_token(token, origin):
             ip_limiter.record_failure(client_ip)

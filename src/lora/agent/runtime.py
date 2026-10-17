@@ -485,15 +485,45 @@ class AgentRuntime:
                 result.meta.setdefault("laya_decision", decision.model_dump())
         return result
 
-    async def run_job(self, text: str, run_mode: str, should_abort: Callable[[], str | None]) -> dict[str, Any]:
+    async def run_job(
+        self,
+        text: str,
+        run_mode: str,
+        should_abort: Callable[[], str | None],
+        notebook_id: str | None = None,
+        depth: str | None = None,
+        checkpoint: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """A phone job: same pipeline, answer returned as data for GET /v1/jobs/{id}."""
         from lora.agent.jobs import JobAborted
 
         self._abort_exc = JobAborted
-        res = await self.run_turn(text, lambda _s: None, lambda _t, _sp=True: None, mode=run_mode, should_abort=should_abort)
+        if checkpoint and checkpoint.get("last_sources") and not self.last_raw_sources:
+            self.last_raw_sources = list(checkpoint["last_sources"])
+        if notebook_id and not self.last_raw_sources:
+            try:
+                from lora.storage.notebook import DEFAULT_NOTEBOOK_DB, NotebookStore
+
+                store = NotebookStore(db_path=self._notebook_db_path or DEFAULT_NOTEBOOK_DB)
+                await store.initialize()
+                nb = await store.get_notebook(notebook_id)
+                if nb is not None:
+                    self.last_answer = nb.answer
+                    self.last_question = nb.title
+                    self.last_raw_sources = [
+                        Source(id=c.card_id, title=c.title, url=c.source_url, text=c.exact_quote, snippet=c.claim_fact)
+                        for c in nb.cards
+                    ]
+            except Exception as exc:
+                logger.debug("Could not load notebook %s for job: %s", notebook_id, exc)
+        effective_mode = run_mode
+        if depth and depth.lower() in ("eli5", "simple", "standard", "detailed", "expert") and self.last_raw_sources and text.lower().startswith("rewrite"):
+            res = await self._do_rewrite_depth(depth, lambda _s: None, lambda _t, _sp=True: None)
+        else:
+            res = await self.run_turn(text, lambda _s: None, lambda _t, _sp=True: None, mode=effective_mode, should_abort=should_abort)
         if res.failure and res.kind == "error":
             raise RuntimeError(res.failure)
-        return {"answer": res.text, "sources": res.sources, "verification": res.meta, "kind": res.kind, "run_mode": run_mode}
+        return {"answer": res.text, "sources": res.sources, "verification": res.meta, "kind": res.kind, "run_mode": effective_mode}
 
     def _check_abort(self) -> None:
         from lora.safety.killswitch import KillSwitch
@@ -865,6 +895,63 @@ class AgentRuntime:
             if independent:
                 self._rewarm(client, plan)
             on_text(text, False)
+
+        # Run Supervisor Checkpoints (PlanReviewer, EvidenceReviewer, AnswerReviewer) and record in meta
+        try:
+            from lora.supervisor.checkpoints import AnswerReviewer, EvidenceReviewer, PlanReviewer
+            from lora.supervisor.state import EvidenceSummary, SupervisorState
+
+            sup_state = SupervisorState(
+                task_id="research-turn",
+                query=rplan.question,
+                origin="desktop" if self.allow_actions else "mobile",
+                evidence=EvidenceSummary(
+                    card_count=len(found.sources),
+                    independent_domains=len({s.domain for s in found.sources if s.domain}),
+                    has_t1_or_t2=True,
+                ),
+                draft_answer=text,
+                verification_score=ver.score,
+                unverified_claims=list(ver.unverified),
+            )
+            plan_rev = PlanReviewer().review(sup_state)
+            ev_rev = EvidenceReviewer().review(sup_state)
+            ans_rev = AnswerReviewer(threshold=0.80).review(sup_state)
+            meta["supervisor_checkpoints"] = {
+                "plan_approved": plan_rev.approved,
+                "evidence_sufficient": ev_rev.sufficient,
+                "answer_approved": ans_rev.approved,
+                "action": ans_rev.action,
+            }
+            if trace:
+                trace.record("supervisor", f"Checkpoints: plan={plan_rev.approved}, ev={ev_rev.sufficient}, ans={ans_rev.action}")
+        except Exception as exc:
+            logger.debug("Supervisor checkpoint review skipped: %s", exc)
+
+        # When run_mode == "deep_with_refinement", record PromptGenome lineage via GenomeRegistry
+        if run_mode == "deep_with_refinement":
+            try:
+                import tempfile as _tf
+                from lora.outer_loop.genome import GenomeRegistry, PromptGenome
+
+                g_reg = GenomeRegistry(Path(_tf.gettempdir()) / "lora_rsi_genomes.db")
+                active_genome = PromptGenome(
+                    system_prompt_base="You are L.O.R.A, a sovereign grounded research assistant.",
+                    refinement_rules=[
+                        "Every factual claim must carry an inline [S#] citation.",
+                        "Drop or qualify any statement not directly entailed by retrieved evidence.",
+                    ],
+                    writer_style="concise_academic",
+                    version=1 if ver.score >= baseline_score else 0,
+                )
+                g_hash = g_reg.save_genome(active_genome, parent_hash=None)
+                meta["rsi_genome"] = {
+                    "hash": g_hash,
+                    "version": active_genome.version,
+                    "net_improvement": round(ver.score - baseline_score, 4),
+                }
+            except Exception as exc:
+                logger.debug("RSI genome registration skipped: %s", exc)
 
         meta["verification_loop"] = build_verification_dropdown_meta(
             ver=ver,

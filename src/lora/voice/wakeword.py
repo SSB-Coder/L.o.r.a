@@ -172,8 +172,9 @@ class WakeWordDetector:
 
     SLEEP_KEYWORDS = (
         "awaken lora", "awaken laura", "awaken lola", "awaken lara", "awaken nora", "awaken flora",
-        "awaken lauren", "awaken lyra", "awaken aura", "awaken",
-        "wake up lora", "wake up laura", "wake up lola", "wake up lara", "wake up", "wake lora", "wake laura",
+        "awaken lauren", "awaken lyra", "awaken aura",
+        "wake up lora", "wake up laura", "wake up lola", "wake up lara", "wake lora", "wake laura",
+        "awaken", "wake up",
     )
     IDLE_KEYWORDS = (
         "hey lora", "hey laura", "hey lola", "hey lara", "hey nora", "hey dora", "hey flora", "hey clara",
@@ -182,6 +183,12 @@ class WakeWordDetector:
         "awaken lora", "awaken laura", "ok lora", "okay lora", "ok laura", "okay laura",
         "yo lora", "yo laura", "halo lora", "halo laura", "a lora", "a laura",
         "lora", "laura", "lorra",
+    )
+    _SLEEP_PHONETIC_RE = re.compile(
+        r"^\s*(?:awaken|wake(?:\s+up)?)[,.\s]+"
+        r"(?:lora|laura|lorra|lola|lara|nora|dora|flora|clara|lauren|lyra|aura)\b"
+        r"[,.:;!?\s]*(?P<rest>.*)$",
+        re.IGNORECASE,
     )
     _IDLE_PHONETIC_RE = re.compile(
         r"^\s*(?:(?:hey|hi|hello|yo|ok|okay|awaken|wake(?:\s+up)?|halo|aye)[,.\s]+)?"
@@ -204,7 +211,22 @@ class WakeWordDetector:
         txt_norm = re.sub(r"[,.;:!?]+", " ", txt)
         txt_norm = re.sub(r"\s+", " ", txt_norm).strip()
         if is_sleeping:
-            return any(kw in txt_norm for kw in self.SLEEP_KEYWORDS), ""
+            ms = self._SLEEP_PHONETIC_RE.match(raw_clean)
+            if ms:
+                return True, (ms.group("rest") or "").strip(" ,.:;!?")
+            for kw in self.SLEEP_KEYWORDS:
+                if kw in txt_norm:
+                    idx = txt_norm.find(kw)
+                    before_ok = idx == 0 or not txt_norm[idx - 1].isalnum()
+                    after_idx = idx + len(kw)
+                    after_ok = after_idx >= len(txt_norm) or not txt_norm[after_idx].isalnum()
+                    if before_ok and after_ok:
+                        after = txt_norm[after_idx:].strip(" ,.:;!?")
+                        # Bare 'awaken' or 'wake up' without 'lora' only triggers if standalone or followed by <4 words
+                        if kw in ("awaken", "wake up") and after and len(after.split()) > 4:
+                            continue
+                        return True, after
+            return False, ""
 
         m = self._IDLE_PHONETIC_RE.match(raw_clean)
         if m:

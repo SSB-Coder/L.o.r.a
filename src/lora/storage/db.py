@@ -6,7 +6,117 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import aiosqlite
+import sqlite3
+try:
+    import aiosqlite
+except ImportError:  # pragma: no cover - stdlib sqlite3 async wrapper fallback
+    import types as _types
+
+    class _FallbackCursor:
+        def __init__(self, cur: sqlite3.Cursor) -> None:
+            self._cur = cur
+
+        @property
+        def lastrowid(self) -> int | None:
+            return self._cur.lastrowid
+
+        @property
+        def rowcount(self) -> int:
+            return self._cur.rowcount
+
+        async def fetchone(self) -> Any:
+            return self._cur.fetchone()
+
+        async def fetchall(self) -> list[Any]:
+            return self._cur.fetchall()
+
+        async def close(self) -> None:
+            self._cur.close()
+
+        def __aiter__(self):
+            rows = list(self._cur.fetchall())
+            async def _gen():
+                for r in rows:
+                    yield r
+            return _gen()
+
+        async def __aenter__(self) -> "_FallbackCursor":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            self._cur.close()
+
+    class _FallbackExec:
+        def __init__(self, conn: sqlite3.Connection, sql: str, params: Any) -> None:
+            self._conn, self._sql, self._params = conn, sql, params
+            self._cur: _FallbackCursor | None = None
+
+        def _run(self) -> _FallbackCursor:
+            if self._cur is None:
+                self._cur = _FallbackCursor(self._conn.execute(self._sql, self._params))
+            return self._cur
+
+        def __await__(self):
+            async def _c():
+                return self._run()
+            return _c().__await__()
+
+        async def __aenter__(self) -> _FallbackCursor:
+            return self._run()
+
+        async def __aexit__(self, *args: Any) -> None:
+            if self._cur is not None:
+                await self._cur.close()
+
+    class _FallbackConn:
+        def __init__(self, path: str | Path) -> None:
+            self._path = str(path)
+            self._conn: sqlite3.Connection | None = None
+            self.row_factory: Any = None
+
+        def _ensure(self) -> sqlite3.Connection:
+            if self._conn is None:
+                self._conn = sqlite3.connect(self._path, check_same_thread=False)
+                if self.row_factory is not None:
+                    self._conn.row_factory = self.row_factory
+            return self._conn
+
+        def __setattr__(self, name: str, value: Any) -> None:
+            super().__setattr__(name, value)
+            if name == "row_factory" and getattr(self, "_conn", None) is not None:
+                self._conn.row_factory = value
+
+        def execute(self, sql: str, params: Any = ()) -> _FallbackExec:
+            return _FallbackExec(self._ensure(), sql, params)
+
+        async def executescript(self, script: str) -> _FallbackCursor:
+            return _FallbackCursor(self._ensure().executescript(script))
+
+        async def commit(self) -> None:
+            self._ensure().commit()
+
+        async def close(self) -> None:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+
+        def __await__(self):
+            async def _c():
+                self._ensure()
+                return self
+            return _c().__await__()
+
+        async def __aenter__(self) -> "_FallbackConn":
+            self._ensure()
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            await self.close()
+
+    aiosqlite = _types.ModuleType("aiosqlite")  # type: ignore
+    aiosqlite.Row = sqlite3.Row  # type: ignore
+    aiosqlite.Connection = _FallbackConn  # type: ignore
+    aiosqlite.connect = lambda db, **kw: _FallbackConn(db)  # type: ignore
 
 SCHEMA_SQL = """
 PRAGMA journal_mode = WAL;

@@ -25,6 +25,20 @@ def open_path(path: str | Path, policy_engine: PolicyEngine | None = None) -> di
             "message": f"Target path '{path}' does not exist.",
         }
 
+    # Plan §4.2.1: Guard against spreadsheet formula/DDE payload auto-execution in .csv/.tsv files
+    if target.is_file() and target.suffix.lower() in (".csv", ".tsv"):
+        try:
+            sample = target.read_text(encoding="utf-8", errors="ignore")[:8192]
+            import re as _re
+
+            if _re.search(r"(?:^|[,\t\r\n])\s*[=+\-@](?:cmd|powershell|wscript|mshta|rundll32|hyperlink)\b", sample, _re.IGNORECASE):
+                return {
+                    "status": "error",
+                    "message": f"Blocked opening '{target.name}' in external spreadsheet viewer: potentially unsafe formula/DDE payload detected.",
+                }
+        except Exception:
+            pass
+
     try:
         # os.startfile opens the file or directory in the default Windows application
         if hasattr(os, "startfile"):

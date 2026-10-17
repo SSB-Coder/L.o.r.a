@@ -3,8 +3,10 @@
 import asyncio
 from typing import Any
 
+from lora.tools.browser.adapters.base import ChatbotAdapter
 
-class GeminiAdapter:
+
+class GeminiAdapter(ChatbotAdapter):
     """DOM Adapter for Google Gemini (gemini.google.com) using Playwright role and CSS locators."""
 
     name = "gemini"

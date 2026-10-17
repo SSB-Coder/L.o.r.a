@@ -3,8 +3,10 @@
 import asyncio
 from typing import Any
 
+from lora.tools.browser.adapters.base import ChatbotAdapter
 
-class ClaudeAdapter:
+
+class ClaudeAdapter(ChatbotAdapter):
     """DOM Adapter for Claude (claude.ai) using Playwright role and CSS locators."""
 
     name = "claude"

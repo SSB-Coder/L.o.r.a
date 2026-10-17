@@ -261,3 +261,112 @@ async def test_diagnostics_reports_problems_with_fixes_and_no_model_names(tmp_pa
     assert "Browsing: I can't reach any search engine" in res.text
     assert "install_tts.ps1" in res.text and "microphone problem" in res.text
     assert "spark" not in res.text.lower()
+
+
+
+def test_v8_sleep_wakeword_word_boundaries_and_inline_query():
+    from lora.voice.wakeword import WakeWordDetector
+
+    det = WakeWordDetector()
+    # Words containing "awaken" as a substring must NOT false-trigger from sleep
+    matched_false, _ = det.match_text("The awakening of spring was loud", is_sleeping=True)
+    assert matched_false is False
+
+    # Saying "Awaken LORA, open Chrome" from sleep wakes and extracts the inline command
+    matched_true, inline_q = det.match_text("Awaken LORA, open Chrome", is_sleeping=True)
+    assert matched_true is True
+    assert inline_q == "open Chrome"
+
+
+def test_v8_ssrf_blocks_172_16_and_link_local_and_ipv6():
+    from lora.safety.egress import EgressFilter
+
+    ef = EgressFilter()
+    assert ef.check_egress("http://172.16.0.5:8080/admin").allowed is False
+    assert ef.check_egress("http://169.254.169.254/latest/meta-data/").allowed is False
+    assert ef.check_egress("http://[fe80::1]/").allowed is False
+    assert ef.check_egress("http://[fc00::1]/").allowed is False
+
+
+def test_v8_mobile_hud_media_routes_blocked(tmp_path):
+    from fastapi.testclient import TestClient
+    from lora.gateway.auth import TokenValidator
+    from lora.gateway.server import create_gateway_app
+
+    tv = TokenValidator(desktop_token="desk_tok", mobile_token="mob_tok")
+    mob_app = create_gateway_app(origin="mobile", token_validator=tv)
+    client = TestClient(mob_app, base_url="http://192.168.50.10:8765")
+
+    assert client.get("/api/hud/status").status_code == 401
+    assert client.get("/api/hud/status", headers={"Authorization": "Bearer mob_tok"}).status_code == 200
+    assert client.post("/api/hud/media/add", json={"path": "C:\\Users\\Public\\secret.txt"}, headers={"Authorization": "Bearer mob_tok"}).status_code == 403
+    assert client.get("/api/hud/media/list", headers={"Authorization": "Bearer mob_tok"}).status_code == 403
+    assert client.post("/api/hud/media/report", json={"query": "secret"}, headers={"Authorization": "Bearer mob_tok"}).status_code == 403
+
+
+def test_v8_hybrid_session_index_rrf_and_chunk_cap():
+    from lora.grounding.chunk import DocumentChunk
+    from lora.grounding.embed import EmbeddingEngine
+    from lora.grounding.session_index import SessionVectorIndex
+
+    eng = EmbeddingEngine(model_name_or_path="nonexistent_fallback_model")
+    idx = SessionVectorIndex(session_id="test-v8", embedding_engine=eng, max_chunks=16)
+    chunks = [
+        DocumentChunk(
+            chunk_id=f"c{i}",
+            text=f"Passage number {i} discussing quantum error correction surface codes and syndrome decoding.",
+            source_url="https://arxiv.org/abs/2401.00001",
+            title="Quantum Paper",
+            token_count=14,
+        )
+        for i in range(25)
+    ]
+    idx.add_chunks(chunks)
+    assert idx.chunk_count == 16
+    hybrid_hits = idx.search_hybrid("syndrome decoding surface codes", top_k=3)
+    assert len(hybrid_hits) == 3
+
+
+def test_v8_contradiction_detection_and_preprint_flag():
+    from lora.grounding.cards import EvidenceCard, EvidenceCardExtractor
+    from lora.grounding.chunk import DocumentChunk
+    from lora.verify.corroborate import CorroborationChecker
+
+    extractor = EvidenceCardExtractor()
+    cards = extractor.extract_cards([
+        DocumentChunk(
+            chunk_id="c1",
+            text="Room temperature superconductivity was observed in copper-substituted apatite samples.",
+            source_url="https://arxiv.org/abs/2307.12008",
+            title="Preprint Claim",
+            token_count=12,
+            tier=1,
+        )
+    ])
+    assert len(cards) == 1
+    assert cards[0].is_preprint is True
+    assert cards[0].reliability_tier == "T1-P"
+
+    c_neg = EvidenceCard(
+        card_id="S2",
+        claim_fact="Room temperature superconductivity was not observed in copper-substituted apatite samples.",
+        exact_quote="Room temperature superconductivity was not observed in copper-substituted apatite samples.",
+        source_url="https://nature.com/articles/s41586-023-06522",
+        title="Replication Study",
+        tier=1,
+    )
+    cor = CorroborationChecker().check_corroboration([cards[0], c_neg])
+    assert cor.is_corroborated is True
+    assert len(cor.contradictions) >= 1
+
+
+def test_v8_csv_formula_injection_blocked_in_open_path(tmp_path):
+    from lora.safety.policy import PolicyEngine
+    from lora.tools.files.paths import open_path
+
+    evil_csv = tmp_path / "payload.csv"
+    evil_csv.write_text("Name,Formula\nAlice,=cmd|'/c calc'!A0\n", encoding="utf-8")
+    policy = PolicyEngine(allowed_roots=[str(tmp_path)])
+    res = open_path(evil_csv, policy_engine=policy)
+    assert res["status"] == "error"
+    assert "formula" in res["message"].lower() or "dde" in res["message"].lower()

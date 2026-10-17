@@ -91,3 +91,31 @@ async def test_eval_conflicting_sources_handling():
     report = await pipeline.verify(answer_text=answer, cards=cards)
     assert report.verdict == VerificationVerdict.VERIFIED
     assert len(report.claim_details) >= 2
+
+
+@pytest.mark.asyncio
+async def test_eval_gold_100_claims_benchmark():
+    import json
+    from pathlib import Path
+    from lora.verify.nli import NliGroundednessChecker
+    from lora.verify.numbers import NumberEntityChecker
+
+    gold_path = Path(__file__).parent / "gold_claims_100.json"
+    items = json.loads(gold_path.read_text(encoding="utf-8"))
+    assert len(items) == 100
+
+    nli = NliGroundednessChecker(threshold=0.80)
+    num_checker = NumberEntityChecker()
+    correct = 0
+    for item in items:
+        premise = item["premise"]
+        claim = item["claim"]
+        expected = bool(item["expected_supported"])
+        num_res = num_checker.verify_numbers(premise=premise, claim=claim)
+        nli_res = nli.check_entailment(premise=premise, hypothesis=claim)
+        predicted = bool(num_res.is_valid and nli_res.is_entailed)
+        if predicted == expected:
+            correct += 1
+
+    accuracy = correct / len(items)
+    assert accuracy >= 0.92, f"Gold 100-claim accuracy {accuracy:.2%} below 92% Gate G3 target"

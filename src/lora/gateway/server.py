@@ -87,14 +87,31 @@ def create_gateway_app(
 
     media_db = media_db or MediaVectorDB()
 
+    def _check_mobile_hud_auth(request: Request) -> bool:
+        if origin.lower() != "mobile":
+            return True
+        auth_hdr = request.headers.get("authorization", "")
+        tok = auth_hdr[7:].strip() if auth_hdr.startswith("Bearer ") else request.headers.get("x-lora-token", "").strip()
+        return bool(tok and token_validator.validate_token(tok, "mobile"))
+
     @app.get("/api/hud/status")
-    async def get_hud_status():
+    async def get_hud_status(request: Request):
+        if not _check_mobile_hud_auth(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
         ollama = OllamaClient()
         online = await ollama.is_online()
         active_model = "unknown"
         if online:
             models = await ollama.list_models()
-            for cand in ("spark-x25-4b-32k:latest", "spark-x25-4b-8k:latest", "granite4.2:8b", "gemma4:e4b"):
+            for cand in (
+                "spark-x25-4b:latest",
+                "spark-x25-4b-8k:latest",
+                "spark-x25-4b-q4",
+                "granite4.2:8b",
+                "hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest",
+                "ornith-1.5:9b",
+                "gemma4:e4b",
+            ):
                 if any(m.get("name") == cand for m in models):
                     active_model = cand
                     break
@@ -109,24 +126,28 @@ def create_gateway_app(
         }
 
     @app.post("/api/hud/chat")
-    async def chat_with_hud(payload: HudChatPayload):
+    async def chat_with_hud(payload: HudChatPayload, request: Request):
+        if not _check_mobile_hud_auth(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
         query = payload.text.strip()
         if not query:
             return {"status": "error", "message": "Empty query"}
 
         ollama = OllamaClient()
         is_online = await ollama.is_online()
-        model_to_use = "spark-x25-4b-32k:latest"
+        model_to_use = "spark-x25-4b-8k:latest"
 
         if is_online:
             models = await ollama.list_models()
             available = [m.get("name", "") for m in models]
             for cand in (
-                "spark-x25-4b-32k:latest",
+                "spark-x25-4b:latest",
                 "spark-x25-4b-8k:latest",
+                "spark-x25-4b-q4",
                 "granite4.2:8b",
-                "gemma4:e4b",
+                "hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest",
                 "ornith-1.5:9b",
+                "gemma4:e4b",
             ):
                 if cand in available:
                     model_to_use = cand
@@ -173,11 +194,15 @@ def create_gateway_app(
         }
 
     @app.get("/api/hud/media/list")
-    async def list_media_files():
+    async def list_media_files(request: Request):
+        if origin.lower() == "mobile":
+            return JSONResponse({"detail": "Local media file listing is restricted to desktop."}, status_code=403)
         return {"status": "ok", "files": media_db.list_files()}
 
     @app.post("/api/hud/media/add")
-    async def add_media_file(payload: HudMediaAddPayload):
+    async def add_media_file(payload: HudMediaAddPayload, request: Request):
+        if origin.lower() == "mobile":
+            return JSONResponse({"detail": "Mobile origin cannot index local PC files."}, status_code=403)
         path_str = payload.path.strip()
         if not path_str:
             return {"status": "error", "message": "Missing path"}
@@ -185,7 +210,9 @@ def create_gateway_app(
         return {"status": "ok", "result": res, "files": media_db.list_files()}
 
     @app.post("/api/hud/media/remove")
-    async def remove_media_file(payload: HudMediaRemovePayload):
+    async def remove_media_file(payload: HudMediaRemovePayload, request: Request):
+        if origin.lower() == "mobile":
+            return JSONResponse({"detail": "Mobile origin cannot modify local PC media."}, status_code=403)
         path_or_id = payload.path_or_id.strip()
         if not path_or_id:
             return {"status": "error", "message": "Missing path or id"}
@@ -193,7 +220,9 @@ def create_gateway_app(
         return {"status": "ok", "result": res, "files": media_db.list_files()}
 
     @app.post("/api/hud/media/report")
-    async def report_on_media(payload: HudMediaReportPayload):
+    async def report_on_media(payload: HudMediaReportPayload, request: Request):
+        if origin.lower() == "mobile":
+            return JSONResponse({"detail": "Mobile origin cannot read local PC media."}, status_code=403)
         q = payload.query.strip()
         rep = media_db.report_on_media(query=q)
         return {"status": "ok", "report": rep}

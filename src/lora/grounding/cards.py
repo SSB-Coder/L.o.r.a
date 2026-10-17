@@ -21,6 +21,8 @@ class EvidenceCard(BaseModel):
     page_or_section: str = ""
     paragraph_index: int = 0
     tier: int = 2
+    is_preprint: bool = False
+    reliability_tier: str = "T2"
     timestamp: float = Field(default_factory=time.time)
 
 
@@ -60,6 +62,9 @@ class EvidenceCardExtractor:
                 else f"§ {chunk.paragraph_index + 1}"
             )
 
+            url_lower = (chunk.source_url or "").lower()
+            is_prep = any(d in url_lower for d in ("arxiv.org", "biorxiv.org", "medrxiv.org", "chemrxiv.org", "ssrn.com"))
+            rel_tier = "T1-P" if is_prep else f"T{chunk.tier}"
             cards.append(
                 EvidenceCard(
                     card_id=f"S{card_counter}",
@@ -70,6 +75,8 @@ class EvidenceCardExtractor:
                     page_or_section=section_ref,
                     paragraph_index=chunk.paragraph_index,
                     tier=chunk.tier,
+                    is_preprint=is_prep,
+                    reliability_tier=rel_tier,
                 )
             )
             card_counter += 1

@@ -48,4 +48,5 @@ class VerificationReport(BaseModel):
     claim_details: list[ClaimVerificationDetail]
     repaired_answer: str
     unverified_claims: list[str] = Field(default_factory=list)
+    contradictions: list[str] = Field(default_factory=list)
     requires_abstention: bool = False

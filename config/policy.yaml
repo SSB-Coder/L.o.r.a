@@ -61,7 +61,10 @@ allow_rules:
 
 typing_domain_allowlist:
   - "google.com"
+  - "gemini.google.com"
   - "duckduckgo.com"
+  - "perplexity.ai"
   - "chat.deepseek.com"
-  - "claude.ai"
   - "chatgpt.com"
+  - "chat.openai.com"
+  - "claude.ai"

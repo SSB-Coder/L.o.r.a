@@ -1,6 +1,10 @@
 import logging
 from enum import StrEnum
-from typing import override
+try:
+    from typing import override
+except ImportError:  # pragma: no cover - Python <3.12 fallback
+    def override(fn):  # type: ignore[misc]
+        return fn
 
 from PySide6.QtCore import QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (
