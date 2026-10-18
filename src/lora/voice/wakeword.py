@@ -196,6 +196,12 @@ class WakeWordDetector:
         r"[,.:;!?\s]*(?P<rest>.*)$",
         re.IGNORECASE,
     )
+    _STANDALONE_SLEEP_RE = re.compile(
+        r"^\s*(?:(?:(?:hey|hi|hello|ok|okay)[,.\s]+)?(?:lora|laura|lorra|lola|lara)[,.\s]+)?(?:please\s+)?"
+        r"(?:go\s+to\s+sleep|sleep\s+mode|sleep\s+now|stand\s*by|standby)"
+        r"(?:[,.\s]+(?:lora|laura|lorra|lola|lara|please|now|for\s+now))*[\s.!?]*$",
+        re.IGNORECASE,
+    )
 
     def match_text(self, text: str, is_sleeping: bool) -> tuple[bool, str]:
         """Check an already-transcribed utterance for the activation phrase.
@@ -227,6 +233,9 @@ class WakeWordDetector:
                             continue
                         return True, after
             return False, ""
+
+        if self._STANDALONE_SLEEP_RE.match(raw_clean):
+            return True, "go to sleep"
 
         m = self._IDLE_PHONETIC_RE.match(raw_clean)
         if m:

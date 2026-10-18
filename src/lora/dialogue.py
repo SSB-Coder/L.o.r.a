@@ -104,6 +104,17 @@ class ConversationHistory:
         self._messages.clear()
 
 
+def temporal_context(now: Any = None) -> str:
+    """Return ground-truth local date, time, and timezone to anchor LLM responses."""
+    from datetime import datetime
+
+    dt = (now or datetime.now()).astimezone()
+    tz = dt.tzname() or "Local"
+    h = dt.strftime("%I").lstrip("0") or "12"
+    m = dt.strftime("%M %p")
+    return f"Current local time: {dt.strftime('%A, %B %d, %Y')}, {h}:{m} ({tz})."
+
+
 def build_messages(
     query: str,
     history: ConversationHistory,
@@ -114,6 +125,7 @@ def build_messages(
     attachment_context: str = "",
 ) -> list[dict[str, Any]]:
     system = persona or PERSONA
+    system += f"\n\n{temporal_context()}"
     if addon:
         system += f"\n\nExtra instructions for this request:\n{addon[:1200]}"
     if profile_context:
@@ -138,6 +150,7 @@ def build_research_messages(
     use_concise = is_simple_question(query) if concise is None else concise
     rules = RESEARCH_RULES_CONCISE if use_concise else RESEARCH_RULES
     system = (persona or PERSONA) + "\n\n" + rules
+    system += f"\n\n{temporal_context()}"
     if addon:
         system += f"\n\nExtra instructions for this request:\n{addon[:1200]}"
     user = f"Question: {query}\n\nSources:\n{sources_block}"

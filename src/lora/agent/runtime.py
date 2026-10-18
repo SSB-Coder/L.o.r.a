@@ -1268,6 +1268,8 @@ class AgentRuntime:
             if callable(self.on_power_command):
                 self.on_power_command("sleep")
             text = "Going to sleep. Say \"Awaken LORA\" or tap the droplet when you need me."
+            on_text(text, True)
+            return TurnResult(text=text, kind="command", meta={"power_action": "sleep"})
         elif cmd.kind == "turn_off":
             text = "Shutting down L.O.R.A. Goodbye!"
             on_text(text, True)

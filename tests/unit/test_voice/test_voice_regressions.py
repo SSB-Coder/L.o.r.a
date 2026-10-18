@@ -170,3 +170,50 @@ def test_power_off_requires_explicit_lora_target():
     assert cmd is not None and cmd.kind == "turn_off"
     cmd2 = parse_command("shut down lora")
     assert cmd2 is not None and cmd2.kind == "turn_off"
+
+
+def test_sleep_command_parsing_and_variations():
+    """Ensure all spoken/written variations of 'go to sleep' trigger Command('sleep') and never fall into 'open'."""
+    sleep_phrases = [
+        "go to sleep",
+        "go to sleep lora",
+        "go to sleep, lora",
+        "go to sleep please",
+        "please go to sleep",
+        "Hey Lora, go to sleep",
+        "sleep mode",
+        "sleep lora",
+        "stand by",
+        "standby",
+        "stand by lora",
+        "standby lora",
+        "go to sleep for now",
+    ]
+    for phrase in sleep_phrases:
+        cmd = parse_command(phrase)
+        assert cmd is not None, f"Expected sleep command for {phrase!r}, got None"
+        assert cmd.kind == "sleep", f"Expected 'sleep' for {phrase!r}, got {cmd.kind!r}"
+
+    # Negative cases must NOT trigger sleep
+    negatives = [
+        "go to sleep early tonight",
+        "what is sleep apnea",
+        "open sleep calculator",
+        "i need more sleep",
+    ]
+    for phrase in negatives:
+        cmd = parse_command(phrase)
+        assert cmd is None or cmd.kind != "sleep", f"Negative phrase {phrase!r} should not trigger sleep"
+
+
+def test_sleep_wakeword_detection_from_idle():
+    """Ensure hands-free speech like 'go to sleep' or 'Hey LORA, go to sleep' is recognized from idle."""
+    det = WakeWordDetector(transcriber=None)
+    assert det.match_text("go to sleep", False) == (True, "go to sleep")
+    assert det.match_text("go to sleep lora", False) == (True, "go to sleep")
+    assert det.match_text("Hey Lora, go to sleep", False) == (True, "go to sleep")
+    assert det.match_text("sleep mode", False) == (True, "go to sleep")
+    assert det.match_text("standby", False) == (True, "go to sleep")
+    assert det.match_text("we should get lunch", False) == (False, "")
+    assert det.match_text("how much sleep do I need", False) == (False, "")
+

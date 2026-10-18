@@ -44,7 +44,8 @@ _REWRITE_DEPTH = re.compile(
     re.IGNORECASE,
 )
 _POWER_SLEEP = re.compile(
-    _POLITE + r"(?:go\s+to\s+sleep|sleep\s+mode|sleep\s+lora|stand\s*by\s+lora)[\s.!?]*$",
+    _POLITE + r"(?:go\s+to\s+sleep|sleep\s+mode|sleep\s+now|sleep\s+lora|stand\s*by(?:\s+lora|\s+laura|\s+mode)?|standby(?:\s+lora|\s+laura|\s+mode)?)"
+    r"(?:[, ]+(?:lora|laura|lara|lola|lorra|please|now|for now))*[\s.!?]*$",
     re.IGNORECASE,
 )
 # Require explicit "lora" or "shut down lora" / "exit lora" / "quit lora" / "turn off lora" so stray Whisper transcripts never exit the app
@@ -174,6 +175,16 @@ _GREETING = re.compile(
     re.IGNORECASE,
 )
 _THANKS = re.compile(r"^(?:thanks|thank you|thx|cheers|ty|nice one|great job|awesome|perfect)(?:\s+lora)?[\s,.!?]*$", re.IGNORECASE)
+_TIME_QUERY = re.compile(
+    _POLITE
+    + r"(?:what(?:\s+is|\x27s)?\s+(?:the\s+)?(?:current\s+)?time|what\s+time\s+is\s+it|tell\s+me\s+the\s+time|current\s+time|time\s+check)(?:\s+(?:right\s+now|now|currently|here))?[\s,.!?]*$",
+    re.IGNORECASE,
+)
+_DATE_QUERY = re.compile(
+    _POLITE
+    + r"(?:what(?:\s+is|\x27s)?\s+(?:the\s+date|today\x27s\s+date|the\s+date\s+today)|what\s+date\s+is\s+it|what\s+day\s+is\s+(?:it|today)|today\x27s\s+date|current\s+date)(?:\s+(?:today|now|currently))?[\s,.!?]*$",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -426,6 +437,12 @@ def quick_reply(text: str, now: datetime | None = None) -> str | None:
         )
     if _THANKS.match(q):
         return random.choice(["Anytime.", "Happy to help.", "You got it.", "Of course."])
+    if _TIME_QUERY.match(q):
+        h = now.strftime("%I").lstrip("0") or "12"
+        m = now.strftime("%M %p")
+        return f"It's {h}:{m}."
+    if _DATE_QUERY.match(q):
+        return f"Today is {now.strftime('%A, %B %d, %Y')}."
     return None
 
 

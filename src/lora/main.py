@@ -170,15 +170,17 @@ def run_desktop_app(
     is_exiting = threading.Event()
     speech_cooldown_until = [time.monotonic() + 1.0]  # ignore startup chime during initial 1.0s
 
-    def on_sleep_toggled(is_sleeping: bool) -> None:
+    def on_sleep_toggled(is_sleeping: bool, play_sound: bool = True) -> None:
         speech_cooldown_until[0] = time.monotonic() + 0.6
         if is_sleeping:
-            audio.play_cue(SoundCue.SLEEP)
+            if play_sound and hud._current_voice_state not in ("sleep", "sleeping"):
+                audio.play_cue(SoundCue.SLEEP)
             tray.update_state(WidgetState.SLEEPING)
             widget.set_state(WidgetState.SLEEPING)
             hud.set_voice_state("sleeping")
         else:
-            audio.play_cue(SoundCue.WAKE)
+            if play_sound and hud._current_voice_state in ("sleep", "sleeping"):
+                audio.play_cue(SoundCue.WAKE)
             tray.update_state(WidgetState.IDLE)
             widget.set_state(WidgetState.IDLE)
             hud.set_voice_state("idle")
@@ -324,7 +326,7 @@ def run_desktop_app(
             time.sleep(duration / num_steps)
         speech_cooldown_until[0] = time.monotonic() + 0.45
 
-    def make_streamer(turn_done: threading.Event):
+    def make_streamer(turn_done: threading.Event, is_sleep_turn: list[bool] | None = None):
         """A SpeechStreamer for one turn, or None when audio/voice is off."""
         if args.no_audio or not voice_enabled[0]:
             return None
@@ -332,7 +334,8 @@ def run_desktop_app(
 
         def _started() -> None:
             speech_active.set()
-            ui.post(lambda: (hud.set_voice_state("speaking"), widget.set_state(WidgetState.SPEAKING)))
+            if not (is_sleep_turn and is_sleep_turn[0]):
+                ui.post(lambda: (hud.set_voice_state("speaking"), widget.set_state(WidgetState.SPEAKING)))
 
         def _done(spoke: bool) -> None:
             speech_active.clear()
@@ -340,13 +343,25 @@ def run_desktop_app(
             if not spoke and turn_done.is_set():
                 logger.warning("Nothing was spoken (TTS produced no audio).")
             if turn_done.is_set():
-                ui.post(lambda: (
-                    hud.set_voice_state("idle"),
-                    widget.set_state(WidgetState.IDLE),
-                    hud.set_audio_level(0.0),
-                    widget.set_audio_level(0.0),
-                    audio.play_cue(SoundCue.COMPLETE) if spoke else None,
-                ))
+                is_sleeping = (
+                    (is_sleep_turn and is_sleep_turn[0])
+                    or hud._current_voice_state in ("sleep", "sleeping")
+                    or widget.state == WidgetState.SLEEPING
+                )
+                if is_sleeping:
+                    ui.post(lambda: (
+                        on_sleep_toggled(True, play_sound=False),
+                        hud.set_audio_level(0.0),
+                        widget.set_audio_level(0.0),
+                    ))
+                else:
+                    ui.post(lambda: (
+                        hud.set_voice_state("idle"),
+                        widget.set_state(WidgetState.IDLE),
+                        hud.set_audio_level(0.0),
+                        widget.set_audio_level(0.0),
+                        audio.play_cue(SoundCue.COMPLETE) if spoke else None,
+                    ))
 
         return SpeechStreamer(synth_sentence, play_chunk, on_start=_started, on_done=_done)
 
@@ -496,6 +511,8 @@ def run_desktop_app(
                 if fast_cmd is not None and fast_cmd.kind in ("open", "google", "site_search", "list_dir", "switch_model", "switch_voice", "switch_skill", "sleep"):
                     def _fast_worker() -> None:
                         try:
+                            if fast_cmd.kind == "sleep":
+                                stop_current_speech(update_ui=False)
                             res = _run_coro(runtime._run_command(fast_cmd, query, lambda _s: None, lambda _t, _sp=True: None), timeout=25.0)
                             if res and res.text:
                                 ui.post(lambda t=res.text: hud.append_message("L.O.R.A", t))
@@ -509,7 +526,13 @@ def run_desktop_app(
         inflight.set()
         inflight_since[0] = time.monotonic()
         last_query[0] = query
-        if hud._current_voice_state in ("sleep", "sleeping"):
+        turn_is_sleep = [False]
+        from lora.agent.commands import parse_command
+
+        incoming_cmd = parse_command(query) if not turn_attachments else None
+        if incoming_cmd is not None and incoming_cmd.kind == "sleep":
+            turn_is_sleep[0] = True
+        elif hud._current_voice_state in ("sleep", "sleeping"):
             on_sleep_toggled(False)
 
         stop_current_speech(update_ui=False)
@@ -520,7 +543,7 @@ def run_desktop_app(
 
         def _worker() -> None:
             started = time.monotonic()
-            streamer = make_streamer(turn_done)
+            streamer = make_streamer(turn_done, is_sleep_turn=turn_is_sleep)
             current_streamer[0] = streamer
             last_push = [0.0]
 
@@ -561,6 +584,9 @@ def run_desktop_app(
                 f", failure={result.failure}" if result.failure else "",
             )
 
+            if (getattr(result, "meta", None) and result.meta.get("power_action") == "sleep") or turn_is_sleep[0]:
+                turn_is_sleep[0] = True
+
             def _post() -> None:
                 try:
                     hud.present_answer(
@@ -568,6 +594,17 @@ def run_desktop_app(
                         meta=result.meta,
                     )
                     turn_done.set()
+                    if turn_is_sleep[0]:
+                        if streamer is None:
+                            on_sleep_toggled(True)
+                        else:
+                            spoken = result.spoken if result.spoken is not None else result.text
+                            if result.spoken is not None:
+                                streamer.feed(spoken)
+                            streamer.finish(spoken)
+                            if not streamer.has_pending:
+                                on_sleep_toggled(True)
+                        return
                     if streamer is None:
                         hud.set_voice_state("idle")
                         widget.set_state(WidgetState.IDLE)
@@ -809,7 +846,11 @@ def run_desktop_app(
                                 armed_until[0] = time.monotonic() + ARM_SECONDS
                                 ui.post(lambda: (on_sleep_toggled(False), hud.set_voice_state("listening")))
                         elif wake.extracted_query:
-                            audio.play_cue(SoundCue.WAKE)
+                            from lora.agent.commands import parse_command
+
+                            maybe_cmd = parse_command(wake.extracted_query)
+                            if maybe_cmd is None or maybe_cmd.kind != "sleep":
+                                audio.play_cue(SoundCue.WAKE)
                             logger.info("Wake word with trailing query: '%s'", wake.extracted_query)
                             ui.post(lambda q=wake.extracted_query, lc=is_low: _submit_voice_query(q, low_confidence=lc))
                         else:
