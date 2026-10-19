@@ -1,6 +1,6 @@
 # L.O.R.A Hardware, Model & Gate Benchmarks (v1.5)
 
-**Target Reference Hardware**: ASUS TUF Gaming F15 (`i7-13620H` 10C/16T, `16 GB DDR5-4800`, `NVIDIA RTX 4050 Laptop 6 GB GDDR6`, `Windows 11`)
+**Target Reference Hardware**: ACER ALG (`i5-13420H`, `16 GB DDR5-4800`, `NVIDIA RTX 3050 Laptop 6 GB GDDR6`, `Windows 11`)
 
 ---
 
