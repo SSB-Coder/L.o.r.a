@@ -11,7 +11,10 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import faiss
+try:
+    import faiss
+except (ImportError, OSError):
+    faiss = None
 import numpy as np
 
 from lora.grounding.chunk import DocumentChunk, DocumentChunker
@@ -62,7 +65,7 @@ class MediaVectorDB:
 
     def _init_index(self, dim: int) -> None:
         self._dimension = dim
-        self._index = faiss.IndexFlatIP(dim)
+        self._index = faiss.IndexFlatIP(dim) if faiss is not None else None
 
     def _extract_file_content(self, path: Path) -> tuple[str, list[tuple[int, str]], str]:
         """Extract text content and page/segment breakdown according to file type."""
@@ -300,8 +303,8 @@ class MediaVectorDB:
         self._chunks = remaining_chunks
 
         if self._dimension is not None:
-            self._index = faiss.IndexFlatIP(self._dimension)
-            if self._chunks:
+            self._index = faiss.IndexFlatIP(self._dimension) if faiss is not None else None
+            if self._chunks and self._index is not None:
                 texts = [c.text for c in self._chunks]
                 embeddings = self.embedding_engine.encode(texts)
                 self._index.add(embeddings)

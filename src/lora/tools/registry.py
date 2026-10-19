@@ -3,6 +3,7 @@
 import asyncio
 import concurrent.futures
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -11,6 +12,7 @@ from lora.agent.notes import create_note
 from lora.grounding.media_vector_db import MediaVectorDB
 from lora.safety.gate import ActionGate, DataProvenance, has_untrusted_taint
 from lora.safety.policy import ActionRiskTier, PolicyEngine
+from lora.storage.export import ReportExporter
 from lora.tools.browser.ask_ai import AskOtherAiTool
 from lora.tools.browser.driver import PlaywrightBrowserDriver
 from lora.tools.browser.pdf_fetcher import PdfFetcher
@@ -53,6 +55,7 @@ class ToolRegistry:
         self.pdf_fetcher = PdfFetcher()
         self.ask_other_ai_tool = AskOtherAiTool(driver=self.browser_driver)
         self.media_db = media_db or MediaVectorDB()
+        self.report_exporter = ReportExporter()
         self._register_built_in_tools()
 
     def register(
@@ -290,6 +293,45 @@ class ToolRegistry:
                 },
             },
         )
+
+        # 18. Export Report (Markdown & HTML styled reports in ~/LORA/outputs)
+        self.register(
+            name="export_report",
+            description="Export research notes, answers, or documents to formatted Markdown or dark-aqueous HTML in ~/LORA/outputs.",
+            tier=ActionRiskTier.TIER2,
+            handler=self._handle_export_report,
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Title of the report"},
+                    "content": {"type": "string", "description": "Markdown text content of the report"},
+                    "format": {"type": "string", "enum": ["markdown", "html", "both"], "default": "markdown"},
+                    "filename": {"type": "string", "description": "Optional custom filename without extension"},
+                },
+                "required": ["title", "content"],
+            },
+        )
+
+    def _handle_export_report(
+        self,
+        title: str,
+        content: str,
+        format: str = "markdown",
+        filename: str | None = None,
+    ) -> dict[str, Any]:
+        paths = []
+        fmt = (format or "markdown").lower()
+        if fmt in ("markdown", "md", "both"):
+            p_md = self.report_exporter.export_markdown(title=title, content=content, filename=filename)
+            paths.append(str(p_md))
+        if fmt in ("html", "both"):
+            p_html = self.report_exporter.export_html(title=title, markdown_content=content, filename=filename)
+            paths.append(str(p_html))
+        return {
+            "status": "success",
+            "message": f"Exported report '{title}' to {', '.join(paths)}",
+            "paths": paths,
+        }
 
     def list_tools(self) -> list[dict[str, Any]]:
         """List all available tools and their schema metadata."""

@@ -1295,6 +1295,22 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  * Port {port}:              IN USE / BOUND")
                 else:
                     print(f"  * Port {port}:              AVAILABLE")
+
+        print("\n  [Isolation & Firewall Audit]")
+        try:
+            from lora.tools.net_check import run_net_check
+
+            user_mobile_bind = (
+                getattr(args, "mobile_bind", None)
+                or (f"{lan_ip}:8765" if lan_ip != "127.0.0.1" else "192.168.50.10:8765")
+            )
+            audit = run_net_check(mobile_bind=user_mobile_bind)
+            for c in audit.checks:
+                status_tag = "[PASS]" if c.passed else "[WARN]"
+                print(f"  {status_tag:7} {c.name}: {c.details}")
+        except Exception as exc:
+            print(f"  [WARN]  Isolation audit skipped: {exc}")
+
         print("=" * 55 + "\n")
         return 0
 

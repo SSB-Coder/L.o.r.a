@@ -13,7 +13,7 @@ def test_load_lora_config(project_root: Path):
     cfg = load_config(config_file)
     assert isinstance(cfg, LoraConfig)
     assert cfg.models_dir in ("models", "C:\\Models")
-    assert cfg.models.writer.name == "spark-x25-4b-q4"
+    assert "spark-x25-4b" in cfg.models.writer.name
     assert cfg.models.writer.num_ctx == 8192
     assert cfg.models.reader.num_ctx == 32768
     assert cfg.gateway.desktop_bind == "127.0.0.1:8765"

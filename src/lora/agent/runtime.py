@@ -1345,6 +1345,8 @@ class AgentRuntime:
             text = await run_diagnostics(self)
         elif cmd.kind == "save_last":
             text = await self._do_save_last(cmd)
+        elif cmd.kind == "export_report":
+            text = await self._do_export_report(cmd)
         elif cmd.kind == "note":
             return await self._do_note(cmd, q, on_status, on_text)
         elif cmd.kind == "ask_ai":
@@ -1520,6 +1522,25 @@ class AgentRuntime:
             body += "\n\n## Sources\n" + "\n".join(f"- [{s['title']}]({s['url']})" for s in self.last_sources)
         res = await self._save(title, body, cmd.args["ext"])
         return f"Saved it to {res['path']}" if res.get("status") == "success" else self._failure_text(res, "save that")
+
+    async def _do_export_report(self, cmd: Command) -> str:
+        if not self.last_answer:
+            return "I don't have any research or answers to export yet — ask me a question first."
+        title = cmd.target or note_title("", self.last_question[:50] if self.last_question else "Research Report")
+        body = self.last_answer
+        if self.last_sources:
+            body += "\n\n## Sources\n" + "\n".join(f"- [{s['title']}]({s['url']})" for s in self.last_sources)
+        fmt = cmd.args.get("format", "markdown")
+        res = await self._tool("export_report", {
+            "title": title,
+            "content": body,
+            "format": fmt,
+        })
+        if res.get("status") == "success":
+            paths = res.get("paths", [])
+            paths_str = ", ".join(paths) if paths else "outputs folder"
+            return f"Exported report **{title}** to {paths_str}"
+        return self._failure_text(res, "export that report")
 
     async def _do_note(
         self, cmd: Command, q: str, on_status: Callable[[str], None], on_text: TextCb

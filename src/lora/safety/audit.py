@@ -4,11 +4,15 @@ Records all policy evaluations, gate decisions, and action attempts
 with automatic scrubbing of sensitive tokens, secrets, and personal information.
 """
 
+from __future__ import annotations
+
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from lora.core.logging import scrub_sensitive_data
-from lora.storage.db import DatabaseManager
+
+if TYPE_CHECKING:
+    from lora.storage.db import DatabaseManager
 
 logger = logging.getLogger("lora.safety.audit")
 

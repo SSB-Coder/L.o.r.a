@@ -62,6 +62,10 @@ _SAVE_LAST = re.compile(
     r"(?:to|in|into|as|to a|as a)?\s*(?:a\s+|an\s+)?(?P<kind>markdown|md|text|txt|note|file)?\b(?P<rest>.*)$",
     re.IGNORECASE | re.DOTALL,
 )
+_EXPORT_REPORT = re.compile(
+    _POLITE + r"(?:export|save)\s+(?:the\s+|this\s+|a\s+)?report(?:\s+(?:as|to|in)\s+(?P<fmt>html|markdown|md|both))?(?:\s+(?:called|named|titled)\s+(?P<title>.+?))?[\s.!?]*$",
+    re.IGNORECASE,
+)
 _NOTE_THAT = re.compile(
     _POLITE + r"(?:make|take|jot down)\s+(?:a\s+)?note\s+(?:of\s+)?(?:that|this|it)\b(?P<rest>.*)$", re.IGNORECASE
 )
@@ -383,6 +387,12 @@ def _parse(text: str) -> Command | None:
             query = m.group("q").strip().strip("\"'“”")
             if site and query:
                 return Command("site_search", target=site, args={"query": query})
+
+    m = _EXPORT_REPORT.match(q)
+    if m:
+        fmt = (m.group("fmt") or "markdown").lower()
+        title = (m.group("title") or "").strip()
+        return Command("export_report", target=title, args={"format": fmt})
 
     m = _NOTE_THAT.match(q)
     if m:

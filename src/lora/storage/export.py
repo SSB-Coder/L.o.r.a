@@ -1,18 +1,42 @@
 import datetime
 import html
 import logging
+import os
 import re
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
+def get_default_outputs_dir() -> Path:
+    env = os.environ.get("LORA_OUTPUTS_DIR")
+    if env:
+        return Path(env).expanduser().resolve()
+    home_dir = Path.home() / ".lora" / "outputs"
+    try:
+        home_dir.mkdir(parents=True, exist_ok=True)
+        test_file = home_dir / ".test_write"
+        test_file.touch()
+        test_file.unlink()
+        return home_dir
+    except (OSError, PermissionError):
+        cwd_dir = Path("outputs").resolve()
+        try:
+            cwd_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        return cwd_dir
+
+
 class ReportExporter:
     """Exports research notebooks and grounded answers to markdown or HTML documents."""
 
-    def __init__(self, outputs_dir: Path) -> None:
-        self._outputs_dir = outputs_dir
-        self._outputs_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, outputs_dir: Path | None = None) -> None:
+        self._outputs_dir = outputs_dir or get_default_outputs_dir()
+        try:
+            self._outputs_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
 
     @property
     def outputs_dir(self) -> Path:

@@ -6,10 +6,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import os
 import sqlite3
 try:
     import aiosqlite
+    _USE_FALLBACK = False
 except ImportError:  # pragma: no cover - stdlib sqlite3 async wrapper fallback
+    _USE_FALLBACK = True
+
+if _USE_FALLBACK:
     import types as _types
 
     class _FallbackCursor:
@@ -119,7 +124,6 @@ except ImportError:  # pragma: no cover - stdlib sqlite3 async wrapper fallback
     aiosqlite.connect = lambda db, **kw: _FallbackConn(db)  # type: ignore
 
 SCHEMA_SQL = """
-PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -221,6 +225,11 @@ class DatabaseManager:
     async def initialize(self) -> None:
         """Run initial schema migration and ensure WAL mode is active."""
         conn = await self.get_connection()
+        if os.environ.get("LORA_SQLITE_NO_WAL", "0") != "1":
+            try:
+                await conn.execute("PRAGMA journal_mode = WAL")
+            except Exception:
+                pass
         await conn.executescript(SCHEMA_SQL)
         await conn.commit()
 
