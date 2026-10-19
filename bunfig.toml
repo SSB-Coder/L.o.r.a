@@ -1,0 +1,5 @@
+[install]
+# Dependency policy: never resolve a version published less than 14 days ago (security fixes go through
+# Dependabot, which skips this wait). Applies to transitive packages too.
+minimumReleaseAge = 1209600
+exact = true

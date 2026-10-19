@@ -1,0 +1,390 @@
+:root {
+  --bg: #0b0f17;
+  --panel: #121826;
+  --line: #222b3d;
+  --text: #e6e9ef;
+  --muted: #8a93a6;
+  --accent: #6aa8ff;
+  --accent-2: #9b7bff;
+  --danger: #ff6b6b;
+  --radius: 14px;
+  color-scheme: dark;
+  font:
+    15px / 1.55 system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  height: 100dvh;
+  overflow: hidden;
+}
+#root {
+  height: 100%;
+}
+button,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+button {
+  cursor: pointer;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  border-radius: 10px;
+  padding: 0.45rem 0.8rem;
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+button.primary {
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  border: 0;
+  color: #0b0f17;
+  font-weight: 600;
+}
+button.icon {
+  background: none;
+  border: 0;
+  font-size: 1.1rem;
+  padding: 0.3rem 0.5rem;
+  opacity: 0.6;
+}
+button.icon.on {
+  opacity: 1;
+}
+button.link {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--accent);
+  font-size: 0.85em;
+}
+.muted {
+  color: var(--muted);
+}
+.center {
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 0.8rem;
+  height: 100%;
+  text-align: center;
+  padding: 2rem;
+}
+h1 {
+  margin: 0;
+  letter-spacing: 0.3em;
+  font-weight: 300;
+}
+
+.shell {
+  display: grid;
+  grid-template-columns: 270px 1fr;
+  height: 100%;
+}
+aside {
+  border-right: 1px solid var(--line);
+  padding: 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+  overflow-y: auto;
+  background: var(--panel);
+}
+aside nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+}
+aside nav button {
+  text-align: left;
+  border: 0;
+  background: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chat-item {
+  display: flex;
+  border-radius: 10px;
+}
+.chat-item.active {
+  background: var(--line);
+}
+.chat-item button:first-child {
+  flex: 1;
+  min-width: 0;
+}
+.chat-item .hide {
+  border: 0;
+  background: none;
+  color: var(--muted);
+  visibility: hidden;
+}
+.chat-item:hover .hide,
+.chat-item.active .hide {
+  visibility: visible;
+}
+aside details summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+.memory p {
+  margin: 0.4rem 0;
+  font-size: 0.9em;
+}
+.qr {
+  background: white;
+  border-radius: 10px;
+  padding: 6px;
+  margin: 0.5rem 0;
+  width: 180px;
+}
+
+.main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  height: 100%;
+}
+header {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--line);
+}
+header h2 {
+  flex: 1;
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+header select {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.3rem;
+  max-width: 40%;
+}
+header .menu {
+  display: none;
+}
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.2rem max(1rem, calc((100% - 820px) / 2));
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+.bubble {
+  border-radius: var(--radius);
+  padding: 0.7rem 0.95rem;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.bubble.user {
+  align-self: flex-end;
+  background: #1d2a44;
+  max-width: 85%;
+  white-space: pre-wrap;
+}
+.bubble.assistant {
+  background: transparent;
+  padding-left: 0;
+  padding-right: 0;
+}
+.markdown > :first-child {
+  margin-top: 0;
+}
+.markdown > :last-child {
+  margin-bottom: 0;
+}
+.markdown a {
+  color: var(--accent);
+}
+.markdown pre,
+.tool pre {
+  background: #0f1420;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.6rem;
+  overflow-x: auto;
+  font-size: 0.85em;
+}
+.markdown code {
+  font-size: 0.9em;
+}
+.markdown table {
+  border-collapse: collapse;
+}
+.markdown td,
+.markdown th {
+  border: 1px solid var(--line);
+  padding: 0.3rem 0.5rem;
+}
+.tool {
+  font-size: 0.88em;
+  margin-bottom: 0.4rem;
+}
+.tool summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+.tool pre {
+  max-height: 240px;
+  white-space: pre-wrap;
+}
+.note {
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.85em;
+  margin: 0;
+}
+.notice {
+  color: var(--muted);
+  font-size: 0.9em;
+}
+.notice.error {
+  color: var(--danger);
+}
+.dots::after {
+  content: "…";
+  animation: blink 1s infinite;
+  font-size: 1.4rem;
+}
+
+footer {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.6rem;
+  padding: 0.8rem max(1rem, calc((100% - 820px) / 2)) calc(0.8rem + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--line);
+}
+footer textarea {
+  flex: 1;
+  resize: none;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.65rem 0.9rem;
+  max-height: 40vh;
+  field-sizing: content;
+  outline: none;
+}
+footer textarea:focus {
+  border-color: var(--accent);
+}
+footer .stop {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+footer .mic {
+  border: 0;
+  background: none;
+  padding: 0;
+}
+
+/* The orb: a translucent droplet that breathes when idle, ripples when listening, swirls when thinking. */
+.orb {
+  --size: 120px;
+  width: var(--size);
+  height: var(--size);
+  border-radius: 50%;
+  display: inline-block;
+  position: relative;
+  background:
+    radial-gradient(circle at 35% 30%, rgba(255, 255, 255, 0.75), rgba(255, 255, 255, 0) 22%),
+    radial-gradient(circle at 60% 70%, rgba(155, 123, 255, 0.55), rgba(155, 123, 255, 0) 60%),
+    radial-gradient(circle at 50% 50%, rgba(106, 168, 255, 0.35), rgba(106, 168, 255, 0.08) 70%);
+  box-shadow:
+    inset 0 0 18px rgba(255, 255, 255, 0.15),
+    0 0 40px rgba(106, 168, 255, 0.25);
+  animation: breathe 4s ease-in-out infinite;
+}
+.orb.small {
+  --size: 40px;
+}
+.orb.listening {
+  animation: pulse 0.9s ease-in-out infinite;
+  box-shadow:
+    0 0 0 4px rgba(106, 168, 255, 0.35),
+    0 0 40px rgba(106, 168, 255, 0.6);
+}
+.orb.thinking {
+  animation: swirl 2.2s linear infinite;
+}
+.orb.speaking {
+  animation: speak 0.5s ease-in-out infinite alternate;
+}
+
+@keyframes breathe {
+  50% {
+    transform: scale(1.04);
+  }
+}
+@keyframes pulse {
+  50% {
+    transform: scale(1.12);
+  }
+}
+@keyframes swirl {
+  to {
+    transform: rotate(360deg);
+    filter: hue-rotate(60deg);
+  }
+}
+@keyframes speak {
+  to {
+    transform: scale(1.08, 0.95);
+  }
+}
+@keyframes blink {
+  50% {
+    opacity: 0.2;
+  }
+}
+
+@media (max-width: 760px) {
+  .shell {
+    grid-template-columns: 1fr;
+  }
+  aside {
+    position: fixed;
+    inset: 0 25% 0 0;
+    z-index: 2;
+    transform: translateX(-100%);
+    transition: transform 0.2s;
+  }
+  .menu-open aside {
+    transform: none;
+    box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0.5);
+  }
+  header .menu {
+    display: inline-block;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .orb {
+    /* biome-ignore lint/complexity/noImportantStyles: must beat every per-state animation */
+    animation: none !important;
+  }
+}

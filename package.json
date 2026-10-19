@@ -1,0 +1,36 @@
+{
+  "name": "lora",
+  "version": "0.2.0",
+  "description": "L.O.R.A — a local, durable research assistant on Ollama",
+  "type": "module",
+  "private": true,
+  "packageManager": "bun@1.4.2",
+  "scripts": {
+    "dev": "LORA_DEV=1 bun --hot src/main.ts --no-open",
+    "start": "bun src/main.ts",
+    "check": "biome check . && tsc --noEmit && bun test",
+    "fix": "biome check --write .",
+    "build": "bun scripts/build.ts"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "1.0.2",
+    "@earendil-works/pi-ai": "1.0.2",
+    "@earendil-works/pi-durable": "1.0.2",
+    "@effect/atom-react": "4.0.0",
+    "@effect/platform-bun": "4.0.0",
+    "@effect/platform-node-shared": "4.0.0",
+    "dompurify": "3.4.16",
+    "effect": "4.0.0",
+    "marked": "18.0.14",
+    "qrcode-generator": "2.0.4",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "@types/bun": "1.4.2",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "typescript": "7.0.2"
+  }
+}
