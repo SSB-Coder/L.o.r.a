@@ -33,10 +33,30 @@ _SHARED_RERANKER = None
 
 
 def _get_rag_components():
-    """Lazy-initialize shared EmbeddingEngine and CrossEncoderReranker for SessionVectorIndex chunk selection."""
+    """Lazy-initialize shared EmbeddingEngine and CrossEncoderReranker for SessionVectorIndex chunk selection.
+
+    On CPU-only environments without CUDA, running a 1.5GB embedding model across multiple web pages
+    blocks the event loop for minutes. We skip heavy neural RAG unless CUDA is present or
+    LORA_ENABLE_CPU_PAGE_RAG=1 is set, falling back to instant lexical/BM25 chunk selection.
+    """
     global _SHARED_EMBEDDER, _SHARED_RERANKER
     if _SHARED_EMBEDDER is None:
         try:
+            import os
+
+            enable_cpu = os.getenv("LORA_ENABLE_CPU_PAGE_RAG", "0").lower() in ("1", "true", "yes")
+            try:
+                import torch
+
+                has_cuda = torch.cuda.is_available()
+            except Exception:
+                has_cuda = False
+
+            if not has_cuda and not enable_cpu:
+                _SHARED_EMBEDDER = False
+                _SHARED_RERANKER = False
+                return None, None
+
             from lora.grounding.embed import EmbeddingEngine
             from lora.grounding.rerank import CrossEncoderReranker
 

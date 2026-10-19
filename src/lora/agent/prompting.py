@@ -8,16 +8,22 @@ the writer model rewrites it first, using the last turns of chat to resolve "it"
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
+logger = logging.getLogger(__name__)
+
 PLAN_SYSTEM = (
     "You rewrite a user's request for a web research assistant. The request may be misheard speech. "
-    "Reply with ONLY JSON: {\"question\": \"the request as one clear standalone question (resolve words like it, "
-    "that, they using the recent chat)\", \"queries\": [\"2 or 3 short web search queries, keywords only\"]}"
+    "CRITICAL: Always output in the EXACT same language as the user's spoken request (e.g. if the user spoke in English, "
+    "both the question and all search queries MUST be in English. NEVER translate into Chinese or any other language). "
+    "Reply with ONLY JSON: {\"question\": \"the request as one clear standalone question in the user's language (resolve words like it, "
+    "that, they using the recent chat)\", \"queries\": [\"2 or 3 short web search queries in the user's language, keywords only\"]}"
 )
 _JSON = re.compile(r"\{.*\}", re.DOTALL)
+_CJK = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 
 
 @dataclass
@@ -39,6 +45,17 @@ def parse_plan(raw: str, fallback: str) -> ResearchPlan:
     queries = [str(q).strip() for q in (data.get("queries") or []) if str(q).strip() and len(str(q)) < 120][:3]
     if not queries:
         queries = [question]
+
+    # Guard against bilingual models (like Spark-X/Qwen) hallucinating into Chinese when input is English
+    if not _CJK.search(fallback) and (_CJK.search(question) or any(_CJK.search(q) for q in queries)):
+        logger.warning(
+            "Prompt engineer hallucinated Chinese output for English request %r -> question=%r queries=%s; reverting to fallback",
+            fallback,
+            question,
+            queries,
+        )
+        return ResearchPlan(fallback, [fallback], engineered=False)
+
     return ResearchPlan(question[:300], queries, engineered=True)
 
 
