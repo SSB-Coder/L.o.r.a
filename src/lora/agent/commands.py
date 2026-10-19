@@ -177,7 +177,20 @@ _GREETING = re.compile(
 _THANKS = re.compile(r"^(?:thanks|thank you|thx|cheers|ty|nice one|great job|awesome|perfect)(?:\s+lora)?[\s,.!?]*$", re.IGNORECASE)
 _TIME_QUERY = re.compile(
     _POLITE
-    + r"(?:what(?:\s+is|\x27s)?\s+(?:the\s+)?(?:current\s+)?time|what\s+time\s+is\s+it|tell\s+me\s+the\s+time|current\s+time|time\s+check)(?:\s+(?:right\s+now|now|currently|here))?[\s,.!?]*$",
+    + r"(?:"
+    r"(?:what(?:\s+is|\x27s)?\s+(?:the\s+)?(?:current\s+)?time)|"
+    r"(?:what\s+time\s+(?:is\s+it|do\s+you\s+(?:have|see)))|"
+    r"(?:(?:can|could|do)\s+you\s+(?:see|know|have|tell(?:\s+me)?)\s+(?:what\s+time\s+it\s+is|(?:the\s+)?(?:current\s+)?time))|"
+    r"(?:tell\s+me\s+(?:the\s+)?time)|"
+    r"(?:check\s+(?:the\s+)?time)|"
+    r"(?:current\s+time)|"
+    r"(?:time\s+check)"
+    r")"
+    r"(?:\s+(?:right\s+now|now|currently|here|today))?[\s,.!?]*$",
+    re.IGNORECASE,
+)
+_TIME_OF_DAY_GREETING = re.compile(
+    _POLITE + r"(?:good\s+(?P<tod>morning|afternoon|evening|night))(?:\s+there)?(?:\s+lora)?[\s,.!?]*$",
     re.IGNORECASE,
 )
 _DATE_QUERY = re.compile(
@@ -421,22 +434,9 @@ def is_research(text: str) -> bool:
 
 
 def quick_reply(text: str, now: datetime | None = None) -> str | None:
-    """Instant canned answers for greetings/thanks so small talk never waits on a model."""
+    """Deterministic utility answers for clock and date; all greetings and conversational turns flow to the model."""
     q = normalize_speech(text)
     now = now or datetime.now()
-    if _GREETING.match(q):
-        hour = now.hour
-        part = "morning" if hour < 12 else "afternoon" if hour < 18 else "evening"
-        return random.choice(
-            [
-                f"Good {part}! What are we working on?",
-                "Hey! I'm here. What do you need?",
-                f"Good {part}. Ready when you are.",
-                "Hey there. What can I do for you?",
-            ]
-        )
-    if _THANKS.match(q):
-        return random.choice(["Anytime.", "Happy to help.", "You got it.", "Of course."])
     if _TIME_QUERY.match(q):
         h = now.strftime("%I").lstrip("0") or "12"
         m = now.strftime("%M %p")

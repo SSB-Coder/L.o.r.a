@@ -28,3 +28,22 @@ def test_build_messages_order_and_profile():
     msgs = build_messages("next?", h, profile_context="likes brevity")
     assert [m["role"] for m in msgs] == ["system", "user", "assistant", "user"]
     assert "likes brevity" in msgs[0]["content"] and msgs[-1]["content"] == "next?"
+
+
+def test_day_period_and_time_awareness():
+    from datetime import datetime
+    from lora.dialogue import day_period, time_awareness
+
+    # 1:50 AM is strictly middle of the night, not morning
+    assert day_period(1) == "middle of the night"
+    assert day_period(4) == "middle of the night"
+    # Morning begins at 5 AM
+    assert day_period(5) == "morning"
+    assert day_period(11) == "morning"
+    assert day_period(12) == "afternoon"
+
+    t_150am = datetime(2026, 10, 19, 1, 50)
+    awareness = time_awareness(t_150am)
+    assert "middle of the night" in awareness
+    assert "Morning is strictly 5:00 AM" in awareness
+

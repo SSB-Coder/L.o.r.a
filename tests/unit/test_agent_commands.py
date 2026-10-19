@@ -49,7 +49,11 @@ def test_research_detection(text):
 from datetime import datetime
 
 def test_quick_replies():
-    assert quick_reply("hello") and quick_reply("Hey LORA") and quick_reply("thanks")
+    # Greetings flow directly to the LLM so answers are never hardcoded or canned
+    assert quick_reply("hello") is None
+    assert quick_reply("Hey LORA") is None
+    assert quick_reply("good morning") is None
+    assert quick_reply("good evening") is None
     assert quick_reply("hello, can you explain gradient descent") is None
 
     t_fixed = datetime(2026, 10, 18, 23, 38)
