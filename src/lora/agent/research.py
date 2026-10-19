@@ -71,6 +71,7 @@ class Source:
 class ResearchResult:
     query: str
     sources: list[Source] = field(default_factory=list)
+    session_index: Any = None
 
     def prompt_block(self) -> str:
         parts = []
@@ -347,10 +348,35 @@ def select_best_passages(full_text: str, query: str = "", max_chars: int = PAGE_
 async def fetch_text(url: str, client: httpx.AsyncClient, query: str = "") -> str:
     if not _egress_ok(url):
         return ""
+
+    p_lower = url.lower()
+    if p_lower.endswith(".pdf") or "arxiv.org/pdf/" in p_lower:
+        try:
+            from lora.tools.browser.pdf_fetcher import PdfFetcher
+
+            pdf_res = await PdfFetcher().fetch_pdf(url)
+            if pdf_res.get("status") == "success" and pdf_res.get("content"):
+                return select_best_passages(pdf_res["content"], query=query, max_chars=PAGE_CHARS)
+        except Exception as exc:
+            logger.info("Direct PDF fetch failed for %s: %s", url, exc)
+            return ""
+
     try:
         async with client.stream("GET", url) as res:
-            ctype = res.headers.get("content-type", "")
-            if res.status_code != 200 or not any(t in ctype for t in ("html", "text/plain", "xml")):
+            ctype = res.headers.get("content-type", "").lower()
+            if res.status_code != 200:
+                return ""
+            if "application/pdf" in ctype:
+                try:
+                    from lora.tools.browser.pdf_fetcher import PdfFetcher
+
+                    pdf_res = await PdfFetcher().fetch_pdf(url)
+                    if pdf_res.get("status") == "success" and pdf_res.get("content"):
+                        return select_best_passages(pdf_res["content"], query=query, max_chars=PAGE_CHARS)
+                except Exception as exc:
+                    logger.info("PDF fetch via Content-Type failed for %s: %s", url, exc)
+                return ""
+            if not any(t in ctype for t in ("html", "text/plain", "xml")):
                 return ""
             buf = bytearray()
             async for chunk in res.aiter_bytes():
@@ -436,4 +462,23 @@ async def research(
         usable = [s for s in picked if len(s.text) >= 200 or s.snippet]
         for i, s in enumerate(usable, 1):
             s.id = f"S{i}"
-        return ResearchResult(query, usable)
+
+        # Accumulate chunks across all search results in SessionVectorIndex during research task
+        session_index = None
+        embedder, _ = _get_rag_components()
+        if embedder is not None and usable:
+            try:
+                import time as _time
+                from lora.grounding.chunk import DocumentChunker
+                from lora.grounding.session_index import SessionVectorIndex
+
+                chunker = DocumentChunker(target_chunk_tokens=180, overlap_tokens=25)
+                session_index = SessionVectorIndex(session_id=f"research-{int(_time.time())}", embedding_engine=embedder)
+                for s in usable:
+                    if s.text:
+                        s_chunks = chunker.chunk_text(s.text, source_url=s.url, title=s.title)
+                        session_index.add_chunks(s_chunks)
+            except Exception as exc:
+                logger.debug("Accumulating chunks in SessionVectorIndex failed: %s", exc)
+
+        return ResearchResult(query, usable, session_index=session_index)

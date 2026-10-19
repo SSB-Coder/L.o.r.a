@@ -12,9 +12,11 @@ class PushToTalkListener:
         self,
         on_activate: Callable[[], None] | None = None,
         on_deactivate: Callable[[], None] | None = None,
+        on_killswitch: Callable[[], None] | None = None,
     ) -> None:
         self.on_activate = on_activate
         self.on_deactivate = on_deactivate
+        self.on_killswitch = on_killswitch
         self.is_active = False
 
         self._current_keys: set[Any] = set()
@@ -43,6 +45,14 @@ class PushToTalkListener:
                     except Exception:
                         pass
 
+    def simulate_killswitch(self) -> None:
+        """Simulate emergency killswitch hotkey trigger (Ctrl+Alt+Shift+Esc)."""
+        if self.on_killswitch:
+            try:
+                self.on_killswitch()
+            except Exception:
+                pass
+
     def _is_hotkey_pressed(self) -> bool:
         """Check if Ctrl + Alt + Space combination is currently pressed."""
         from pynput import keyboard
@@ -59,9 +69,29 @@ class PushToTalkListener:
 
         return has_ctrl and has_alt and has_space
 
+    def _is_killswitch_pressed(self) -> bool:
+        """Check if Ctrl + Esc (or Ctrl + Alt + Shift + Esc) is currently pressed."""
+        from pynput import keyboard
+
+        has_ctrl = any(
+            k in self._current_keys
+            for k in [keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r]
+        )
+        has_esc = keyboard.Key.esc in self._current_keys
+
+        return has_ctrl and has_esc
+
     def _on_key_press(self, key: Any) -> None:
         with self._lock:
             self._current_keys.add(key)
+            if self._is_killswitch_pressed():
+                if self.on_killswitch:
+                    try:
+                        self.on_killswitch()
+                    except Exception:
+                        pass
+                return
+
             if self._is_hotkey_pressed() and not self.is_active:
                 self.is_active = True
                 if self.on_activate:

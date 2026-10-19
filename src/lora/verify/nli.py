@@ -3,6 +3,7 @@
 import logging
 import os
 import re
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -57,14 +58,24 @@ class NliGroundednessChecker:
         self._model_failed: bool = False
 
     def _load_model(self) -> Any:
-        if os.getenv("LORA_VERIFY_OFFLINE", "0") == "1" or os.getenv("LORA_VERIFY_NLI") != "1":
+        if os.getenv("LORA_VERIFY_OFFLINE", "0") == "1" or os.getenv("LORA_VERIFY_NLI", "1") == "0":
             return None
         if self._model is None and not self._model_failed:
+            p = Path(self.model_name)
+            is_local = p.exists()
             try:
                 from sentence_transformers import CrossEncoder
 
                 logger.info("Loading NLI groundedness model '%s' on %s", self.model_name, self.device)
-                self._model = CrossEncoder(self.model_name, device=self.device, trust_remote_code=True)
+                if is_local:
+                    self._model = CrossEncoder(str(p.resolve()), device=self.device, trust_remote_code=True, local_files_only=True)
+                else:
+                    # Online model id; try loading with local_files_only=True first to avoid hanging on network
+                    try:
+                        self._model = CrossEncoder(self.model_name, device=self.device, trust_remote_code=True, local_files_only=True)
+                    except Exception:
+                        self._model_failed = True
+                        return None
             except Exception as e:
                 logger.debug("NLI model load deferred/fallback: %s", e)
                 self._model_failed = True

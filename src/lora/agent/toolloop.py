@@ -220,6 +220,8 @@ class ToolLoop:
         escalated_model: str | None = None
         started_t = _time.monotonic()
         for step_idx in range(self.max_steps):
+            if hasattr(self.rt, "_check_abort"):
+                self.rt._check_abort()
             if (_time.monotonic() - started_t) > UNATTENDED_TIMEOUT_S:
                 return "Stopped multi-step execution after reaching the 3-minute unattended timeout."
             raw = await self.rt._collect(msgs, role="controller", model=escalated_model)

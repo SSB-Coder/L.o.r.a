@@ -53,6 +53,10 @@ _POWER_OFF = re.compile(
     _POLITE + r"(?:turn\s+off\s+lora|shut\s*down\s+lora|exit\s+lora|quit\s+lora|close\s+lora)[\s.!?]*$",
     re.IGNORECASE,
 )
+_STOP = re.compile(
+    _POLITE + r"(?:stop(?:\s+now|\s+everything|\s+all|\s+talking|\s+playing|\s+lora|\s+laura)?|cancel(?:\s+all|\s+everything)?|emergency\s+stop|abort|halt)[\s.!?]*$",
+    re.IGNORECASE,
+)
 _SAVE_LAST = re.compile(
     _POLITE + r"(?:save|put|store|write|export)\s+(?:that|this|it|the (?:answer|reply|response|above|last (?:answer|reply)))\s*"
     r"(?:to|in|into|as|to a|as a)?\s*(?:a\s+|an\s+)?(?P<kind>markdown|md|text|txt|note|file)?\b(?P<rest>.*)$",
@@ -310,6 +314,9 @@ def _parse(text: str) -> Command | None:
 
     if _POWER_OFF.match(q):
         return Command("turn_off")
+
+    if _STOP.match(q):
+        return Command("stop")
 
     m = _REWRITE_DEPTH.match(q)
     if m:

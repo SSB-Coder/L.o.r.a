@@ -100,6 +100,28 @@ class AppLauncher:
             "url": url,
         }
 
+    @staticmethod
+    def _find_windows_app_candidate(cmd: str) -> Path | None:
+        """Search typical Windows installation folders for apps not on system PATH."""
+        if sys.platform != "win32":
+            return None
+        target_name = Path(cmd).name.lower()
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        prog_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        prog_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        candidates = [
+            Path(local_app_data) / "Obsidian" / "Obsidian.exe",
+            Path(local_app_data) / "Programs" / "Obsidian" / "Obsidian.exe",
+            Path(prog_files) / "Xournal++" / "bin" / "xournalpp.exe",
+            Path(prog_files) / "Xournal++" / "xournalpp.exe",
+            Path(prog_files) / "OpenBoard" / "OpenBoard.exe",
+            Path(prog_files_x86) / "OpenBoard" / "OpenBoard.exe",
+        ]
+        for c in candidates:
+            if c.is_file() and c.name.lower() == target_name:
+                return c
+        return None
+
     def open_app(self, name: str) -> dict[str, Any]:
         """Launch an allowlisted desktop application."""
         app_info = self.resolve_app(name)
@@ -114,15 +136,21 @@ class AppLauncher:
             # shell=False to prevent shell injection
             try:
                 subprocess.Popen([command], shell=False)
-            except FileNotFoundError:
+            except (FileNotFoundError, OSError):
                 # 1) shutil.which honours PATHEXT, so the allowlisted "code" finds code.cmd.
-                # 2) Windows apps like chrome.exe live under "App Paths", which CreateProcess (Popen) ignores
-                #    but ShellExecute (os.startfile) honours. The name is allowlisted either way.
                 resolved = shutil.which(command)
                 if resolved:
                     subprocess.Popen([resolved], shell=False)
                 elif sys.platform == "win32":
-                    os.startfile(command)  # noqa: S606
+                    try:
+                        os.startfile(command)  # noqa: S606
+                    except Exception:
+                        # 3) Check typical Windows user & program installation directories
+                        candidate = self._find_windows_app_candidate(command)
+                        if candidate:
+                            subprocess.Popen([str(candidate)], shell=False)
+                        else:
+                            raise
                 else:
                     raise
             return {

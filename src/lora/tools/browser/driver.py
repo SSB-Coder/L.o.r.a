@@ -17,7 +17,12 @@ from lora.tools.browser.extractor import ContentExtractor
 class PlaywrightBrowserDriver:
     """Headless Chromium browser controller with ephemeral vs. persistent profile isolation and egress policy."""
 
-    DEFAULT_USER_DATA_DIR = Path("cache/browser_profile")
+    @staticmethod
+    def _default_user_data_dir() -> Path:
+        repo_root = Path(__file__).resolve().parents[4]
+        if (repo_root / "config").is_dir():
+            return repo_root / "cache" / "browser_profile"
+        return Path.home() / ".lora" / "cache" / "browser_profile"
 
     def __init__(
         self,
@@ -26,7 +31,7 @@ class PlaywrightBrowserDriver:
         egress_filter: EgressFilter | None = None,
         extractor: ContentExtractor | None = None,
     ) -> None:
-        self.user_data_dir = Path(user_data_dir) if user_data_dir else self.DEFAULT_USER_DATA_DIR
+        self.user_data_dir = Path(user_data_dir) if user_data_dir else self._default_user_data_dir()
         self.user_data_dir.mkdir(parents=True, exist_ok=True)
         self.headless = headless
         self.egress_filter = egress_filter or EgressFilter()

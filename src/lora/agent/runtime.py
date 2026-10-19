@@ -470,8 +470,9 @@ class AgentRuntime:
             msg = NO_MODELS if "no models" in str(exc) else ENGINE_DOWN
             return TurnResult(text=msg, kind="error", failure=msg)
         except Exception as exc:
-            if type(exc).__name__ == "JobAborted":
-                raise
+            if type(exc).__name__ == "JobAborted" or "JobAborted" in str(type(exc)):
+                logger.info("Turn cancelled by user stop: %s", exc)
+                return TurnResult(text="User stopped Task.", kind="command")
             logger.exception("Turn failed")
             msg = "Something went wrong on my side. Try that again in a moment."
             return TurnResult(text=msg, kind="error", failure=f"{type(exc).__name__}: {exc}")
@@ -605,6 +606,7 @@ class AgentRuntime:
         async for delta in client.stream_chat(
             chosen, messages, options=opts, think=plan.think, keep_alive=keep_alive or plan.keep_alive
         ):
+            self._check_abort()
             text += delta
         return strip_think(text)
 
@@ -628,6 +630,7 @@ class AgentRuntime:
                 async for delta in client.stream_chat(
                     chosen_model, messages, options=plan.options, think=plan.think, keep_alive=plan.keep_alive
                 ):
+                    self._check_abort()
                     answer += delta
                     shown = strip_think(answer, streaming=True)
                     if shown:
@@ -797,15 +800,19 @@ class AgentRuntime:
         found.sources = list(found.sources) + mine
         self.last_raw_sources = list(found.sources)
         if not found.sources:
-            on_status("I couldn't reach the web, answering from what I know…")
-            msgs = build_messages(
-                q + "\n\n(Note: web search returned nothing. Answer from your own knowledge and say it may be out of date.)",
-                self.history,
-                self._profile_fn(),
-                **self._persona_kwargs(q),
+            on_status("No verified sources found; abstaining from ungrounded answer.")
+            refusal = (
+                "I could not find verified sources to substantiate this query. "
+                "To prevent ungrounded claims or hallucinations, I am abstaining from generating an answer. "
+                "Please provide relevant reference documents or refine your search query."
             )
-            text = await self._stream(msgs, on_text)
-            return TurnResult(text=text, kind="chat")
+            on_text(refusal)
+            return TurnResult(
+                text=refusal,
+                sources=[],
+                kind="abstention",
+                meta={"verdict": "abstain", "score": 0.0, "reason": "empty_sources", "stages": []},
+            )
 
         client, plan = plan_pair
         sources_ui = [
@@ -873,7 +880,7 @@ class AgentRuntime:
             installed = await client.installed_models()
             judge, independent = pick_judge_model(installed, plan.model)
             on_status("Getting a second opinion…")
-            opinion_timeout = float(os.environ.get("LORA_OPINION_TIMEOUT", "75.0"))
+            opinion_timeout = float(os.environ.get("LORA_OPINION_TIMEOUT", "180.0"))
             judge_opts = {"num_ctx": 4096, "temperature": 0.2} if independent else {"temperature": 0.2}
             try:
                 raw = await asyncio.wait_for(
@@ -955,30 +962,29 @@ class AgentRuntime:
         except Exception as exc:
             logger.debug("Supervisor checkpoint review skipped: %s", exc)
 
-        # When run_mode == "deep_with_refinement", record PromptGenome lineage via GenomeRegistry
+        # When run_mode == "deep_with_refinement", run formal RSIEngine outer loop (PromptGenome evolution + rollback)
         if run_mode == "deep_with_refinement":
             try:
-                import tempfile as _tf
-                from lora.outer_loop.genome import GenomeRegistry, PromptGenome
-
-                g_reg = GenomeRegistry(Path(_tf.gettempdir()) / "lora_rsi_genomes.db")
-                active_genome = PromptGenome(
-                    system_prompt_base="You are L.O.R.A, a sovereign grounded research assistant.",
-                    refinement_rules=[
-                        "Every factual claim must carry an inline [S#] citation.",
-                        "Drop or qualify any statement not directly entailed by retrieved evidence.",
-                    ],
-                    writer_style="concise_academic",
-                    version=1 if ver.score >= baseline_score else 0,
+                on_status("Evolving prompts via outer loop refinement…")
+                rsi_res = await self.run_rsi_outer_loop(
+                    rplan.question,
+                    found.sources,
+                    max_iters=2,
                 )
-                g_hash = g_reg.save_genome(active_genome, parent_hash=None)
-                meta["rsi_genome"] = {
-                    "hash": g_hash,
-                    "version": active_genome.version,
-                    "net_improvement": round(ver.score - baseline_score, 4),
-                }
+                if rsi_res.get("best_answer") and rsi_res.get("best_score", 0.0) >= baseline_score:
+                    text = rsi_res["best_answer"]
+                    logger.info(
+                        "RSI outer loop adopted improved draft: baseline=%.2f best=%.2f net_improvement=%.2f (genome v%s)",
+                        rsi_res.get("baseline_score", 0.0),
+                        rsi_res.get("best_score", 0.0),
+                        rsi_res.get("net_improvement", 0.0),
+                        rsi_res.get("genome_version", 0),
+                    )
+                else:
+                    logger.info("RSI outer loop: candidate did not beat baseline; rolling back to initial draft.")
+                meta["rsi_outer_loop"] = rsi_res
             except Exception as exc:
-                logger.debug("RSI genome registration skipped: %s", exc)
+                logger.warning("RSI outer loop refinement skipped/failed: %s", exc)
 
         meta["verification_loop"] = build_verification_dropdown_meta(
             ver=ver,
@@ -1276,6 +1282,14 @@ class AgentRuntime:
             if callable(self.on_power_command):
                 self.on_power_command("turn_off")
             return TurnResult(text=text, kind="command")
+        elif cmd.kind == "stop":
+            from lora.safety.killswitch import KillSwitch
+            KillSwitch.get_global().trigger("Voice stop command")
+            if callable(self.on_power_command):
+                self.on_power_command("stop")
+            text = "Stopping active tasks and speech."
+            on_text(text, True)
+            return TurnResult(text=text, kind="command", meta={"action": "stop"})
         elif cmd.kind == "rewrite_depth":
             return await self._do_rewrite_depth(cmd.target, on_status, on_text, trace=trace)
         elif cmd.kind == "save_notebook":

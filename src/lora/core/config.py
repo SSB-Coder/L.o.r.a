@@ -104,11 +104,11 @@ class STTConfig(BaseModel):
 
 
 class TTSQualityConfig(BaseModel):
-    engine: str = "qwen3-tts"
-    model_path: str = "C:\\Models\\Qwen3-TTS-12Hz-1.7B-CustomVoice"
-    tokenizer_path: str = "C:\\Models\\Qwen3-TTS-Tokenizer-12Hz"
-    speaker: str = "Vivian"
-    dtype: str = "bfloat16"
+    engine: str = "kokoro-onnx"
+    model_path: str = "models/kokoro/kokoro-v1.0.onnx"
+    voices_path: str = "models/kokoro/voices-v1.0.bin"
+    speaker: str = "af_sky"
+    dtype: str = "float32"
     attn: str = "sdpa"
 
 
@@ -186,7 +186,7 @@ class ModelsConfig(BaseModel):
 class GroundingConfig(BaseModel):
     nli_fast: str = "vectara-hhem-2.1-open"
     nli_secondary: str = "minicheck"
-    embedder: str = "C:\\Models\\embeddinggemma-2"
+    embedder: str = "models/embeddinggemma-2"
     vector_store: str = "faiss"
     reranker: str = "bge-reranker-base"
 
@@ -209,14 +209,14 @@ class OuterLoopConfig(BaseModel):
 class SafetyConfig(BaseModel):
     max_actions_per_task: int = 40
     dry_run_over: int = 3
-    killswitch: str = "ctrl+alt+shift+esc"
+    killswitch: str = "ctrl+esc"
     allowed_roots: list[str] = Field(default_factory=list)
     safe_extensions: list[str] = Field(default_factory=list)
     blocked_extensions: list[str] = Field(default_factory=list)
 
 
 class LoraConfig(BaseModel):
-    models_dir: str = "C:\\Models"
+    models_dir: str = "models"
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
     decision: DecisionConfig = Field(default_factory=DecisionConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)

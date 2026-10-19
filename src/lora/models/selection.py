@@ -42,11 +42,12 @@ EXCLUDED_MODELS: tuple[str, ...] = (
 )
 
 DEFAULT_FALLBACKS: tuple[str, ...] = (
+    "spark-x25-4b-8k:latest",
+    "granite4.2:3b",
     "gemma4:e4b",
     "granite4.2:8b",
     QWYTHOS_MODEL,
     "ornith-1.5:9b",
-    "granite4.2:3b",
 )
 COMPLEX_PREFERENCE: tuple[str, ...] = (
     "granite4.2:8b",

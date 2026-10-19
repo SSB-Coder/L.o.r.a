@@ -72,10 +72,13 @@ class EmbeddingEngine:
                 from sentence_transformers import SentenceTransformer
 
                 logger.info("Loading embedding model from '%s' on %s", self.model_path, self.device)
+                kwargs = {"trust_remote_code": True}
+                if Path(self.model_path).exists():
+                    kwargs["local_files_only"] = True
                 self._model = SentenceTransformer(
                     str(self.model_path),
                     device=self.device,
-                    trust_remote_code=True,
+                    **kwargs,
                 )
             except Exception as e:
                 logger.warning(
@@ -121,6 +124,9 @@ class EmbeddingEngine:
         if self._use_fallback or model is None:
             return self._fallback_dim
         try:
-            return int(model.get_sentence_embedding_dimension())
+            fn = getattr(model, "get_embedding_dimension", None) or getattr(model, "get_sentence_embedding_dimension", None)
+            if fn is not None:
+                return int(fn())
+            return self._fallback_dim
         except Exception:
             return self._fallback_dim

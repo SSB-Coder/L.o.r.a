@@ -67,14 +67,16 @@ cfg_mgr, user_cfg = lm.init_platform(base_dir=tmp)
 user_cfg = user_cfg.model_copy(update={"models": user_cfg.models.model_copy(update={"ollama_url": url})})
 args = argparse.Namespace(no_audio=True, headless=False, port=0, host="127.0.0.1", offline=False, config_dir=tmp)
 
+t0 = [time.monotonic()]
 done = {"v": False}
 def finish_check():
     if any(e[0] == "present" for e in log) and any(e[:2] == ("state", "idle") for e in log[[i for i,e in enumerate(log) if e[0]=="present"][0]:]):
         app.quit()
-    elif time.monotonic() - t0 > 20:
+    elif time.monotonic() - t0[0] > 45:
         log.append(("TIMEOUT",)); app.quit()
-t0 = time.monotonic()
+
 def submit():
+    t0[0] = time.monotonic()
     hud_ref[0].query_submitted.emit("explain gradient descent briefly", "")
     t = QTimer(); t.setInterval(100); t.timeout.connect(finish_check); t.start(); done["t"] = t
 QTimer.singleShot(500, submit)

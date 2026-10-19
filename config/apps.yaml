@@ -36,6 +36,18 @@ applications:
     name: "File Explorer"
     command: "explorer.exe"
     aliases: ["files", "file manager"]
+  obsidian:
+    name: "Obsidian"
+    command: "Obsidian.exe"
+    aliases: ["obsidian", "graph book", "vault", "notes vault", "obsidian vault"]
+  xournal:
+    name: "Xournal++"
+    command: "xournalpp.exe"
+    aliases: ["xournal", "xournal++", "journal", "xournalpp"]
+  openboard:
+    name: "OpenBoard"
+    command: "OpenBoard.exe"
+    aliases: ["openboard", "open board", "the board", "board", "whiteboard"]
 
 # Web App Shortcuts: maps friendly web service names to URLs opened in default browser.
 web_apps:

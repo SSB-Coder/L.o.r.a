@@ -11,6 +11,7 @@ from typing import Any
 SENSITIVE_PATTERNS = [
     re.compile(r"(Bearer\s+)[A-Za-z0-9_\-\.]{8,}", re.IGNORECASE),
     re.compile(r"(LORA_TOKEN\s*=\s*)[A-Za-z0-9_\-\.]{8,}", re.IGNORECASE),
+    re.compile(r"([?&]token=)[A-Za-z0-9_\-\.]{8,}", re.IGNORECASE),
     re.compile(r"(api[_-]?key\s*[:=]\s*)[A-Za-z0-9_\-\.]{8,}", re.IGNORECASE),
     re.compile(r"(sk-[A-Za-z0-9_\-]{16,})", re.IGNORECASE),
 ]

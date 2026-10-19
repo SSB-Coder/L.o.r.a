@@ -25,43 +25,67 @@ except Exception:  # pragma: no cover - headless environment without PySide6
 logger = logging.getLogger("lora")
 
 
-def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="L.O.R.A - Layer Oriented Research Assistant (Native Desktop Platform)"
-    )
-    parser.add_argument(
+def _add_run_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
         "--config-dir",
         type=Path,
         default=None,
         help="Path to custom LORA config directory (default: ~/.lora)",
     )
-    parser.add_argument(
+    p.add_argument(
         "--port",
         type=int,
         default=8765,
         help="Gateway HTTP/WebSocket port (default: 8765)",
     )
-    parser.add_argument(
+    p.add_argument(
         "--host",
         type=str,
         default="127.0.0.1",
         help="Gateway bind host (default: 127.0.0.1)",
     )
-    parser.add_argument(
+    p.add_argument(
         "--headless",
         action="store_true",
         help="Run without desktop UI (Gateway daemon only)",
     )
-    parser.add_argument(
+    p.add_argument(
         "--no-audio",
         action="store_true",
         help="Disable microphone capture and TTS voice pipeline",
     )
-    parser.add_argument(
+    p.add_argument(
         "--offline",
         action="store_true",
         help="Force air-gapped offline research mode",
     )
+    p.add_argument(
+        "--mobile-bind",
+        default=None,
+        metavar="HOST:PORT",
+        help="Also listen for phone requests on this LAN address (token-protected). Off by default.",
+    )
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="L.O.R.A - Layer Oriented Research Assistant (Native Desktop Platform)"
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", help="LORA subcommands")
+
+    start_parser = subparsers.add_parser("start", help="Start L.O.R.A desktop HUD or daemon")
+    _add_run_arguments(start_parser)
+
+    subparsers.add_parser("stop", help="Send a stop trigger to active tasks")
+
+    net_parser = subparsers.add_parser("net-check", help="Verify LAN IP, Ollama status, and ports")
+    net_parser.add_argument("--ollama-url", default="http://127.0.0.1:11434", help="Ollama base URL")
+
+    enroll_parser = subparsers.add_parser("enroll", help="Calibrate voice profile for 'Awaken LORA'")
+    enroll_parser.add_argument("--speaker", default="owner", help="Speaker name")
+    enroll_parser.add_argument("--samples", type=int, default=5, help="Number of audio samples")
+
+    _add_run_arguments(parser)
     return parser
 
 
@@ -441,13 +465,33 @@ def run_desktop_app(
     )
     runtime.on_verification = lambda meta: ui.post(lambda m=dict(meta): hud.set_verification(m))
 
+    def _on_emergency_stop(reason: str = "User stop command") -> None:
+        from lora.safety.killswitch import KillSwitch
+
+        logger.info("Task stop triggered: %s", reason)
+        KillSwitch.get_global().trigger(reason)
+        stop_current_speech(update_ui=False)
+        if current_streamer[0] is not None:
+            try:
+                current_streamer[0].stop()
+            except Exception:
+                pass
+        inflight.clear()
+        ui.post(lambda: hud.append_message("System", "User stopped Task."))
+        ui.post(lambda: hud.set_engine_state("idle"))
+        ui.post(lambda: hud.set_voice_state("idle"))
+        ui.post(lambda: widget.set_state(WidgetState.IDLE))
+
     def _handle_power_cmd(action: str) -> None:
         if action == "sleep":
             ui.post(lambda: on_sleep_toggled(True))
         elif action == "turn_off":
             ui.post(on_exit)
+        elif action == "stop":
+            _on_emergency_stop("Voice stop command")
 
     runtime.on_power_command = _handle_power_cmd
+    widget.emergency_stop_requested.connect(lambda: _on_emergency_stop("Droplet widget emergency stop"))
 
     def _confirm_blocking(text: str) -> bool:
         """Ask the user (GUI thread dialog) and wait for the answer from the worker thread."""
@@ -475,7 +519,7 @@ def run_desktop_app(
     bg_loop = asyncio.new_event_loop()
     threading.Thread(target=bg_loop.run_forever, daemon=True, name="lora-async-loop").start()
 
-    def _run_coro(coro, timeout: float = 180.0):
+    def _run_coro(coro, timeout: float = 1800.0):
         fut = asyncio.run_coroutine_threadsafe(coro, bg_loop)
         return fut.result(timeout=timeout)
 
@@ -499,15 +543,21 @@ def run_desktop_app(
         hud.pending_attachments = []
         if not query and not turn_attachments:
             return
+        from lora.agent.commands import parse_command
+        from lora.safety.killswitch import KillSwitch
+
+        incoming_cmd = parse_command(query) if not turn_attachments else None
+        if incoming_cmd is not None and incoming_cmd.kind == "stop":
+            _on_emergency_stop("User stop command")
+            return
+
         if inflight.is_set():
             # Auto-recover if a previous turn has been stuck > 90s
             if inflight_since[0] > 0 and (time.monotonic() - inflight_since[0]) > 90.0:
                 logger.warning("Previous turn exceeded 90s lock window; clearing inflight flag.")
                 inflight.clear()
             else:
-                from lora.agent.commands import parse_command
-
-                fast_cmd = parse_command(query) if not turn_attachments else None
+                fast_cmd = incoming_cmd
                 if fast_cmd is not None and fast_cmd.kind in ("open", "google", "site_search", "list_dir", "switch_model", "switch_voice", "switch_skill", "sleep"):
                     def _fast_worker() -> None:
                         try:
@@ -523,13 +573,14 @@ def run_desktop_app(
                     return
                 logger.info("Ignoring query while another is still running: %r", query)
                 return
+
+        # Starting a new turn: reset kill switch so previous stop doesn't block it
+        KillSwitch.get_global().reset()
         inflight.set()
         inflight_since[0] = time.monotonic()
         last_query[0] = query
         turn_is_sleep = [False]
-        from lora.agent.commands import parse_command
 
-        incoming_cmd = parse_command(query) if not turn_attachments else None
         if incoming_cmd is not None and incoming_cmd.kind == "sleep":
             turn_is_sleep[0] = True
         elif hud._current_voice_state in ("sleep", "sleeping"):
@@ -551,6 +602,8 @@ def run_desktop_app(
                 ui.post(lambda t=text: hud.set_status(t))
 
             def on_text(full: str, speak: bool = True) -> None:
+                if KillSwitch.get_global().is_halted():
+                    return
                 now = time.monotonic()
                 if now - last_push[0] >= 0.06:
                     last_push[0] = now
@@ -559,7 +612,8 @@ def run_desktop_app(
                     streamer.feed(full)
 
             try:
-                turn_timeout = float(os.environ.get("LORA_TURN_TIMEOUT", "600.0"))
+                default_timeout = "1800.0" if mode_override in ("deep", "deep_with_refinement") else "1200.0"
+                turn_timeout = float(os.environ.get("LORA_TURN_TIMEOUT", default_timeout))
                 result = _run_coro(
                     runtime.run_turn(
                         query,
@@ -567,12 +621,24 @@ def run_desktop_app(
                         on_text,
                         mode=mode_override,
                         attachments=turn_attachments or None,
+                        should_abort=lambda: "User stopped Task" if KillSwitch.get_global().is_halted() else None,
                     ),
                     timeout=turn_timeout,
                 )
             except Exception as exc:
-                logger.exception("Turn crashed")
-                result = TurnResult(text="Something went wrong on my side. Try again in a moment.", kind="error", failure=str(exc))
+                if "abort" in str(exc).lower() or "halt" in str(exc).lower() or "stopped" in str(exc).lower():
+                    logger.info("Turn cancelled by user stop: %s", exc)
+                    result = TurnResult(text="User stopped Task.", kind="command")
+                elif isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+                    logger.warning("Turn exceeded timeout limit (%.1fs)", turn_timeout)
+                    result = TurnResult(
+                        text="The research task exceeded the allowed time limit. The background analysis took longer than expected—try breaking down the request into specific questions.",
+                        kind="error",
+                        failure="TimeoutError",
+                    )
+                else:
+                    logger.exception("Turn crashed")
+                    result = TurnResult(text="Something went wrong on my side. Try again in a moment.", kind="error", failure=str(exc))
             finally:
                 # Always release inflight even if the UI callback is delayed
                 inflight.clear()
@@ -958,7 +1024,11 @@ def run_desktop_app(
             try:
                 from lora.voice.hotkey import PushToTalkListener
 
-                hotkey = PushToTalkListener(on_activate=_on_ptt_down, on_deactivate=_on_ptt_up)
+                hotkey = PushToTalkListener(
+                    on_activate=_on_ptt_down,
+                    on_deactivate=_on_ptt_up,
+                    on_killswitch=lambda: _on_emergency_stop("Hotkey pressed (Ctrl+Esc)"),
+                )
                 hotkey.start()
             except Exception as e:
                 logger.warning("Global push-to-talk hotkey unavailable: %s", e)
@@ -1061,17 +1131,18 @@ def run_desktop_app(
         from lora.gateway.qr import generate_pairing_qr_terminal, get_pairing_url
 
         lan_ip = _detect_lan_ip()
-        target = bind_str or getattr(args, "mobile_bind", None) or "0.0.0.0:8766"
+        target = bind_str or getattr(args, "mobile_bind", None) or f"{lan_ip}:8766"
         m_host, _, m_port = target.rpartition(":")
         m_port_int = int(m_port or 8766)
-        display_ip = lan_ip if m_host in ("0.0.0.0", "") else m_host
+        bind_host = m_host or lan_ip
+        display_ip = lan_ip if bind_host in ("0.0.0.0", "") else bind_host
         token_file = Path(cfg_mgr.paths.user_profile_file).parent / "mobile_token.txt"
         token = os.environ.get("LORA_MOBILE_TOKEN") or (
             token_file.read_text(encoding="utf-8").strip() if token_file.exists() else _secrets.token_urlsafe(32)
         )
         token_file.write_text(token, encoding="utf-8")
         srv = start_gateway_thread(
-            m_host or "0.0.0.0",
+            bind_host,
             m_port_int,
             queue=job_queue,
             origin="mobile",
@@ -1084,10 +1155,14 @@ def run_desktop_app(
         url = get_pairing_url(display_ip, m_port_int, token)
         mobile_url_ref[0] = url
         try:
+            from lora.core.logging import scrub_sensitive_data
+
             qr_ascii = generate_pairing_qr_terminal(display_ip, m_port_int, token)
-            logger.info("Mobile gateway on %s\n%s", url, qr_ascii)
+            logger.info("Mobile gateway on %s\n%s", scrub_sensitive_data(url), qr_ascii)
         except Exception:
-            logger.info("Mobile gateway on %s (token saved in %s)", url, token_file)
+            from lora.core.logging import scrub_sensitive_data
+
+            logger.info("Mobile gateway on %s (token saved in %s)", scrub_sensitive_data(url), token_file)
         return url
 
     try:
@@ -1169,20 +1244,73 @@ def run_desktop_app(
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_argument_parser()
-    parser.add_argument(
-        "--mobile-bind",
-        default=None,
-        metavar="HOST:PORT",
-        help="Also listen for phone requests on this LAN address (token-protected). Off by default.",
-    )
     args = parser.parse_args(argv)
+
+    if getattr(args, "subcommand", None) == "stop":
+        from lora.safety.killswitch import KillSwitch
+
+        KillSwitch.get_global().trigger()
+        print("User stopped Task.")
+        return 0
+
+    if getattr(args, "subcommand", None) == "net-check":
+        import json
+        import socket
+        import sys
+        import urllib.request
+
+        if sys.platform == "win32":
+            try:
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+                sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+        print("\n[NET-CHECK] L.O.R.A Network & Service Diagnostic Check")
+        print("=" * 55)
+        lan_ip = _detect_lan_ip()
+        print(f"  * Private LAN IP:        {lan_ip}")
+        ollama_url = getattr(args, "ollama_url", "http://127.0.0.1:11434")
+        try:
+            req = urllib.request.Request(f"{ollama_url}/api/tags")
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode())
+                    models = [m.get("name") for m in data.get("models", [])]
+                    print(f"  * Ollama Service:        ONLINE ({len(models)} models available)")
+                    for m in models[:5]:
+                        print(f"      - {m}")
+                    if len(models) > 5:
+                        print(f"      ... and {len(models) - 5} more")
+                else:
+                    print(f"  * Ollama Service:        HTTP {resp.status}")
+        except Exception as exc:
+            print(f"  * Ollama Service:        OFFLINE ({exc})")
+
+        for port in (8765, 8766):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                res = s.connect_ex(("127.0.0.1", port))
+                if res == 0:
+                    print(f"  * Port {port}:              IN USE / BOUND")
+                else:
+                    print(f"  * Port {port}:              AVAILABLE")
+        print("=" * 55 + "\n")
+        return 0
+
+    if getattr(args, "subcommand", None) == "enroll":
+        from lora.voice.enroll import EnrollmentSession
+
+        session = EnrollmentSession(samples_needed=getattr(args, "samples", 5))
+        session.run_interactive(speaker_name=getattr(args, "speaker", "owner"))
+        return 0
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    cfg_mgr, user_cfg = init_platform(base_dir=args.config_dir)
+    cfg_mgr, user_cfg = init_platform(base_dir=getattr(args, "config_dir", None))
 
     if getattr(args, "offline", False) or getattr(user_cfg.security, "offline_only", False):
         os.environ["LORA_OFFLINE"] = "1"

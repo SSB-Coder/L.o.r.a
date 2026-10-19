@@ -34,6 +34,7 @@ class AmbientDropletWidget(QWidget):
     hud_requested = Signal()
     sleep_toggled = Signal(bool)
     state_changed = Signal(str)
+    emergency_stop_requested = Signal()
 
     def __init__(
         self,
@@ -242,6 +243,7 @@ class AmbientDropletWidget(QWidget):
         """)
         open_hud_action = menu.addAction("Open HUD")
         toggle_sleep_action = menu.addAction("Toggle Sleep / Wake")
+        stop_action = menu.addAction("Emergency Stop (Halt)")
         menu.addSeparator()
         exit_action = menu.addAction("Exit L.O.R.A")
 
@@ -250,6 +252,8 @@ class AmbientDropletWidget(QWidget):
             self.hud_requested.emit()
         elif action == toggle_sleep_action:
             self.toggle_sleep()
+        elif action == stop_action:
+            self.emergency_stop_requested.emit()
         elif action == exit_action:
             if self.parent():
                 self.parent().close()

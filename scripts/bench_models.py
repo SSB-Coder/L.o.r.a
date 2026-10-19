@@ -127,9 +127,10 @@ def benchmark_embeddings_and_faiss(
     model_path: str | None = None,
 ) -> dict[str, Any]:
     """Benchmark local CPU embedding generation and FAISS similarity indexing."""
+    default_models_dir = Path("models").resolve() if Path("models").exists() else Path(__file__).resolve().parent.parent / "models"
     resolved_path = model_path or os.environ.get(
         "LORA_EMBEDDING_MODEL_PATH",
-        str(Path(os.environ.get("LORA_MODELS_DIR", r"C:\Models")) / "embeddinggemma-2"),
+        str(Path(os.environ.get("LORA_MODELS_DIR", str(default_models_dir))) / "embeddinggemma-2"),
     )
     console = Console()
     console.print(f"[bold green]Benchmarking Embeddings & FAISS with {resolved_path}...[/bold green]")
@@ -199,14 +200,20 @@ async def run_phase1_benchmark() -> None:
         console.print("[bold red]Ollama daemon is offline at http://127.0.0.1:11434. Aborting.[/bold red]")
         return
 
-    # Candidates to benchmark
-    candidate_models = [
+    installed = await client.installed_models()
+    from lora.models.selection import is_excluded_model
+
+    preferred_order = [
+        "spark-x25-4b-8k:latest",
+        "granite4.2:3b",
+        "spark-x25-4b-32k:latest",
+        "hf.co/XHToken/Spark-X2.5-4B-GGUF:Q4_K_M",
         "granite4.2:8b",
         "gemma4:e4b",
-        "spark-x25-4b-8k:latest",
-        "ornith-1.5:9b",
-        "hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest",
     ]
+    candidate_models = [m for m in preferred_order if m in installed]
+    if not candidate_models:
+        candidate_models = [m for m in installed if not is_excluded_model(m)][:4]
 
     llm_results = []
     for m in candidate_models:
@@ -217,9 +224,9 @@ async def run_phase1_benchmark() -> None:
             console.print(f"[red]Failed to benchmark {m}: {e}[/red]")
 
     # Measure swap latency between primary writer (Spark) and primary verifier (Granite)
-    console.print("\n[bold cyan]Measuring model swap latency (Spark <-> Granite)...[/bold cyan]")
+    console.print("\n[bold cyan]Measuring model swap latency (Spark <-> Granite 3B)...[/bold cyan]")
     try:
-        swap_time_s = await measure_model_swap(client, "spark-x25-4b-8k:latest", "granite4.2:8b")
+        swap_time_s = await measure_model_swap(client, "spark-x25-4b-8k:latest", "granite4.2:3b")
         console.print(f"Swap latency: [bold green]{swap_time_s} s[/bold green]")
     except Exception as e:
         swap_time_s = None

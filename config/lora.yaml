@@ -61,62 +61,66 @@ gateway:
     allow_uploads: false
     allow_local_files: false
 
-models:                           # Model role assignments (Spark 4B base + 8B/9B smart escalation, fixed num_ctx=8192)
+models:                           # Model role assignments (RTX 3050 6GB VRAM: Spark 4B base writer + Granite 3B verifier, 8B/9B manual escalation)
   planner:
-    name: "granite4.2:8b"
+    name: "granite4.2:3b"
     think: false
     num_ctx: 8192
-    fallback: ["hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest", "gemma4:e4b", "spark-x25-4b-8k:latest"]
+    fallback: ["spark-x25-4b-8k:latest", "granite4.2:8b", "hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest"]
   controller:
-    name: "granite4.2:8b"
+    name: "granite4.2:3b"
     think: false
     num_ctx: 8192
-    fallback: ["hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest", "ornith-1.5:9b", "gemma4:e4b", "spark-x25-4b-8k:latest"]
+    fallback: ["spark-x25-4b-8k:latest", "granite4.2:8b"]
   writer:
-    name: "spark-x25-4b-q4"
+    name: "spark-x25-4b-8k:latest"
     family: spark
     think: false
     temperature: 0.3
-    num_ctx: 8192                      # 8k context cap for fast base writer
-    fallback: ["gemma4:e4b", "granite4.2:8b", "hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest", "ornith-1.5:9b", "granite4.2:3b"]
+    num_ctx: 8192                      # 8k context cap for fast base writer (~2.6 GB VRAM)
+    fallback: ["spark-x25-4b-q4", "granite4.2:3b", "gemma4:e4b"]
   complex:
     name: "granite4.2:8b"
     think: false
     temperature: 0.2
     num_ctx: 8192
-    fallback: ["hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest", "ornith-1.5:9b", "gemma4:e4b", "spark-x25-4b-q4"]
+    fallback: ["hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest", "ornith-1.5:9b", "spark-x25-4b-8k:latest"]
   vision:
     name: "gemma4:e4b"
     think: false
     temperature: 0.2
     num_ctx: 8192
-    fallback: ["gemma3:4b", "llava:latest", "qwen2.5vl:latest", "granite4.2:8b", "spark-x25-4b-q4"]
+    fallback: ["gemma3:4b", "llava:latest", "qwen2.5vl:latest", "spark-x25-4b-8k:latest"]
   reader:
     name: "spark-x25-4b-32k:latest"
     family: spark
     think: false
     temperature: 0.2
     num_ctx: 32768                     # 32k context exclusively for long-doc map-reduce
-    fallback: ["spark-x25-4b-q4", "granite4.2:8b"]
+    fallback: ["spark-x25-4b-8k:latest", "spark-x25-4b-q4"]
   verifier:
-    name: "gemma4:e4b"
+    name: "granite4.2:3b"
     think: false
-    num_ctx: 4096
+    num_ctx: 8192
     temperature: 0.0
-    fallback: ["granite4.2:3b", "granite4.2:8b", "hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest", "ornith-1.5:9b"]
+    fallback: ["spark-x25-4b-8k:latest", "gemma4:e4b"]
   supervisor:
-    name: "hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest"
+    name: "granite4.2:3b"
     think: false
     num_ctx: 8192
     temperature: 0.0
-    fallback: ["granite4.2:8b", "ornith-1.5:9b"]
+    fallback: ["spark-x25-4b-8k:latest", "granite4.2:8b"]
   optimizer:
-    name: "gemma4:e4b"
+    name: "spark-x25-4b-8k:latest"
     think: false
     num_ctx: 8192
-    fallback: ["granite4.2:8b", "hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest"]
+    fallback: ["granite4.2:3b", "gemma4:e4b"]
   excluded:
     - "gemma4:26b"
+    - "26b"
+    - "27b"
+    - "32b"
+    - "70b"
   ollama_env:
     OLLAMA_MAX_LOADED_MODELS: 1
     base_url: "http://127.0.0.1:11434"

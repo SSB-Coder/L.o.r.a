@@ -22,10 +22,6 @@ from lora.verify.claims import ClaimDecomposer, extract_citation_ids
 
 logger = logging.getLogger(__name__)
 
-if os.environ.get("LORA_VERIFY_NLI") == "0":
-    os.environ.setdefault("LORA_VERIFY_OFFLINE", "1")
-
-
 @dataclass
 class Verification:
     verdict: str  # verified | repaired | abstain | unchecked
@@ -36,10 +32,11 @@ class Verification:
     claims: list[dict[str, Any]] = field(default_factory=list)
     repaired_answer: str = ""
     stages: list[dict[str, Any]] = field(default_factory=list)
+    contradictions: list[str] = field(default_factory=list)
 
     @property
     def clean(self) -> bool:
-        return self.total > 0 and not self.unverified
+        return self.total > 0 and not self.unverified and not self.contradictions
 
     def for_ui(self) -> dict[str, Any]:
         return {
@@ -49,6 +46,7 @@ class Verification:
             "score": round(self.score, 2),
             "unverified": self.unverified[:6],
             "stages": self.stages,
+            "contradictions": self.contradictions,
         }
 
 
@@ -105,6 +103,7 @@ def _build_eight_stages(
     llm_calls: int = 0,
     llm_succeeded: int = 0,
     llm_timed_out: int = 0,
+    contradictions: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Build the 8-stage (V1-V8) verification breakdown for the UI Verification Dropdown."""
     total_claims = len(details)
@@ -135,9 +134,14 @@ def _build_eight_stages(
     )
     v3_score = round(min(1.0, max(0.0, avg_nli)), 2)
 
-    # V4: LLM Entailment Escalation & Spot-Check Audit
-    if llm_timed_out > 0 and llm_succeeded == 0:
+    # V4: LLM Entailment Escalation & Spot-Check Audit (honest SKIPPED labeling when 0 probes executed)
+    if llm_calls == 0 and llm_succeeded == 0:
+        v4_score = None
+        v4_status = "SKIPPED"
+        v4_detail = f"Skipped (0 LLM probes needed; {supported_claims}/{total_claims} claims entailed by CPU NLI)"
+    elif llm_timed_out > 0 and llm_succeeded == 0:
         v4_score = round(min(0.65, avg_nli * 0.75), 2)
+        v4_status = "fail"
         v4_detail = (
             f"LLM probe timed out ({llm_timed_out}/{max(1, llm_calls)}); "
             f"CPU NLI fallback ({supported_claims}/{total_claims} claims)"
@@ -145,13 +149,15 @@ def _build_eight_stages(
     elif llm_succeeded > 0:
         support_ratio = supported_claims / max(1, total_claims)
         v4_score = round(min(1.0, 0.65 * support_ratio + 0.35 * avg_nli), 2)
+        v4_status = "pass" if v4_score >= 0.80 else ("warn" if v4_score >= 0.55 else "fail")
         timeout_note = f", {llm_timed_out} timed out" if llm_timed_out > 0 else ""
         v4_detail = f"{supported_claims}/{total_claims} claims verified ({llm_succeeded} LLM probe(s){timeout_note})"
     else:
-        v4_score = round(min(0.88, avg_nli), 2)
-        v4_detail = f"CPU NLI only (0 LLM probes; {supported_claims}/{total_claims} claims entailed)"
+        v4_score = None
+        v4_status = "SKIPPED"
+        v4_detail = "Skipped"
 
-    # V5: Multi-Source Corroboration (measures actual cited source breadth + domain diversity)
+    # V5: Multi-Source Corroboration (measures actual cited source breadth + domain diversity + surfaces contradictions)
     domains = {
         c.source_url.split("/")[2]
         for c in cards
@@ -160,10 +166,14 @@ def _build_eight_stages(
     cited_valid_count = len(cited_ids & valid_ids)
     cite_source_ratio = cited_valid_count / max(1, len(cards))
     domain_ratio = min(1.0, len(domains) / max(1, min(3, len(cards)))) if cards else 0.0
+    contra_list = contradictions or []
+    contra_penalty = min(0.40, 0.20 * len(contra_list))
     if len(cards) == 1:
-        v5_score = round(0.85 * cite_source_ratio, 2)
+        v5_score = round(max(0.0, 0.85 * cite_source_ratio - contra_penalty), 2)
     else:
-        v5_score = round(0.55 * domain_ratio + 0.45 * cite_source_ratio, 2)
+        v5_score = round(max(0.0, (0.55 * domain_ratio + 0.45 * cite_source_ratio) - contra_penalty), 2)
+    contra_note = f"; {len(contra_list)} contradiction(s) detected" if contra_list else ""
+    v5_detail = f"{cited_valid_count}/{len(cards)} source(s) cited across {max(1, len(domains))} domain(s){contra_note}"
 
     # V6: Numerical & Entity Precision
     num_passed = sum(1 for d in details if getattr(d, "number_check_passed", True))
@@ -176,13 +186,16 @@ def _build_eight_stages(
     orig_ratio = max(0.0, 1.0 - copy_res.overlap_ratio)
     v7_score = round(orig_ratio if copy_res.is_clean else min(0.54, orig_ratio), 2)
 
-    # V8: Composite Faithfulness & Repair Gate (continuous blend of pipeline score and V1-V7 stage scores)
-    stage_mean = (v1_score + v2_score + v3_score + v4_score + v5_score + v6_score + v7_score) / 7.0
+    # V8: Composite Faithfulness & Repair Gate (averages ONLY executed stages, never blending synthetic scores for skipped stages)
+    active_scores = [s for s in [v1_score, v2_score, v3_score, v4_score, v5_score, v6_score, v7_score] if s is not None]
+    stage_mean = (sum(active_scores) / len(active_scores)) if active_scores else float(composite_score)
     v8_score = round(0.55 * float(composite_score) + 0.45 * stage_mean, 2)
     if llm_timed_out > 0 and llm_succeeded == 0:
         v8_score = round(min(v8_score, 0.78), 2)
 
-    def _st(s: float) -> str:
+    def _st(s: float | None) -> str:
+        if s is None:
+            return "SKIPPED"
         return "pass" if s >= 0.80 else ("warn" if s >= 0.55 else "fail")
 
     v3_detail = (
@@ -217,7 +230,7 @@ def _build_eight_stages(
             "id": "V4",
             "name": "LLM Fact-Check",
             "score": v4_score,
-            "status": _st(v4_score),
+            "status": v4_status,
             "detail": v4_detail,
         },
         {
@@ -225,7 +238,7 @@ def _build_eight_stages(
             "name": "Source Corroboration",
             "score": round(v5_score, 2),
             "status": _st(v5_score),
-            "detail": f"{cited_valid_count}/{len(cards)} source(s) cited across {max(1, len(domains))} domain(s)",
+            "detail": v5_detail,
         },
         {
             "id": "V6",
@@ -272,6 +285,7 @@ async def verify_answer(answer: str, sources: list[Source], llm: VerifierLLM | N
     ]
     verdict_str = str(report.verdict.value)
     comp_score = float(report.composite_faithfulness_score)
+    all_contradictions = list(getattr(report, "contradictions", []) or [])
     v4_stats = pipe.last_v4_stats
     llm_calls = max(v4_stats.get("attempted", 0), getattr(llm, "calls", 0) if llm else 0)
     llm_succeeded = v4_stats.get("succeeded", getattr(llm, "succeeded", 0) if llm else 0)
@@ -285,16 +299,21 @@ async def verify_answer(answer: str, sources: list[Source], llm: VerifierLLM | N
         llm_calls=llm_calls,
         llm_succeeded=llm_succeeded,
         llm_timed_out=llm_timed_out,
+        contradictions=all_contradictions,
     )
     v8_stage_score = float(stages[-1]["score"]) if stages else comp_score
     supported_cnt = sum(1 for d in details if d.is_supported)
+    stage_strs = [
+        f"{s['id']}={'SKIPPED' if s.get('score') is None else str(int(round(s['score'] * 100))) + '%'}"
+        for s in stages
+    ]
     logger.info(
         "8-Way Verification: verdict=%s score=%.2f (%d/%d claims) [%s]",
         verdict_str,
         v8_stage_score,
         supported_cnt,
         len(details),
-        ", ".join(f"{s['id']}={int(round(s['score']*100))}%" for s in stages),
+        ", ".join(stage_strs),
     )
     return Verification(
         verdict=verdict_str,
@@ -305,4 +324,5 @@ async def verify_answer(answer: str, sources: list[Source], llm: VerifierLLM | N
         claims=claims,
         repaired_answer=str(report.repaired_answer or ""),
         stages=stages,
+        contradictions=all_contradictions,
     )

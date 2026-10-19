@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "lora"
 version = "0.1.0"
 description = "L.O.R.A - Layer Oriented Research Assistant"
-readme = "LORA_PLAN.md"
+readme = "README.md"
 requires-python = ">=3.11"
 authors = [
     { name = "LORA Team" }

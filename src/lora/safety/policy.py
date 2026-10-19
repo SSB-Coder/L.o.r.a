@@ -160,12 +160,22 @@ class PolicyEngine:
         typing_domain_allowlist: list[str] | None = None,
     ) -> None:
         self.config: PolicyConfig | None = None
-        default_policy_path = Path("config/policy.yaml")
-        resolved_cfg_path = config_path or (default_policy_path if default_policy_path.exists() else None)
+        repo_root = Path(__file__).resolve().parents[3]
+        repo_policy = repo_root / "config" / "policy.yaml"
+        user_policy = Path.home() / ".lora" / "policy.yaml"
+        cwd_policy = Path("config/policy.yaml")
+
+        default_policy_path = (
+            repo_policy if repo_policy.is_file()
+            else (user_policy if user_policy.is_file()
+            else (cwd_policy if cwd_policy.is_file() else None))
+        )
+        resolved_cfg_path = config_path or default_policy_path
         if resolved_cfg_path and Path(resolved_cfg_path).exists():
             try:
                 self.config = ConfigManager().load_policy(resolved_cfg_path)
-            except Exception:
+            except Exception as exc:
+                logger.warning("Failed to load policy config from %s: %s", resolved_cfg_path, exc)
                 self.config = None
 
         # Resolve allowed roots to absolute canonical paths

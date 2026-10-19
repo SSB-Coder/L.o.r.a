@@ -43,6 +43,8 @@ class KillSwitch:
     def trigger(self, reason: str = "Emergency kill switch activated") -> None:
         """Activate the emergency kill switch and fire all registered stop callbacks."""
         with self._lock:
+            if self._halted:
+                return
             self._halted = True
             self._reason = reason
             callbacks_to_fire = list(self._callbacks)

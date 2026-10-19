@@ -39,6 +39,14 @@ def open_path(path: str | Path, policy_engine: PolicyEngine | None = None) -> di
         except Exception:
             pass
 
+    # Guard against executing runnable scripts or executables via os.startfile
+    RUNNABLE_EXTENSIONS = {".py", ".pyw", ".exe", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".msi", ".reg", ".com", ".scr"}
+    if target.is_file() and target.suffix.lower() in RUNNABLE_EXTENSIONS:
+        return {
+            "status": "error",
+            "message": f"Blocked launching runnable script '{target.name}' in system shell. Use read_file to inspect code files.",
+        }
+
     try:
         # os.startfile opens the file or directory in the default Windows application
         if hasattr(os, "startfile"):

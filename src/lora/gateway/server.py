@@ -22,6 +22,7 @@ from starlette.requests import Request
 from fastapi.middleware.cors import CORSMiddleware
 from lora.models.ollama_client import OllamaClient
 from lora.grounding.media_vector_db import MediaVectorDB
+from lora.safety.policy import PolicyEngine
 
 LOCAL_ORIGIN_REGEX = r"https?://(localhost|127\.0\.0\.1|\[::1\]|192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})(:\d+)?"
 
@@ -103,6 +104,10 @@ def create_gateway_app(
             return True
         auth_hdr = request.headers.get("authorization", "")
         tok = auth_hdr[7:].strip() if auth_hdr.startswith("Bearer ") else request.headers.get("x-lora-token", "").strip()
+        if not tok:
+            tok = request.cookies.get("lora_mobile_token", "").strip()
+        if not tok:
+            tok = request.query_params.get("token", "").strip()
         return bool(tok and token_validator.validate_token(tok, "mobile"))
 
     @app.get("/api/hud/status")
@@ -206,24 +211,27 @@ def create_gateway_app(
 
     @app.get("/api/hud/media/list")
     async def list_media_files(request: Request):
-        if origin.lower() == "mobile":
-            return JSONResponse({"detail": "Local media file listing is restricted to desktop."}, status_code=403)
+        if not _check_mobile_hud_auth(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
         return {"status": "ok", "files": media_db.list_files()}
 
     @app.post("/api/hud/media/add")
     async def add_media_file(payload: HudMediaAddPayload, request: Request):
-        if origin.lower() == "mobile":
-            return JSONResponse({"detail": "Mobile origin cannot index local PC files."}, status_code=403)
+        if not _check_mobile_hud_auth(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
         path_str = payload.path.strip()
         if not path_str:
             return {"status": "error", "message": "Missing path"}
+        pol = PolicyEngine().check_path(path_str, origin="desktop", mode="read")
+        if not pol.allowed:
+            return JSONResponse({"status": "error", "message": f"Path blocked by policy: {pol.reason}"}, status_code=403)
         res = media_db.add_file(path_str)
         return {"status": "ok", "result": res, "files": media_db.list_files()}
 
     @app.post("/api/hud/media/remove")
     async def remove_media_file(payload: HudMediaRemovePayload, request: Request):
-        if origin.lower() == "mobile":
-            return JSONResponse({"detail": "Mobile origin cannot modify local PC media."}, status_code=403)
+        if not _check_mobile_hud_auth(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
         path_or_id = payload.path_or_id.strip()
         if not path_or_id:
             return {"status": "error", "message": "Missing path or id"}
@@ -232,8 +240,8 @@ def create_gateway_app(
 
     @app.post("/api/hud/media/report")
     async def report_on_media(payload: HudMediaReportPayload, request: Request):
-        if origin.lower() == "mobile":
-            return JSONResponse({"detail": "Mobile origin cannot read local PC media."}, status_code=403)
+        if not _check_mobile_hud_auth(request):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
         q = payload.query.strip()
         rep = media_db.report_on_media(query=q)
         return {"status": "ok", "report": rep}
