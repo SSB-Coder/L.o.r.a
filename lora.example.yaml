@@ -1,0 +1,35 @@
+# LORA configuration. Copy to ~/.lora/lora.yaml (Windows: %USERPROFILE%\.lora\lora.yaml).
+# Every setting is optional; these are the defaults unless marked "example".
+
+ollama:
+  url: http://127.0.0.1:11434
+  model: ""            # default model for new chats; empty picks the first installed one. e.g. qwen3:8b
+  contextWindow: 8192  # keep equal to Ollama's context length (OLLAMA_CONTEXT_LENGTH)
+
+server:
+  port: 8765           # the app window, on 127.0.0.1 only
+  # Phone access (example). Bind to a dedicated, isolated network interface. See docs/NETWORK_SETUP.md.
+  # mobile:
+  #   host: 192.168.50.10
+  #   port: 8765
+
+files:
+  roots: ["~/Documents", "~/Downloads", "~/Desktop"]   # the only folders LORA may read
+  notes: "~/Documents/LORA Notes"                       # where save_note writes
+
+research:
+  searxng: ""          # optional SearXNG URL; empty uses DuckDuckGo with a Wikipedia fallback
+
+voice:
+  # Empty uses the browser's built-in speech recognition and voices.
+  stt: ""              # example: http://127.0.0.1:8000/v1/audio/transcriptions (speaches / faster-whisper-server)
+  sttModel: whisper-1
+  tts: ""              # example: http://127.0.0.1:8880/v1/audio/speech (Kokoro-FastAPI)
+  ttsModel: kokoro
+  voice: af_sky
+
+# Apps and sites the `open` tool may launch, by name or alias. Defining either replaces its defaults.
+# apps:
+#   vscode: { command: code, aliases: [code, vs code] }
+# sites:
+#   wikipedia: { url: https://en.wikipedia.org, search: "https://en.wikipedia.org/wiki/Special:Search?search={query}", aliases: [wiki] }

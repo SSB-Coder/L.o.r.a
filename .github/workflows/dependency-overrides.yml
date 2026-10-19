@@ -1,0 +1,45 @@
+name: Dependency overrides
+
+on:
+  schedule:
+    - cron: "17 6 * * *"            # daily
+  push:
+    branches: [master]
+    paths: [bun.lock]               # right after a parent bump lands
+  pull_request:
+    paths: [package.json, .github/dependency-overrides.yml]
+  workflow_dispatch:
+
+jobs:
+  # On PRs: every override has a complete ledger entry, and every ledger entry has an override.
+  ledger:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - run: bun scripts/check-bun-overrides.ts --ledger-only
+
+  # Everywhere else: try removing each override and open PRs for the ones that can go.
+  remove:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read                # writes go through DEPS_BOT_TOKEN
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ secrets.DEPS_BOT_TOKEN }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - run: |
+          git config user.name "deps-bot"
+          git config user.email "deps-bot@users.noreply.github.com"
+      - run: bun scripts/check-bun-overrides.ts --open-prs
+        env:
+          GH_TOKEN: ${{ secrets.DEPS_BOT_TOKEN }}

@@ -1,0 +1,4 @@
+# Every override in package.json "overrides" needs an entry here, added in the same commit.
+# Overrides are a last resort for security alerts; .github/workflows/dependency-overrides.yml removes them
+# automatically once upstream no longer needs them. See the format in docs/dependencies.md.
+overrides: []

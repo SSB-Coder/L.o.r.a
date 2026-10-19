@@ -8,8 +8,8 @@ This document describes the network setup for running L.O.R.A (Layer-Oriented Re
 
 To provide remote access from a mobile phone to L.O.R.A on your PC without exposing your desktop environment to the general home network or internet, L.O.R.A implements an **isolated dual-listener architecture**:
 
-- **Desktop Listener**: Bound strictly to `127.0.0.1:8765` (`origin="desktop"`). Has full access to desktop controls, local files, and deep research modes.
-- **Mobile Listener**: Bound strictly to a dedicated router-side interface IP (default: `192.168.50.10:8765`, `origin="mobile"`). Access is restricted exclusively to Tier 0 read-only research. Local file access and OS controls are strictly stripped and denied.
+- **Desktop Listener**: Bound strictly to `127.0.0.1:8765` (`origin="desktop"`). Has access to local files (in the allowed folders), notes, memory, and opening apps.
+- **Mobile Listener**: Bound strictly to a dedicated router-side interface IP (default: `192.168.50.10:8765`, `origin="mobile"`). Access is restricted to read-only web research. Local file tools and OS controls are not offered to phone chats, and a policy hook refuses them even if a model asks.
 
 > **CRITICAL SECURITY INVARIANT:** The mobile gateway must **NEVER** bind to `0.0.0.0` and must **NEVER** be reachable from the primary home Wi-Fi subnet.
 
@@ -77,16 +77,24 @@ The script:
 
 ---
 
-## 4. Verification with `lora net-check`
+## 4. Turn On Phone Access and Pair
 
-Verify the network setup before starting the gateway:
+Add the mobile listener to `~/.lora/lora.yaml` (Windows: `%USERPROFILE%\.lora\lora.yaml`), using the PC's address on the isolated network:
 
-```powershell
-python -m lora.tools.net_check
+```yaml
+server:
+  mobile:
+    host: 192.168.50.10   # never 0.0.0.0; LORA refuses to start with it
+    port: 8765
 ```
 
-The tool audits:
-- Mobile listener IP configuration (strictly isolated subnet, never `0.0.0.0`).
-- Windows Firewall rule existence, interface binding, and remote subnet scoping.
-- Non-overlap between home Wi-Fi and isolated router subnets.
-- Unreachability from non-isolated interfaces.
+Restart LORA, then pair the phone:
+
+- In the app window, open **Pair a phone** in the sidebar and scan the QR code, or
+- run `lora pair` and open the printed link on the phone.
+
+The link carries the phone token once; LORA swaps it for an HttpOnly cookie. Five bad tokens in a minute ban that address for 15 minutes. The token lives in `~/.lora/tokens.json`; delete that file and restart to revoke every paired phone.
+
+What a phone can do: chat and research the web (`web_search`, `fetch_page`, `search_papers`). It cannot read files, save notes, change memory, open apps, or see chats started on the PC.
+
+**Voice on the phone:** browsers only allow the microphone on HTTPS or localhost, so over plain HTTP on the LAN the mic button is hidden. Typing works, and answers can still be read aloud.

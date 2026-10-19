@@ -1,0 +1,30 @@
+# Policy: security fixes ship immediately (cooldown never applies to them);
+# every other new version waits 14 days after release.
+version: 2
+updates:
+  - package-ecosystem: bun
+    directory: /
+    schedule:
+      interval: daily        # checked daily so a version is proposed soon after its 14 days are up
+    cooldown:
+      default-days: 14       # all semver levels; Dependabot's own default is only 3
+    labels: [dependencies]
+    groups:
+      # Effect packages must move together (effect, @effect/*); so must the Pi packages.
+      effect:
+        applies-to: version-updates
+        patterns: ["effect", "@effect/*"]
+      pi:
+        applies-to: version-updates
+        patterns: ["@earendil-works/*"]
+      minor-and-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    labels: [dependencies]

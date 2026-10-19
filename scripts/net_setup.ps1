@@ -100,4 +100,4 @@ if ($EnableKeepAwake) {
     Write-Host "Keep-awake not requested. Pass -EnableKeepAwake to activate sleep prevention." -ForegroundColor Gray
 }
 
-Write-Host "`nNetwork isolation setup complete! Verify with: python -m lora.tools.net_check" -ForegroundColor Cyan
+Write-Host "`nNetwork isolation setup complete! Then add server.mobile to lora.yaml and pair your phone with: lora pair" -ForegroundColor Cyan
