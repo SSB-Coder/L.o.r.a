@@ -75,3 +75,18 @@ def test_v2_claim_decomposer_basic():
     # Check citation association
     num_claim = next(c for c in claims if "500" in c.claim_text)
     assert "S2" in num_claim.cited_sources
+
+
+def test_v2_claim_decomposer_ignores_conversational_signoff():
+    decomposer = ClaimDecomposer()
+    text = (
+        "Redshift is a key phenomenon in astrophysics [S1]. "
+        "It occurs when electromagnetic radiation increases in wavelength [S2]. "
+        "I'd suggest taking a break to rest your eyes and mind—you've got this, and I'll be here when you're ready to pick up."
+    )
+    claims = decomposer.decompose(text)
+    # The conversational signoff should be excluded from factual claims
+    assert len(claims) == 2
+    assert not any("taking a break" in c.claim_text.lower() for c in claims)
+    assert not any("rest your eyes" in c.claim_text.lower() for c in claims)
+

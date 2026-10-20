@@ -19,6 +19,24 @@ class AtomicClaim(BaseModel):
 
 _SUPERSCRIPT_MAP = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
 
+_CONVERSATIONAL_SIGNOFF = re.compile(
+    r"\b(?:"
+    r"suggest(?:ing)?\s+taking\s+a\s+break|"
+    r"rest\s+(?:your\s+)?(?:eyes|mind|head)|"
+    r"get\s+(?:some\s+)?(?:sleep|rest)|"
+    r"catch\s+(?:some\s+)?(?:sleep|rest|zs)|"
+    r"let\s+me\s+know\s+if|"
+    r"hope\s+this\s+helps|"
+    r"feel\s+free\s+to|"
+    r"you(?:'ve|\s+have)\s+got\s+this|"
+    r"i(?:'ll|\s+will)\s+be\s+here\s+when|"
+    r"ready\s+when\s+you\s+are|"
+    r"take\s+care|"
+    r"good\s+night"
+    r")\b",
+    re.IGNORECASE,
+)
+
 
 def extract_citation_ids(text: str) -> list[str]:
     """Extract all citation IDs (`S1`, `S2`, etc.) from `[S1]`, `[S1, S4]`, `[1]`, or superscripts."""
@@ -108,6 +126,11 @@ class ClaimDecomposer:
                 continue
             if clean_text.endswith(":"):
                 continue
+
+            # Skip uncited conversational sign-offs, friendly nudges, or persona rest advice (not factual claims)
+            if not cited and _CONVERSATIONAL_SIGNOFF.search(clean_text):
+                continue
+
             clean_text = clean_text[0].upper() + clean_text[1:]
             has_nums = self._contains_numbers(clean_text)
 

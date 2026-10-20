@@ -901,9 +901,18 @@ window.updateMediaList=(files)=>{
 
 // Watchdog: never stay locked in think/verify if the backend went quiet.
 setInterval(()=>{
- if((mode==='think'||mode==='verify')&&Date.now()-lastActivity>240000){
+ if((mode==='think'||mode==='verify')&&Date.now()-lastActivity>300000){
   busy=false;streaming=false;
-  if(cur){setLiveStatus(cur,'');cur.body.innerHTML='';const n=document.createElement('div');n.className='notice';n.textContent='I didn\u2019t get an answer. Please try again.';cur.body.appendChild(n);cur=null}
+  if(cur){
+   setLiveStatus(cur,'');
+   if(!cur.hasText){
+    cur.body.innerHTML='';
+    const n=document.createElement('div');n.className='notice';n.textContent='I didn\u2019t get an answer. Please try again.';cur.body.appendChild(n);
+   }else{
+    const n=document.createElement('div');n.className='notice';n.textContent='Verification timed out. Showing draft answer above.';cur.body.appendChild(n);
+   }
+   cur=null;
+  }
   setState('idle');
  }
 },5000);
