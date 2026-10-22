@@ -36,7 +36,7 @@ CHUNK = 60
 _BAD_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
-class TypingRefused(Exception):
+class TypingRefused(Exception):  # noqa: N818 - public API
     pass
 
 
@@ -92,7 +92,9 @@ class TypeTextTool:
         if not re.search(pattern, title, re.IGNORECASE):
             raise TypingRefused("The editor isn't the active window, so I didn't type anything.")
 
-    def type_text(self, text: str, target: str) -> dict[str, Any]:
+    def type_text(self, text: str, target: str, *, confirmed: bool = False) -> dict[str, Any]:
+        if not confirmed:
+            raise TypingRefused("Direct typing is deferred until an exact-text confirmation is accepted.")
         label, pattern = self.validate(text, target)
         self.wm.focus_window(pattern)
         self.sleep(0.5)
@@ -100,6 +102,9 @@ class TypeTextTool:
         kb = self._keyboard or default_keyboard()
         typed = 0
         for i in range(0, len(text), CHUNK):
+            from lora.safety.killswitch import KillSwitch
+            if KillSwitch.get_global().is_halted():
+                raise TypingRefused("Stopped typing at the user's request.")
             self._check_foreground(pattern)  # abort if focus moved mid-way
             kb.type(text[i : i + CHUNK])
             typed += len(text[i : i + CHUNK])

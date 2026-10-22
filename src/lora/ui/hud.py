@@ -75,7 +75,7 @@ class HudBridge(QObject):
 class _DummyLabel:
     """Null-safe label adapter for background status text updates."""
 
-    def setText(self, text: str) -> None:
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt API
         pass
 
 
@@ -93,7 +93,6 @@ class LoraDesktopHUD(QMainWindow):
     voice_toggled = Signal(bool)  # spoken replies on/off
     mobile_qr_requested = Signal()
     _media_notice = Signal(str, bool)  # (message, refresh the list) from a worker thread
-    _media_report = Signal(str)  # report text from a worker thread
     exit_requested = Signal()
     rewrite_requested = Signal(int, str)
     media_updated = Signal()
@@ -114,7 +113,6 @@ class LoraDesktopHUD(QMainWindow):
         self.status_label = _DummyLabel()
         self._last_level = 0.0
         self._media_notice.connect(self._on_media_notice)
-        self._media_report.connect(self._on_media_report)
         self._last_level_time = 0.0
         self.web_view: Any = None
         self._web_loading = False
@@ -255,12 +253,7 @@ class LoraDesktopHUD(QMainWindow):
             QTimer.singleShot(0, self._browse_media)
         elif action == "on_report_media":
             q = str(payload.get("query", "")).strip()
-            self._media_task(
-                lambda: self.media_db.report_on_media(query=q),
-                lambda rep: (None, False),
-                "Reading your sources…",
-                report=True,
-            )
+            self.query_submitted.emit(q or "Summarize my sources", "")
 
     @staticmethod
     def _open_local_artifact(path_str: str) -> None:
@@ -312,20 +305,13 @@ class LoraDesktopHUD(QMainWindow):
             return f"I couldn't add {name}: {res.get('message', 'unknown problem')}", False
         return f"Added {res.get('filename', name)} to your sources.", True
 
-    def _media_task(self, work, describe, start_text: str, report: bool = False) -> None:
+    def _media_task(self, work, describe, start_text: str) -> None:
         """Run indexing work on a background thread; results come back through queued signals."""
         self._media_notice.emit(start_text, False)
 
         def _run() -> None:
             try:
                 res = work()
-                if report:
-                    body = "Here's what's in your sources:\n" + str(res.get("summary", ""))
-                    findings = res.get("findings") or []
-                    if findings:
-                        body += "\n\n" + "\n".join(f"- {f}" for f in findings)
-                    self._media_report.emit(body)
-                    return
                 text, refresh = describe(res)
                 self._media_notice.emit(text, refresh)
             except Exception as exc:
@@ -340,10 +326,6 @@ class LoraDesktopHUD(QMainWindow):
             self.append_message("System", text)
         if refresh:
             self.sync_media_files()
-
-    @Slot(str)
-    def _on_media_report(self, text: str) -> None:
-        self.present_answer("Summarize my sources", text)
 
     def _run_js(self, script: str) -> None:
         """Executes JavaScript safely in the droplet page (queued if page is still loading)."""
@@ -362,7 +344,7 @@ class LoraDesktopHUD(QMainWindow):
         self._run_js(f"window.setSources && window.setSources({json.dumps(sources or [])});")
 
     def set_verification(self, meta: dict[str, Any]) -> None:
-        """Attach or update the 8-Way Verification Scorecard & Laya trace immediately."""
+        """Attach source-reference checks and the execution trace."""
         self._run_js(f"window.setVerification && window.setVerification({json.dumps(meta or {})});")
 
     def update_model_list(self, models: list[str], active_model: str = "auto") -> None:
@@ -388,7 +370,7 @@ class LoraDesktopHUD(QMainWindow):
         query: str,
         answer: str,
         sources: list[Any] | None = None,
-        confidence: float = 0.95,
+        confidence: float = 0.0,
         label: str = "",
         streamed: bool = False,
         meta: dict[str, Any] | None = None,
@@ -501,7 +483,7 @@ class LoraDesktopHUD(QMainWindow):
             self.raise_()
             self.activateWindow()
 
-    def closeEvent(self, event: Any) -> None:
+    def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
         """Emit exit_requested on window close to trigger clean microphone release."""
         self.exit_requested.emit()
         super().closeEvent(event)

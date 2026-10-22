@@ -1,7 +1,7 @@
 """AgentRuntime with the real ToolRegistry/policy/gate, a fake Ollama (respx) and no real launches."""
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import respx
@@ -60,21 +60,23 @@ async def run(rt, q):
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_greeting_is_instant_and_never_touches_the_model(runtime):
+async def test_greeting_uses_casual_persona_and_model(runtime):
+    respx.get(f"{URL}/api/tags").respond(200, json=TAGS)
+    route = respx.post(f"{URL}/api/chat").respond(200, content=_nd("Hey, how are you?"))
     res, sink = await run(runtime, "hello")
-    assert res.kind == "smalltalk" and res.text and sink.texts[0][0] == res.text
-    assert respx.calls.call_count == 0
+    assert res.kind == "chat" and res.text == "Hey, how are you?"
+    assert "companion" in json.loads(route.calls[0].request.content)["messages"][0]["content"]
 
 
 @pytest.mark.asyncio
 @respx.mock
 async def test_chat_uses_spark_not_the_stale_default_and_streams(runtime):
     respx.get(f"{URL}/api/tags").respond(200, json=TAGS)
-    route = respx.post(f"{URL}/api/chat").respond(200, content=_nd("Sure", ", boss."))
-    res, sink = await run(runtime, "explain attention in one line")
-    assert res.text == "Sure, boss." and res.kind == "chat"
+    route = respx.post(f"{URL}/api/chat").respond(200, content=_nd("Sure", ", friend."))
+    res, sink = await run(runtime, "tell me a joke about cats")
+    assert res.text == "Sure, friend." and res.kind == "chat"
     assert json.loads(route.calls[0].request.content)["model"] == "SparkLLM/Spark-X2.5-4B:latest"
-    assert [t for t, _ in sink.texts][-1] == "Sure, boss."
+    assert [t for t, _ in sink.texts][-1] == "Sure, friend."
 
 
 @pytest.mark.asyncio
@@ -86,7 +88,7 @@ async def test_open_desktop_app_through_the_real_registry(runtime):
 
 
 @pytest.mark.asyncio
-async def test_open_web_app_and_url(runtime):
+async def test_open_web_app_and_url(runtime, public_dns):
     with patch("webbrowser.open") as wb:
         r1, _ = await run(runtime, "open youtube")
         r2, _ = await run(runtime, "go to https://example.com".replace("go to", "open"))
@@ -131,6 +133,7 @@ async def test_ambiguous_verb_falls_through_to_chat(runtime):
 @pytest.mark.asyncio
 @respx.mock
 async def test_create_note_end_to_end_and_spoken_summary(runtime, notes_dir):
+    runtime.confirm = AsyncMock(return_value=True)
     respx.get(f"{URL}/api/tags").respond(200, json=TAGS)
     respx.post(f"{URL}/api/chat").respond(200, content=_nd("# Quantum tunneling\n", "A particle crosses a barrier."))
     res, sink = await run(runtime, "create a markdown note about quantum tunneling")
@@ -143,17 +146,9 @@ async def test_create_note_end_to_end_and_spoken_summary(runtime, notes_dir):
 @pytest.mark.asyncio
 @respx.mock
 async def test_save_last_answer_with_sources(runtime, notes_dir):
-    respx.get(f"{URL}/api/tags").respond(200, json=TAGS)
-    respx.post(f"{URL}/api/chat").respond(200, content=_nd("Mamba is linear-time [S1]."))
-    src = ResearchResult("q", [Source("S1", "Mamba paper", "https://arxiv.org/abs/2312.00752", text="t" * 300)])
-
-    async def fake_research(q, status):
-        status("Searching the web…")
-        return src
-
-    runtime._research_fn = fake_research
-    res, sink = await run(runtime, "research mamba models")
-    assert res.kind == "research" and res.sources[0]["url"].startswith("https://arxiv.org") and "Searching the web…" in sink.status and "Planning the search…" in sink.status
+    runtime.confirm = AsyncMock(return_value=True)
+    runtime.last_answer = "Mamba is linear-time [S1]."
+    runtime.last_sources = [{"id": "S1", "title": "Mamba paper", "url": "https://arxiv.org/abs/2312.00752"}]
     saved, _ = await run(runtime, "save that as a markdown file")
     note = next(notes_dir.glob("*.md")).read_text(encoding="utf-8")
     assert "Mamba is linear-time" in note and "[Mamba paper](https://arxiv.org/abs/2312.00752)" in note

@@ -130,7 +130,7 @@ def is_complex_query(query: str) -> bool:
     return bool(_COMPLEX_QUERY_RE.search(q))
 
 
-def is_vision_Capable(model_name: str) -> bool:
+def is_vision_capable(model_name: str) -> bool:
     """True if the Ollama model tag is a known multimodal vision model."""
     low = (model_name or "").lower()
     return any(v in low for v in ("gemma4", "llava", "gemma3", "vl", "vision", "minicpm-v", "moondream", "bakllava", "pixtral"))
@@ -197,6 +197,8 @@ def candidate_names(
 def fixed_num_ctx_for_model(model_name: str, role: str = "writer", configured_ctx: int | None = None) -> int:
     """v1.5 Plan §3.3: Return ONE fixed num_ctx per model tag so Ollama never reloads on role transitions."""
     m_low = (model_name or "").lower()
+    if "granite" in m_low:
+        return 6144
     if "32k" in m_low:
         return 32768 if role == "reader" else MAX_INTERACTIVE_CTX
     if configured_ctx is not None and not model_name:
@@ -228,10 +230,8 @@ def build_options(
 def choose_model(candidates: list[str], installed: list[str], allow_excluded: bool = False) -> tuple[str | None, bool]:
     """Return (model, was_configured). Excludes oversized models (e.g. gemma4:26b) unless explicitly requested."""
     pool = list(installed) if allow_excluded else [m for m in installed if not is_excluded_model(m)]
-    if not pool and installed:
-        pool = list(installed)
     for cand in candidates:
-        search_pool = list(installed) if is_excluded_model(cand) else pool
+        search_pool = pool
         found = match_models(cand, search_pool)
         if found:
             return min(found, key=_variant_rank), True

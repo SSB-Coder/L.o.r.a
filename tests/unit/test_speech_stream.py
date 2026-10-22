@@ -84,3 +84,28 @@ def test_nothing_to_say_still_signals_done():
     st = SpeechStreamer(lambda s: s, lambda c, stop: None, on_done=lambda spoke: (res.update(spoke=spoke), done.set()))
     st.finish("```code only```")
     assert done.wait(2) and res["spoke"] is False
+
+
+def test_shutdown_drops_queued_speech_and_joins_both_threads(caplog):
+    entered, closed = threading.Event(), threading.Event()
+    calls, played = [], []
+
+    def synthesize(text):
+        calls.append(text)
+        entered.set()
+        closed.wait(3)
+        return text
+
+    stream = SpeechStreamer(synthesize, lambda text, stop: played.append(text))
+    stream.feed("First sentence. Second sentence. Third sentence. ")
+    try:
+        assert entered.wait(2)
+        stream.stop()
+        assert not stream.wait(timeout=.01), "Pending native synthesis should keep the producer alive"
+    finally:
+        closed.set()
+        stream.stop()
+    assert stream.wait(timeout=2)
+    assert calls == ["First sentence."] and played == []
+    assert not stream.has_pending and not stream.active
+    assert not caplog.records

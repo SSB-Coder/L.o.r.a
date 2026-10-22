@@ -39,7 +39,11 @@ class CorroborationChecker:
             return url.lower()
 
     def detect_contradictions(self, cards: list[EvidenceCard]) -> list[str]:
-        """Detect opposing negation polarity or conflicting numbers on shared entities across sources."""
+        """Flag direct polarity reversals of the same sentence-level assertion.
+
+        Shared topic words plus unrelated negation in a long page are not a
+        contradiction. Paraphrased conflicts need semantic review instead.
+        """
         if len(cards) < 2:
             return []
         conflicts: list[str] = []
@@ -49,18 +53,21 @@ class CorroborationChecker:
                 d1, d2 = self._extract_domain(c1.source_url), self._extract_domain(c2.source_url)
                 if d1 and d2 and d1 == d2:
                     continue
-                t1 = re.sub(r"[^\w\s]", " ", c1.exact_quote.lower()).split()
-                t2 = re.sub(r"[^\w\s]", " ", c2.exact_quote.lower()).split()
-                w1 = {w for w in t1 if len(w) > 3 and w not in _STOP_WORDS and not w.isdigit()}
-                w2 = {w for w in t2 if len(w) > 3 and w not in _STOP_WORDS and not w.isdigit()}
-                shared = w1 & w2
-                if len(shared) < 2:
-                    continue
-                neg1 = bool(set(t1) & _NEG_WORDS)
-                neg2 = bool(set(t2) & _NEG_WORDS)
-                if neg1 != neg2:
+                def assertions(text):
+                    out = []
+                    for sentence in re.split(r"(?<=[.!?])\s+|\n+", text.lower()):
+                        words = re.findall(r"\b[\w'-]+\b", sentence.replace("n't", " not"))
+                        negative = any(w in {"not", "never"} for w in words)
+                        core = tuple(w for w in words if w not in {"not", "never"})
+                        if len(core) >= 4:
+                            out.append((core, negative))
+                    return out
+                conflicts_here = [(a, neg_a) for a, neg_a in assertions(c1.exact_quote)
+                                  for b, neg_b in assertions(c2.exact_quote)
+                                  if a == b and neg_a != neg_b]
+                if conflicts_here:
                     conflicts.append(
-                        f"Source [{c1.card_id}] ({c1.title or d1}) vs [{c2.card_id}] ({c2.title or d2}) disagree on {' '.join(sorted(shared)[:3])}."
+                        f"Source [{c1.card_id}] vs [{c2.card_id}] directly oppose: {' '.join(conflicts_here[0][0])}."
                     )
         return conflicts
 

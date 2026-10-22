@@ -1,4 +1,4 @@
-"""Persistent and In-Memory FAISS Vector Database for Files & Media using EmbeddingGemma-2."""
+"""Persistent CPU vector retrieval for files and media using local embeddings."""
 
 import functools
 import hashlib
@@ -11,27 +11,25 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-try:
-    import faiss
-except (ImportError, OSError):
-    faiss = None
 import numpy as np
 
 from lora.grounding.chunk import DocumentChunk, DocumentChunker
 from lora.grounding.embed import DEFAULT_MODEL_PATH, EmbeddingEngine
+from lora.grounding.vector_index import load_index, make_index, save_index
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MEDIA_STORAGE = Path("data/media_db")
+DEFAULT_MEDIA_STORAGE = Path(__file__).resolve().parents[3] / "data" / "media_db"
+INGEST_VERSION = 2
 
 
 class MediaVectorDB:
-    """FAISS-powered vector database for user files and media assets.
+    """Exact CPU vector database for user files and media assets.
 
     Features:
     - Multi-modal file ingestion: PDF, TXT, MD, CSV, JSON, Code, Images, Audio.
     - Semantic chunking and vector indexing via EmbeddingGemma-2.
-    - Fast sub-millisecond inner-product (cosine) search with FAISS CPU.
+    - Exact inner-product search with NumPy or optional FAISS CPU.
     - Dynamic file removal with vector index rebuilding.
     - In-memory querying and persistence to disk.
     - Agent reporting tool for executive summaries across all indexed files.
@@ -65,33 +63,25 @@ class MediaVectorDB:
 
     def _init_index(self, dim: int) -> None:
         self._dimension = dim
-        self._index = faiss.IndexFlatIP(dim) if faiss is not None else None
+        self._index = make_index(dim)
 
-    def _extract_file_content(self, path: Path) -> tuple[str, list[tuple[int, str]], str]:
+    def _extract_file_content(self, path: Path) -> tuple[str, list[tuple[int | None, str]], str]:
         """Extract text content and page/segment breakdown according to file type."""
         suffix = path.suffix.lower()
         full_text = ""
         pages: list[tuple[int, str]] = []
         media_type = "document"
 
-        # 1. PDF via PyMuPDF
-        if suffix == ".pdf":
-            media_type = "pdf"
-            try:
-                try:
-                    import pymupdf as fitz
-                except ImportError:
-                    import fitz
+        if suffix in (".pdf", ".docx"):
+            from lora.safety.parsers import MAX_INPUT_BYTES, parse_document
 
-                with fitz.open(str(path)) as doc:
-                    for i in range(len(doc)):
-                        pg_text = doc[i].get_text()
-                        if pg_text.strip():
-                            pages.append((i + 1, pg_text))
-                full_text = "\n\n".join(t for _, t in pages)
-            except Exception as e:
-                logger.warning("Could not read PDF with PyMuPDF: %s", e)
-                full_text = f"[PDF file: {path.name}]"
+            if path.stat().st_size > MAX_INPUT_BYTES:
+                raise ValueError("Document exceeds parser input limit")
+            result = parse_document(suffix[1:], path.read_bytes())
+            media_type = suffix[1:]
+            pages = [(p.get("page") if suffix == ".pdf" else None, p["text"])
+                     for p in result["pages"] if p["text"].strip()]
+            full_text = "\n\n".join(t for _, t in pages)
 
         # 2. Images: extract metadata and resolution
         elif suffix in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"):
@@ -117,8 +107,9 @@ class MediaVectorDB:
         elif suffix in (".wav", ".mp3", ".ogg", ".flac", ".m4a"):
             media_type = "audio"
             try:
-                from lora.voice.stt import FasterWhisperTranscriber
                 import soundfile as sf  # type: ignore
+
+                from lora.voice.stt import FasterWhisperTranscriber
 
                 data, sr = sf.read(str(path))
                 if data.ndim > 1:
@@ -137,14 +128,18 @@ class MediaVectorDB:
 
         # 4. Standard text/code/markdown/json/csv
         else:
+            allowed = {".txt", ".md", ".csv", ".json", ".py", ".js", ".ts", ".tsx", ".jsx",
+                       ".html", ".css", ".yaml", ".yml", ".toml", ".xml", ".sql", ".log", ".rst"}
+            if suffix not in allowed:
+                raise ValueError(f"Unsupported source format: {suffix or 'unknown'}")
+            if path.stat().st_size > 8_000_000:
+                raise ValueError("Text source exceeds 8 MB limit")
             media_type = "text" if suffix in (".txt", ".md", ".csv") else "code"
-            try:
-                full_text = path.read_text(encoding="utf-8", errors="replace")
-                pages.append((1, full_text))
-            except Exception as e:
-                logger.warning("Could not read text file: %s", e)
-                full_text = f"File {path.name}"
-                pages.append((1, full_text))
+            raw = path.read_bytes()
+            if b"\x00" in raw or raw.startswith(b"PK\x03\x04"):
+                raise ValueError("Source contains binary data rather than UTF-8 text")
+            full_text = raw.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+            pages.append((None, full_text))
 
         return full_text, pages, media_type
 
@@ -160,6 +155,13 @@ class MediaVectorDB:
         # Check if already indexed
         for fid, fmeta in self._files.items():
             if Path(fmeta["path"]).resolve() == p:
+                if fmeta.get("ingest_version") != INGEST_VERSION:
+                    replacement = MediaVectorDB(self.embedding_engine, self.storage_dir)
+                    result = replacement.add_file(p, tags or fmeta.get("tags"))
+                    if result["status"] != "success":
+                        return result
+                    self._append_replacement(replacement, fid)
+                    return {**result, "reindexed": True, "total_files": self.file_count, "total_chunks": self.chunk_count}
                 return {
                     "status": "exists",
                     "file_id": fid,
@@ -167,7 +169,13 @@ class MediaVectorDB:
                 }
 
         file_id = f"file-{uuid.uuid4().hex[:8]}"
-        full_text, pages, media_type = self._extract_file_content(p)
+        started = time.perf_counter()
+        try:
+            full_text, pages, media_type = self._extract_file_content(p)
+        except Exception as exc:
+            logger.warning("Source extraction failed for %s: %s", p.name, exc)
+            return {"status": "error", "message": f"Could not extract {p.name}: {exc}"}
+        extracted_at = time.perf_counter()
 
         if not full_text.strip():
             return {
@@ -190,6 +198,7 @@ class MediaVectorDB:
                 source_url=str(p),
                 title=p.name,
                 tier=1,
+                page_number=pages[0][0] if pages else None,
             )
 
         if not chunks:
@@ -201,7 +210,7 @@ class MediaVectorDB:
                     title=p.name,
                     text=full_text[:1200],
                     paragraph_index=0,
-                    page_number=1,
+                    page_number=pages[0][0] if pages else None,
                     token_count=len(full_text.split()),
                     tier=1,
                     content_hash=hashlib.sha256(full_text.encode("utf-8")).hexdigest()[:16],
@@ -211,6 +220,7 @@ class MediaVectorDB:
         # Compute embeddings via EmbeddingGemma-2
         texts = [c.text for c in chunks]
         embeddings = self.embedding_engine.encode(texts)
+        embedded_at = time.perf_counter()
 
         dim = embeddings.shape[1] if len(embeddings) > 0 else 768
         if self._index is None:
@@ -236,15 +246,25 @@ class MediaVectorDB:
             "chunk_ids": chunk_ids,
             "tags": tags or [],
             "added_at": time.time(),
+            "ingest_version": INGEST_VERSION,
+            "extracted_chars": len(full_text),
+            "estimated_tokens": self.chunker._estimate_tokens(full_text),
+            "min_chunk_tokens": min(c.token_count for c in chunks),
+            "max_chunk_tokens": max(c.token_count for c in chunks),
+            "extraction_seconds": round(extracted_at - started, 3),
+            "embedding_seconds": round(embedded_at - extracted_at, 3),
         }
 
         logger.info(
-            "Indexed '%s' (%s) -> %d chunks into FAISS (Total chunks: %d)",
+            "Indexed '%s' (%s) -> %d vector chunks (Total chunks: %d)",
             p.name,
             media_type,
             len(chunks),
             len(self._chunks),
         )
+        logger.info("Source timings: extraction=%.3fs embedding/chunking=%.3fs chars=%d chunks=%d estimated_tokens=%d..%d",
+                    extracted_at - started, embedded_at - extracted_at, len(full_text), len(chunks),
+                    min(c.token_count for c in chunks), max(c.token_count for c in chunks))
 
         return {
             "status": "success",
@@ -256,6 +276,20 @@ class MediaVectorDB:
             "total_files": len(self._files),
             "vector_dimension": dim,
         }
+
+    def _append_replacement(self, replacement: "MediaVectorDB", old_id: str) -> None:
+        """Commit a reindex only after all replacement vectors are ready."""
+        retained = [c for c in self._chunks if self._chunk_to_file.get(c.chunk_id) != old_id]
+        chunks = retained + replacement._chunks
+        vectors = self.embedding_engine.encode([c.text for c in chunks])
+        index = make_index(vectors.shape[1])
+        index.add(vectors)
+        files = {fid: meta for fid, meta in self._files.items() if fid != old_id}
+        files.update(replacement._files)
+        mapping = {c.chunk_id: self._chunk_to_file[c.chunk_id] for c in retained}
+        mapping.update(replacement._chunk_to_file)
+        self._index, self._dimension, self._chunks = index, vectors.shape[1], chunks
+        self._files, self._chunk_to_file = files, mapping
 
     def remove_file(self, file_id_or_path: str) -> dict[str, Any]:
         """Remove a file and its vectors from the FAISS database."""
@@ -303,7 +337,7 @@ class MediaVectorDB:
         self._chunks = remaining_chunks
 
         if self._dimension is not None:
-            self._index = faiss.IndexFlatIP(self._dimension) if faiss is not None else None
+            self._index = make_index(self._dimension)
             if self._chunks and self._index is not None:
                 texts = [c.text for c in self._chunks]
                 embeddings = self.embedding_engine.encode(texts)
@@ -331,8 +365,11 @@ class MediaVectorDB:
         return list(self._files.values())
 
     def get_vector_db(self) -> dict[str, Any]:
-        """Return the raw FAISS vector database object and runtime status."""
+        """Return the vector index and runtime status (legacy key retained)."""
+        from lora.grounding.vector_index import backend_name
+
         return {
+            "backend": backend_name(),
             "faiss_index": self._index,
             "dimension": self._dimension,
             "total_chunks": len(self._chunks),
@@ -374,6 +411,7 @@ class MediaVectorDB:
                     "media_type": fmeta.get("media_type", "document"),
                     "text": chunk.text,
                     "page_number": chunk.page_number,
+                    "section": chunk.section,
                     "score": round(f_score, 4),
                 })
 
@@ -385,7 +423,7 @@ class MediaVectorDB:
         file_ids: list[str] | None = None,
         top_k: int = 6,
     ) -> dict[str, Any]:
-        """Reads indexed files and media and generates a structured research report."""
+        """Return index diagnostics and sample passages, not a prose summary."""
         if not self._files:
             return {
                 "status": "empty",
@@ -415,7 +453,8 @@ class MediaVectorDB:
                             "media_type": meta["media_type"],
                             "text": chunk.text,
                             "page_number": chunk.page_number,
-                            "score": 1.0,
+                            "section": chunk.section,
+                            "score": None,
                         })
 
         # 2. Compile structured report
@@ -425,22 +464,38 @@ class MediaVectorDB:
                 "filename": f["filename"],
                 "media_type": f["media_type"],
                 "chunks": f["chunk_count"],
+                "extracted_chars": f.get("extracted_chars"),
+                "estimated_tokens": f.get("estimated_tokens"),
+                "min_chunk_tokens": f.get("min_chunk_tokens"),
+                "max_chunk_tokens": f.get("max_chunk_tokens"),
+                "extraction_seconds": f.get("extraction_seconds"),
+                "embedding_seconds": f.get("embedding_seconds"),
             }
             for f in self._files.values()
+            if not file_ids or f["file_id"] in file_ids
         ]
 
         # Synthesis
         findings = []
         for i, hit in enumerate(hits, 1):
             snippet = hit["text"][:240].replace("\n", " ").strip()
+            location = f", p.{hit['page_number']}" if hit.get("page_number") else ""
+            if hit.get("section"):
+                location += f", section: {hit['section']}"
+            label = f"similarity: {hit['score']}" if hit["score"] is not None else "sample passage"
             findings.append(
-                f"[S{i}] ({hit['filename']}, p.{hit['page_number']}): \"{snippet}...\" (match score: {hit['score']})"
+                f"[S{i}] ({hit['filename']}{location}): \"{snippet}...\" ({label})"
             )
 
         summary_text = (
-            f"Analyzed {len(sources_summary)} indexed file(s) across {len(self._chunks)} chunks "
-            f"using EmbeddingGemma-2 FAISS vector database. Found {len(hits)} relevant passage(s)."
+            f"Analyzed {len(sources_summary)} indexed file(s) across {sum(s['chunks'] for s in sources_summary)} chunks. "
+            + (f"Found {len(hits)} retrieved passage(s)." if query.strip() else
+               f"Showing {len(hits)} sample passage(s), up to two per file; this is not a relevance search.")
         )
+        for source in sources_summary:
+            if source.get("extracted_chars") is not None:
+                summary_text += (f"\n{source['filename']}: {source['extracted_chars']} extracted characters; "
+                                 f"{source['chunks']} chunks, estimated {source['min_chunk_tokens']}–{source['max_chunk_tokens']} tokens per chunk.")
 
         return {
             "status": "success",
@@ -451,6 +506,37 @@ class MediaVectorDB:
             "passages": hits,
         }
 
+    def summary_batches(self, max_chars: int = 10000, max_batches: int = 24) -> dict[str, Any]:
+        """Snapshot document-order passages for bounded writer synthesis.
+
+        Includes the end of each document when it fits. Any coverage limit is
+        explicit, and the index lock is released before model inference starts.
+        """
+        if max_chars < 1500 or max_batches < 1:
+            raise ValueError("Summary limits must allow at least one source chunk and one batch")
+        batches = []
+        included = 0
+        for number, (file_id, meta) in enumerate(self._files.items(), 1):
+            chunks = [chunk for chunk in self._chunks if self._chunk_to_file.get(chunk.chunk_id) == file_id]
+            pending = []
+            size = 0
+            for chunk in chunks:
+                text = chunk.text
+                if pending and size + len(text) > max_chars:
+                    batches.append({"id": f"S{number}", "title": meta["filename"], "text": "\n\n".join(pending)})
+                    pending, size = [], 0
+                if len(batches) >= max_batches:
+                    break
+                pending.append(text)
+                size += len(text) + 2
+                included += 1
+            if pending and len(batches) < max_batches:
+                batches.append({"id": f"S{number}", "title": meta["filename"], "text": "\n\n".join(pending)})
+            if len(batches) >= max_batches:
+                break
+        return {"batches": batches, "included_chunks": included, "total_chunks": len(self._chunks),
+                "partial": included < len(self._chunks), "files": self.list_files()}
+
     def save_db(self, target_dir: Path | str | None = None) -> Path:
         """Persist FAISS index and file metadata to disk."""
         out_dir = Path(target_dir) if target_dir else self.storage_dir
@@ -460,7 +546,7 @@ class MediaVectorDB:
         meta_file = out_dir / "metadata.json"
 
         if self._index is not None:
-            faiss.write_index(self._index, str(idx_file))
+            save_index(self._index, idx_file)
 
         meta_data = {
             "files": self._files,
@@ -482,12 +568,36 @@ class MediaVectorDB:
             return False
 
         try:
-            self._index = faiss.read_index(str(idx_file))
             meta_data = json.loads(meta_file.read_text(encoding="utf-8"))
+            if any(f.get("ingest_version") != INGEST_VERSION for f in meta_data.get("files", {}).values()):
+                rebuilt = MediaVectorDB(self.embedding_engine, self.storage_dir)
+                for source in meta_data["files"].values():
+                    result = rebuilt.add_file(source["path"], source.get("tags"))
+                    if result["status"] != "success":
+                        raise ValueError(f"Reindex required for {source['filename']}: {result.get('message', 'extraction failed')}")
+                self._index, self._dimension = rebuilt._index, rebuilt._dimension
+                self._chunks, self._files, self._chunk_to_file = rebuilt._chunks, rebuilt._files, rebuilt._chunk_to_file
+                logger.info("Rebuilt legacy source index from originals; saved index preserved until next save")
+                return True
+            chunks = [DocumentChunk(**c) for c in meta_data.get("chunks", [])]
+            try:
+                index = load_index(idx_file)
+            except ValueError as exc:
+                if not str(exc).startswith("Legacy FAISS index preserved") or not chunks:
+                    raise
+                # Metadata already contains the original text. Rebuild in RAM
+                # without importing the broken DLL or changing saved user files.
+                vectors = self.embedding_engine.encode([c.text for c in chunks])
+                index = make_index(vectors.shape[1])
+                index.add(vectors)
+                logger.info("Rebuilt legacy media vectors in RAM; original index preserved")
+            if index.ntotal != len(chunks):
+                raise ValueError("Persisted vector count does not match source chunks")
+            self._index = index
             self._files = meta_data.get("files", {})
-            self._dimension = meta_data.get("dimension")
+            self._dimension = index.d
             self._chunk_to_file = meta_data.get("chunk_to_file", {})
-            self._chunks = [DocumentChunk(**c) for c in meta_data.get("chunks", [])]
+            self._chunks = chunks
             logger.info("Loaded MediaVectorDB from %s with %d files", s_dir, len(self._files))
             return True
         except Exception as e:
@@ -505,6 +615,6 @@ def _locked(fn):
 
 
 # add/remove/search/report share one FAISS index; the UI adds files on a background thread.
-_LOCKED_METHODS = ("add_file", "remove_file", "search", "report_on_media", "save_db", "load_db", "list_files", "get_vector_db")
+_LOCKED_METHODS = ("add_file", "remove_file", "search", "report_on_media", "summary_batches", "save_db", "load_db", "list_files", "get_vector_db")
 for _name in _LOCKED_METHODS:
     setattr(MediaVectorDB, _name, _locked(getattr(MediaVectorDB, _name)))

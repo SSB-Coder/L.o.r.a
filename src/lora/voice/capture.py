@@ -2,9 +2,9 @@
 
 import logging
 import math
+import queue
 import threading
 import time
-from collections import deque
 from typing import Any
 
 import numpy as np
@@ -13,50 +13,55 @@ logger = logging.getLogger(__name__)
 
 
 class AudioBuffer:
-    """Thread-safe circular audio buffer for incoming microphone PCM frames."""
+    """Fixed-size NumPy ring; the audio callback never allocates Python floats."""
 
     def __init__(self, max_seconds: float = 10.0, sample_rate: int = 16000) -> None:
         self.sample_rate = sample_rate
-        self.max_samples = int(max_seconds * sample_rate)
-        self._buffer: deque[float] = deque(maxlen=self.max_samples)
+        self.max_samples = max(1, int(max_seconds * sample_rate))
+        self._buffer = np.empty(self.max_samples, dtype=np.float32)
+        self._position = 0
+        self._count = 0
         self._lock = threading.Lock()
 
     def write(self, samples: np.ndarray) -> None:
-        """Append 1D audio samples (float32, normalized between -1.0 and 1.0) into the buffer."""
-        flattened = samples.flatten().astype(np.float32)
+        data = np.asarray(samples, dtype=np.float32).reshape(-1)[-self.max_samples:]
+        if not len(data):
+            return
         with self._lock:
-            self._buffer.extend(flattened.tolist())
+            first = min(len(data), self.max_samples - self._position)
+            self._buffer[self._position:self._position + first] = data[:first]
+            remaining = len(data) - first
+            if remaining:
+                self._buffer[:remaining] = data[first:]
+            self._position = (self._position + len(data)) % self.max_samples
+            self._count = min(self.max_samples, self._count + len(data))
+
+    def _recent(self, take: int) -> np.ndarray:
+        start = (self._position - take) % self.max_samples
+        if not take:
+            return np.zeros(0, dtype=np.float32)
+        if start + take <= self.max_samples:
+            return self._buffer[start:start + take].copy()
+        return np.concatenate((self._buffer[start:], self._buffer[:take - (self.max_samples - start)]))
 
     def read_last_n_seconds(self, seconds: float) -> np.ndarray:
-        """Extract the most recent `seconds` worth of audio as float32 array."""
-        num_samples = int(seconds * self.sample_rate)
         with self._lock:
-            buf_len = len(self._buffer)
-            if buf_len == 0:
-                return np.zeros(0, dtype=np.float32)
-            take = min(num_samples, buf_len)
-            # Slice the last `take` elements from deque
-            # Using list comprehension or slice from list
-            recent = list(self._buffer)[-take:]
-            return np.array(recent, dtype=np.float32)
+            return self._recent(min(self._count, max(0, int(seconds * self.sample_rate))))
 
     def read_all(self) -> np.ndarray:
-        """Retrieve all currently buffered audio and clear the buffer."""
         with self._lock:
-            arr = np.array(list(self._buffer), dtype=np.float32)
-            self._buffer.clear()
-            return arr
+            result = self._recent(self._count)
+            self._count = self._position = 0
+            return result
 
     def clear(self) -> None:
-        """Clear all stored audio in the buffer."""
         with self._lock:
-            self._buffer.clear()
+            self._count = self._position = 0
 
     @property
     def duration_seconds(self) -> float:
-        """Current duration of buffered audio in seconds."""
         with self._lock:
-            return len(self._buffer) / self.sample_rate
+            return self._count / self.sample_rate
 
 
 class AudioCapture:
@@ -89,6 +94,12 @@ class AudioCapture:
         self._stream: Any = None
         self._callbacks: list[Any] = []
         self._resample: Any = None
+        self._lifecycle_lock = threading.RLock()
+        self._pending: queue.Queue = queue.Queue(maxsize=64)  # at most ~2 seconds
+        self._consumer: threading.Thread | None = None
+        self._consumer_stop = threading.Event()
+        self._generation = 0
+        self.dropped_blocks = 0
 
     # ----- status -----
     @property
@@ -121,19 +132,35 @@ class AudioCapture:
                     logger.exception("Audio chunk callback failed")
 
     def _audio_callback(self, indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
-        """Callback invoked by sounddevice for each audio block."""
-        if status:
-            logger.debug("Audio stream status: %s", status)
+        """Copy and enqueue only. Native inference must never run on PortAudio."""
         if not self.is_recording:
             return
         samples = indata[:, 0] if indata.ndim > 1 else indata
-        norm_samples = samples.astype(np.float32)
-        if self._resample is not None:
-            norm_samples = self._resample(norm_samples).astype(np.float32)
         self.blocks_received += 1
         self._last_block_time = time.monotonic()
-        self.buffer.write(norm_samples)
-        self._dispatch(norm_samples)
+        item = (self._generation, samples.astype(np.float32, copy=True))
+        try:
+            self._pending.put_nowait(item)
+        except queue.Full:
+            self.dropped_blocks += 1
+            try:
+                self._pending.get_nowait()
+                self._pending.put_nowait(item)
+            except (queue.Empty, queue.Full):
+                pass
+
+    def _consume_audio(self) -> None:
+        while not self._consumer_stop.is_set():
+            try:
+                generation, samples = self._pending.get(timeout=.1)
+            except queue.Empty:
+                continue
+            if generation != self._generation or not self.is_recording:
+                continue
+            if self._resample is not None:
+                samples = self._resample(samples).astype(np.float32)
+            self.buffer.write(samples)
+            self._dispatch(samples)
 
     def feed_samples(self, samples: np.ndarray) -> None:
         """Feed synthetic or file audio samples directly (used in tests or offline pipeline)."""
@@ -149,10 +176,19 @@ class AudioCapture:
         return lambda x: resample_poly(x, up, down)
 
     def start(self) -> bool:
+        with self._lifecycle_lock:
+            return self._start()
+
+    def _start(self) -> bool:
         """Open the default (or configured) microphone. Returns True if a stream is running."""
         if self.is_streaming:
             return True
         self.is_recording = True
+        self._generation += 1
+        self._consumer_stop.clear()
+        if self._consumer is None or not self._consumer.is_alive():
+            self._consumer = threading.Thread(target=self._consume_audio, daemon=True, name="lora-mic-consumer")
+            self._consumer.start()
         self.last_error = None
         try:
             import sounddevice as sd
@@ -175,6 +211,7 @@ class AudioCapture:
             attempts.append((native, max(1, round(self.chunk_size * native / self.sample_rate))))
 
         for rate, block in attempts:
+            stream = None
             try:
                 stream = sd.InputStream(
                     device=self.device,
@@ -196,6 +233,11 @@ class AudioCapture:
                 )
                 return True
             except Exception as exc:
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        logger.debug("Failed input stream cleanup", exc_info=True)
                 self.last_error = f"{self.device_name}: {type(exc).__name__}: {exc}"
                 logger.warning("Could not open microphone at %d Hz: %s", rate, self.last_error)
 
@@ -205,7 +247,12 @@ class AudioCapture:
 
     def stop(self) -> None:
         """Stop capturing audio."""
+        with self._lifecycle_lock:
+            self._stop()
+
+    def _stop(self) -> None:
         self.is_recording = False
+        self._generation += 1
         if self._stream is not None:
             try:
                 self._stream.stop()
@@ -213,3 +260,14 @@ class AudioCapture:
             except Exception:
                 pass
             self._stream = None
+        while True:
+            try:
+                self._pending.get_nowait()
+            except queue.Empty:
+                break
+
+    def close(self) -> None:
+        self.stop()
+        self._consumer_stop.set()
+        if self._consumer is not None and self._consumer is not threading.current_thread():
+            self._consumer.join(timeout=2)

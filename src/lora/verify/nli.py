@@ -3,16 +3,21 @@
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict
 
+from lora.verify.evidence import relevant_excerpt
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_NLI_MODEL = os.getenv("LORA_NLI_MODEL", "vectara/hallucination_evaluation_model")
 _SHARED_EMBEDDER: Any = None
+_MODEL_CACHE: dict[tuple[str, str], Any] = {}
+_MODEL_LOCK = threading.Lock()
 
 
 def _get_shared_embedder() -> Any:
@@ -40,6 +45,8 @@ class NliScoreResult(BaseModel):
 
     score: float
     is_entailed: bool
+    backend: str = "model"
+    reliable: bool = True
 
 
 class NliGroundednessChecker:
@@ -61,18 +68,36 @@ class NliGroundednessChecker:
         if os.getenv("LORA_VERIFY_OFFLINE", "0") == "1" or os.getenv("LORA_VERIFY_NLI", "1") == "0":
             return None
         if self._model is None and not self._model_failed:
+            with _MODEL_LOCK:
+                key = (self.model_name, self.device)
+                if key not in _MODEL_CACHE:
+                    _MODEL_CACHE[key] = self._load_uncached()
+                self._model = _MODEL_CACHE[key]
+                self._model_failed = self._model is None
+        return self._model
+
+    def _load_uncached(self) -> Any:
+        if self._model is None and not self._model_failed:
             p = Path(self.model_name)
             is_local = p.exists()
             try:
+                if not is_local:
+                    from huggingface_hub import try_to_load_from_cache
+
+                    config = try_to_load_from_cache(self.model_name, "config.json")
+                    if not isinstance(config, str):
+                        logger.warning("NLI weights are not installed locally; independent LLM checking remains available. Set LORA_NLI_MODEL to local weights to enable NLI.")
+                        self._model_failed = True
+                        return None
                 from sentence_transformers import CrossEncoder
 
                 logger.info("Loading NLI groundedness model '%s' on %s", self.model_name, self.device)
                 if is_local:
-                    self._model = CrossEncoder(str(p.resolve()), device=self.device, trust_remote_code=True, local_files_only=True)
+                    self._model = CrossEncoder(str(p.resolve()), device="cpu", trust_remote_code=True, local_files_only=True)
                 else:
                     # Online model id; try loading with local_files_only=True first to avoid hanging on network
                     try:
-                        self._model = CrossEncoder(self.model_name, device=self.device, trust_remote_code=True, local_files_only=True)
+                        self._model = CrossEncoder(self.model_name, device="cpu", trust_remote_code=True, local_files_only=True)
                     except Exception:
                         self._model_failed = True
                         return None
@@ -141,7 +166,7 @@ class NliGroundednessChecker:
                     best = sc2
 
         # Blend with neural EmbeddingGemma-2 cosine similarity when available and no negation conflict exists
-        embedder = _get_shared_embedder()
+        embedder = None  # Similarity is not entailment; never boost truth scores with embeddings.
         if embedder is not None and best > 0.25:
             try:
                 windows = (sents[:12] if sents else [premise[:1200]])
@@ -174,7 +199,7 @@ class NliGroundednessChecker:
 
         if model is not None:
             try:
-                scores = model.predict([[premise[:1800], hypothesis]])
+                scores = model.predict([[relevant_excerpt(premise, hypothesis, 1800), hypothesis]])
                 score = float(scores[0])
                 if score < 0.0 or score > 1.0:
                     import math
@@ -188,7 +213,10 @@ class NliGroundednessChecker:
                 logger.warning("Error in NLI model predict: %s. Using heuristic.", e)
 
         heuristic_score = self._heuristic_entailment_score(premise, hypothesis)
+        logger.debug("NLI unavailable: heuristic diagnostics only; cross-family verification required")
         return NliScoreResult(
             score=heuristic_score,
             is_entailed=heuristic_score >= self.threshold,
+            backend="heuristic",
+            reliable=False,
         )

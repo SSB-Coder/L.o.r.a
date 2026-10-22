@@ -137,7 +137,7 @@ def test_media_tools_registered_in_tool_registry(tmp_path: Path):
 
     tools = {t["name"]: t for t in registry.list_tools()}
     assert "add_media_file" in tools
-    assert "remove_media_file" in tools
+    assert "remove_media_file" not in tools  # Manual HUD removal remains available; model removal is deferred.
     assert "list_media_files" in tools
     assert "search_media_db" in tools
     assert "report_on_media" in tools

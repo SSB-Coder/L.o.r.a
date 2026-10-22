@@ -1,6 +1,7 @@
 """Unit tests for CPU EmbeddingEngine and ephemeral SessionVectorIndex."""
 
 import numpy as np
+import pytest
 
 from lora.grounding.chunk import DocumentChunk
 from lora.grounding.embed import EmbeddingEngine
@@ -96,13 +97,14 @@ def test_session_vector_index_empty_query():
     assert index.search("", top_k=5) == []
 
 
-def test_embedding_engine_with_mocked_transformer(monkeypatch):
+@pytest.mark.parametrize("dimension_method", ["get_embedding_dimension", "get_sentence_embedding_dimension"])
+def test_embedding_engine_with_mocked_transformer(monkeypatch, dimension_method):
     import sys
     from unittest.mock import MagicMock
 
     mock_st_class = MagicMock()
-    mock_instance = MagicMock()
-    mock_instance.get_sentence_embedding_dimension.return_value = 768
+    mock_instance = MagicMock(spec=[dimension_method, "encode"])
+    getattr(mock_instance, dimension_method).return_value = 768
     mock_instance.encode.return_value = np.ones((2, 768), dtype=np.float32)
     mock_st_class.return_value = mock_instance
 

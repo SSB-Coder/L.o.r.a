@@ -2,12 +2,14 @@
 
 import json
 import re
+import ssl
 from collections.abc import AsyncIterator, Sequence
 from typing import Any, TypeVar
 
 import httpx
 from pydantic import BaseModel, ValidationError
 
+from lora.models.scheduler import serialized_model_call
 from lora.models.schemas import ChatMessage, OllamaChatResponse
 
 T = TypeVar("T", bound=BaseModel)
@@ -113,6 +115,14 @@ class OllamaClient:
     def _chat_timeout(self) -> httpx.Timeout:
         return httpx.Timeout(self.chat_timeout, connect=5.0)
 
+    def _http_client(self, **kwargs) -> httpx.AsyncClient:
+        # HTTP loopback never performs TLS. Avoid loading the full Windows CA
+        # store for every local tags/chat request. HTTPS still verifies normally.
+        if self.base_url.startswith("http://"):
+            kwargs["verify"] = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        return httpx.AsyncClient(trust_env=False, **kwargs)
+
+    @serialized_model_call
     async def warm_up(
         self,
         model: str,
@@ -128,7 +138,7 @@ class OllamaClient:
         if options:
             payload["options"] = options
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=5.0)) as client:
+            async with self._http_client(timeout=httpx.Timeout(timeout, connect=5.0)) as client:
                 res = await client.post(f"{self.base_url}/api/generate", json=payload)
                 return res.status_code == 200
         except httpx.HTTPError:
@@ -165,7 +175,7 @@ class OllamaClient:
     async def is_online(self) -> bool:
         """Check if the Ollama daemon is reachable and responding."""
         try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
+            async with self._http_client(timeout=3.0) as client:
                 res = await client.get(f"{self.base_url}/api/tags")
                 return res.status_code == 200
         except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPError):
@@ -173,13 +183,14 @@ class OllamaClient:
 
     async def list_models(self) -> list[dict[str, Any]]:
         """List currently downloaded models in Ollama."""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with self._http_client(timeout=self.timeout) as client:
             res = await client.get(f"{self.base_url}/api/tags")
             if res.status_code != 200:
                 raise OllamaClientError(f"Failed to list models: HTTP {res.status_code}")
             data = res.json()
             return data.get("models", [])
 
+    @serialized_model_call
     async def generate_chat(
         self,
         model: str,
@@ -211,7 +222,7 @@ class OllamaClient:
         if keep_alive is not None:
             payload["keep_alive"] = keep_alive
 
-        async with httpx.AsyncClient(timeout=self._chat_timeout()) as client:
+        async with self._http_client(timeout=self._chat_timeout()) as client:
             try:
                 res = await client.post(f"{self.base_url}/api/chat", json=payload)
                 if res.status_code == 400 and think is not None and "think" in res.text.lower():
@@ -228,6 +239,7 @@ class OllamaClient:
                     f"Network error communicating with Ollama: {describe_exception(e)}"
                 ) from e
 
+    @serialized_model_call
     async def stream_chat(
         self,
         model: str,
@@ -235,10 +247,13 @@ class OllamaClient:
         options: dict[str, Any] | None = None,
         think: bool | str | None = None,
         keep_alive: str | int | None = None,
+        format: str | dict[str, Any] | None = None,
     ) -> AsyncIterator[str]:
         """Yield assistant text deltas as Ollama produces them (thinking tokens are skipped)."""
         normalized = [m.model_dump() if isinstance(m, ChatMessage) else m for m in messages]
         payload: dict[str, Any] = {"model": model, "messages": normalized, "stream": True}
+        if format is not None:
+            payload["format"] = format
         if options:
             payload["options"] = options
         if think is not None:
@@ -247,7 +262,7 @@ class OllamaClient:
             payload["keep_alive"] = keep_alive
 
         url = f"{self.base_url}/api/chat"
-        async with httpx.AsyncClient(timeout=self._chat_timeout()) as client:
+        async with self._http_client(timeout=self._chat_timeout()) as client:
             try:
                 for attempt in range(2):
                     async with client.stream("POST", url, json=payload) as res:
@@ -314,7 +329,7 @@ class OllamaClient:
                 raw_reply = await self.generate_chat(
                     model=model,
                     messages=messages,
-                    format="json",
+                    format=response_model.model_json_schema(),
                     options=options,
                 )
 

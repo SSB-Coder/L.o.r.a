@@ -1,10 +1,13 @@
 """Voice Activity Detection (VAD) and endpointing for L.O.R.A Voice Pipeline."""
 
+import logging
 from collections import deque
 from enum import StrEnum
 from typing import Any
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 class SpeechState(StrEnum):
@@ -26,12 +29,20 @@ class VoiceActivityDetector:
         min_speech_duration_seconds: float = 0.16,
         onnx_model_path: str | None = None,
         preroll_chunks: int = 16,  # ~512ms pre-roll at 512 samples / 16kHz (v1.5 Plan)
+        max_utterance_seconds: float = 20.0,
     ) -> None:
         self.sample_rate = sample_rate
         self.threshold = threshold
         self.silence_duration_seconds = silence_duration_seconds
         self.min_speech_duration_seconds = min_speech_duration_seconds
         self.state = SpeechState.SILENCE
+        self.max_samples = int(max(1.0, max_utterance_seconds) * sample_rate)
+        self._buffered_samples = 0
+        self.noise_floor = 0.002
+        self._warned_fallback = False
+        self._silero_h = np.zeros((1, 1, 128), dtype=np.float32)
+        self._silero_c = np.zeros((1, 1, 128), dtype=np.float32)
+        self._silero_context = np.zeros((1, 64), dtype=np.float32)
 
         self._session: Any = None
         self._silero_vad: Any = None
@@ -74,10 +85,25 @@ class VoiceActivityDetector:
         """Calculate speech probability for a single audio frame (typically 512 samples / 32ms)."""
         if self._silero_vad is not None and len(chunk) == 512:
             try:
-                probs = self._silero_vad(chunk)
-                return float(probs[0])
-            except Exception:
-                pass
+                # Calling SileroVADModel.__call__ on each 32ms frame resets its
+                # recurrent state. Keep per-stream state and acoustic context.
+                audio = chunk.astype(np.float32).reshape(1, -1)
+                inputs = np.concatenate((self._silero_context, audio), axis=1)
+                probs, self._silero_h, self._silero_c = self._silero_vad.session.run(
+                    None, {"input": inputs, "h": self._silero_h, "c": self._silero_c}
+                )
+                self._silero_context = audio[:, -64:].copy()
+                prob = float(np.asarray(probs).reshape(-1)[0])
+                rms = float(np.sqrt(np.mean(chunk ** 2)))
+                if prob < 0.15:
+                    self.noise_floor = 0.98 * self.noise_floor + 0.02 * min(rms, 0.03)
+                # Fan RMS can exceed a soft voice's RMS. Do not veto confident
+                # neural speech merely because the fan raised the noise floor.
+                return prob if rms >= 0.0001 else 0.0
+            except Exception as exc:
+                if not self._warned_fallback:
+                    logger.warning("Streaming VAD failed; energy fallback is less selective: %s", exc)
+                    self._warned_fallback = True
         if self._session is not None:
             try:
                 # Prepare tensor for Silero VAD ONNX: shape (1, len(chunk))
@@ -87,7 +113,14 @@ class VoiceActivityDetector:
                 return float(outputs[0][0][0])
             except Exception:
                 pass
+        if self._silero_vad is None and self._session is None and not self._warned_fallback:
+            logger.info("VAD uses energy fallback; neural noise rejection is unavailable")
+            self._warned_fallback = True
         return self.compute_energy_prob(chunk)
+
+    def _record(self, chunk: np.ndarray) -> None:
+        self._recorded_utterance_chunks.append(chunk)
+        self._buffered_samples += len(chunk)
 
     def process_chunk(self, chunk: np.ndarray) -> tuple[SpeechState, float]:
         """Process incoming audio chunk, track speech lifecycle, and return (state, speech_prob)."""
@@ -100,8 +133,9 @@ class VoiceActivityDetector:
             self._total_speech_samples += len(chunk)
             if self.state == SpeechState.SILENCE and not self._recorded_utterance_chunks:
                 self._recorded_utterance_chunks.extend(self._preroll)
+                self._buffered_samples += sum(len(c) for c in self._preroll)
                 self._preroll.clear()
-            self._recorded_utterance_chunks.append(chunk)
+            self._record(chunk)
 
             # Check if speech just started
             if self.state == SpeechState.SILENCE:
@@ -114,21 +148,24 @@ class VoiceActivityDetector:
                 # tolerate a brief inter-syllable dip (up to 6 frames / ~192ms) without wiping the onset buffer.
                 # Isolated 1-frame clicks (_consecutive_speech_frames == 1) reset immediately.
                 if self._consecutive_speech_frames >= 2 and self._consecutive_silence_frames <= 6:
-                    self._recorded_utterance_chunks.append(chunk)
+                    self._record(chunk)
                 else:
                     if self._recorded_utterance_chunks:
                         for c in self._recorded_utterance_chunks:
                             self._preroll.append(c)
                         self._recorded_utterance_chunks.clear()
+                        self._buffered_samples = 0
                     self._consecutive_speech_frames = 0
                     self._total_speech_samples = 0
                     self._preroll.append(chunk)
             elif self.state == SpeechState.SPEAKING:
-                self._recorded_utterance_chunks.append(chunk)
+                self._record(chunk)
                 silence_elapsed = self._consecutive_silence_frames * chunk_duration
                 if silence_elapsed >= self.silence_duration_seconds:
                     self.state = SpeechState.ENDED
 
+        if self._buffered_samples >= self.max_samples:
+            self.state = SpeechState.ENDED
         return self.state, prob
 
     def get_and_reset_utterance(self) -> np.ndarray:
@@ -149,3 +186,7 @@ class VoiceActivityDetector:
         self._total_speech_samples = 0
         self._recorded_utterance_chunks.clear()
         self._preroll.clear()
+        self._buffered_samples = 0
+        self._silero_h.fill(0)
+        self._silero_c.fill(0)
+        self._silero_context.fill(0)

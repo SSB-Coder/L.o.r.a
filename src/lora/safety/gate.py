@@ -6,6 +6,7 @@ audit logging, and dry-run modes before tool calls reach the operating system.
 
 import logging
 import threading
+import time
 from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any
@@ -55,15 +56,20 @@ class ActionGate:
         self.action_history: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self.audit_db_path = "logs/audit.db"
+        self._task_started = time.monotonic()
+        if policy_engine.config:
+            self.max_actions_per_task = min(max_actions_per_task, policy_engine.config.max_actions_per_task)
+        self.unattended_seconds = policy_engine.config.unattended_seconds if policy_engine.config else 180
 
     def reset_task(self) -> None:
         """Reset per-task counters for a new task session."""
         with self._lock:
             self.action_count = 0
             self.action_history.clear()
+            self._task_started = time.monotonic()
 
     def _log_audit(self, tool: str, origin: str, tier: int, res: PolicyResult, params: dict[str, Any]) -> None:
-        if tier >= 1 or not res.allowed:
+        if True:  # Every attempt, including read-only calls, is replayable.
             scrubbed = scrub_sensitive_data(params)
             logger.info(
                 "AUDIT origin=%s tool=%s tier=%d verdict=%s allowed=%s params=%s",
@@ -79,9 +85,9 @@ class ActionGate:
                 import sqlite3 as _sqlite3
                 import uuid as _uuid
                 from datetime import UTC, datetime
-                from pathlib import Path as _P
+                from pathlib import Path as _Path
 
-                db_file = _P(self.audit_db_path)
+                db_file = _Path(self.audit_db_path)
                 db_file.parent.mkdir(parents=True, exist_ok=True)
                 with _sqlite3.connect(str(db_file), timeout=2.0) as conn:
                     conn.execute(
@@ -107,7 +113,11 @@ class ActionGate:
                     )
                     conn.commit()
             except Exception:
-                pass
+                logger.exception("Audit persistence failed; action denied")
+                res.allowed = False
+                res.verdict = PolicyVerdict.HARD_DENY
+                res.reason = "Audit persistence unavailable"
+                res.rule_matched = "audit_unavailable"
 
     def verify_and_gate(
         self,
@@ -122,6 +132,12 @@ class ActionGate:
         provenance_dict = provenance or {}
         tier_int = int(tier)
         tool_lower = tool.lower()
+        if time.monotonic() - self._task_started > self.unattended_seconds:
+            res = PolicyResult(allowed=False, verdict=PolicyVerdict.ASK,
+                               reason="Unattended task time exceeded; re-confirm the task",
+                               rule_matched="unattended_budget")
+            self._log_audit(tool, origin, tier_int, res, params_dict)
+            return res
 
         # 1. Kill Switch verification
         if self.kill_switch.is_halted():

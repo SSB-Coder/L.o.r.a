@@ -5,11 +5,12 @@ import os
 from pathlib import Path
 from typing import Any
 
+from lora.core.paths import project_path
 from lora.grounding.chunk import DocumentChunk
 
 logger = logging.getLogger(__name__)
 
-LOCAL_RERANKER_PATH = Path("models/bge-reranker-base")
+LOCAL_RERANKER_PATH = project_path("models/bge-reranker-base")
 DEFAULT_RERANKER_MODEL = os.getenv(
     "LORA_RERANKER_MODEL",
     str(LOCAL_RERANKER_PATH.resolve()) if LOCAL_RERANKER_PATH.is_dir() else "BAAI/bge-reranker-base",

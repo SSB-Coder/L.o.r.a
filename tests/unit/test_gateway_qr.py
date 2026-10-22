@@ -5,7 +5,9 @@ from lora.gateway.qr import generate_pairing_qr_terminal, get_pairing_url
 
 def test_get_pairing_url():
     url = get_pairing_url(ip="192.168.50.10", port=8765, token="test_token_abc")
-    assert url == "http://192.168.50.10:8765/app?token=test_token_abc"
+    assert url == "http://192.168.50.10:8765/app/#token=test_token_abc"
+    from urllib.parse import urlparse
+    assert urlparse(url).query == ""
 
 
 def test_generate_pairing_qr_terminal():

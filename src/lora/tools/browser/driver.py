@@ -5,6 +5,7 @@ with zero cookies/session state) from the persistent user profile context (`_ens
 exclusively for `ask_other_ai`).
 """
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +90,7 @@ class PlaywrightBrowserDriver:
                 self._playwright = await async_playwright().start()
             self._context = await self._playwright.chromium.launch_persistent_context(
                 user_data_dir=str(self.user_data_dir),
+                accept_downloads=False,
                 headless=self.headless,
                 viewport={"width": 1280, "height": 800},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -108,14 +110,13 @@ class PlaywrightBrowserDriver:
         try:
             if self._ephemeral_browser is None or not self._ephemeral_browser.is_connected():
                 self._ephemeral_browser = await self._playwright.chromium.launch(headless=True)
-            ctx = await self._ephemeral_browser.new_context(
+            ctx = await self._ephemeral_browser.new_context(accept_downloads=False,
                 viewport={"width": 1280, "height": 800},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             )
             return ctx, True
         except Exception:
-            ctx = await self._ensure_context()
-            return ctx, False
+            raise RuntimeError("Cannot create isolated research browser context") from None
 
     async def fetch_page(self, url: str) -> dict[str, Any]:
         """Navigate to URL in a clean ephemeral context, render page, and extract clean text and metadata."""
@@ -134,7 +135,8 @@ class PlaywrightBrowserDriver:
             page = await context.new_page()
 
             async def intercept_route(route):
-                if route.request.resource_type in ["image", "media", "font"]:
+                check = self.egress_filter.check_egress(route.request.url, require_typing_allowlist=False)
+                if not check.allowed or route.request.method != "GET" or route.request.resource_type in ["image", "media", "font"]:
                     await route.abort()
                 else:
                     await route.continue_()
@@ -153,7 +155,7 @@ class PlaywrightBrowserDriver:
                     except Exception:
                         pass
 
-            extracted = self.extractor.extract_from_html(html, source_url=target_url)
+            extracted = await asyncio.to_thread(self.extractor.extract_from_html, html, source_url=target_url)
 
             return {
                 "status": "success",

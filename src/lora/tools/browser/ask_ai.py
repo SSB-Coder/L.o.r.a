@@ -27,13 +27,7 @@ class AskOtherAiTool:
     ) -> None:
         self.driver = driver or PlaywrightBrowserDriver()
         self.egress_filter = egress_filter or EgressFilter()
-        if prompt_optimizer is None:
-            try:
-                from lora.models.ollama_client import OllamaClient
-
-                prompt_optimizer = PromptOptimizerAgent(ollama_client=OllamaClient())
-            except Exception:
-                prompt_optimizer = PromptOptimizerAgent()
+        prompt_optimizer = prompt_optimizer or PromptOptimizerAgent()
         self.prompt_optimizer = prompt_optimizer
         self.adapters = {
             "chatgpt": ChatGPTAdapter(),
@@ -63,7 +57,7 @@ class AskOtherAiTool:
         5. Classification: Response is classified as Tier 4 untrusted lead.
         """
         # 1. Provenance Guard
-        if provenance == DataProvenance.UNTRUSTED:
+        if provenance not in {DataProvenance.USER, DataProvenance.SYSTEM}:
             return {
                 "status": "error",
                 "message": (
@@ -101,12 +95,16 @@ class AskOtherAiTool:
                 prompt=prompt,
                 target_ai=svc_key,
                 style=style,
-                deep=deep_optimize,
+                deep=False,
             )
             effective_prompt = opt_res.optimized_prompt
             redactions_count = opt_res.redacted_count
             redactions = opt_res.redactions
             applied_style = opt_res.style.value
+        # The deterministic egress scrubber also runs for pre-refined L2 text.
+        effective_prompt, final_redactions = self.prompt_optimizer.scrubber.scrub(effective_prompt)
+        redactions.extend(final_redactions)
+        redactions_count += len(final_redactions)
 
         # 5. Politeness rate limiting & Playwright automation (serialized with lock)
         async with self._lock:

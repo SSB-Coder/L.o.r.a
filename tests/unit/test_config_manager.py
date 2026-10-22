@@ -1,7 +1,14 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from lora.config.manager import ConfigManager, LoraUserConfig
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
 
 
 def test_config_manager_initialization(tmp_path: Path):
@@ -13,7 +20,7 @@ def test_config_manager_initialization(tmp_path: Path):
     assert paths.agents_dir == tmp_path / "agents"
     assert paths.memory_dir == tmp_path / "memory"
     assert paths.notebooks_dir == tmp_path / "notebooks"
-    assert paths.outputs_dir == tmp_path / "outputs"
+    assert paths.outputs_dir == Path.home() / "LORA" / "outputs"
     assert paths.config_file == tmp_path / "config.yaml"
     assert paths.mcp_file == tmp_path / "mcp.json"
     assert paths.user_profile_file == tmp_path / "memory" / "user_profile.md"
@@ -28,7 +35,8 @@ def test_ensure_ecosystem_creates_directories_and_defaults(tmp_path: Path):
     assert (tmp_path / "agents").is_dir()
     assert (tmp_path / "memory").is_dir()
     assert (tmp_path / "notebooks").is_dir()
-    assert (tmp_path / "outputs").is_dir()
+    assert not (tmp_path / "outputs").exists()
+    assert (Path.home() / "LORA" / "outputs").is_dir()
 
     # Check default files exist
     assert (tmp_path / "config.yaml").is_file()

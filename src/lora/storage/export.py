@@ -12,7 +12,7 @@ def get_default_outputs_dir() -> Path:
     env = os.environ.get("LORA_OUTPUTS_DIR")
     if env:
         return Path(env).expanduser().resolve()
-    home_dir = Path.home() / ".lora" / "outputs"
+    home_dir = Path.home() / "LORA" / "outputs"
     try:
         home_dir.mkdir(parents=True, exist_ok=True)
         test_file = home_dir / ".test_write"
@@ -55,7 +55,7 @@ class ReportExporter:
         header = f"# {title}\n*Exported by L.O.R.A on {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n"
         full_content = header + content.strip() + "\n"
 
-        target_path.write_text(full_content, encoding="utf-8")
+        target_path = self._write_new(target_path, full_content)
         logger.info("Exported markdown report to %s", target_path)
         return target_path
 
@@ -132,9 +132,22 @@ class ReportExporter:
 </body>
 </html>"""
 
-        target_path.write_text(html_doc, encoding="utf-8")
+        target_path = self._write_new(target_path, html_doc)
         logger.info("Exported HTML report to %s", target_path)
         return target_path
+
+    @staticmethod
+    def _write_new(target: Path, content: str) -> Path:
+        """Exclusive creation also protects against concurrent exports and symlinks."""
+        for i in range(10000):
+            candidate = target if i == 0 else target.with_name(f"{target.stem}_{i}{target.suffix}")
+            try:
+                with candidate.open("x", encoding="utf-8") as f:
+                    f.write(content)
+                return candidate
+            except FileExistsError:
+                continue
+        raise FileExistsError("Too many output filename collisions")
 
     def _make_safe_filename(self, title: str, filename: str | None, ext: str) -> str:
         if filename:

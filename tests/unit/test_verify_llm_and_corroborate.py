@@ -16,7 +16,7 @@ async def test_v4_llm_fact_checker_supported():
     mock_ollama.generate = AsyncMock(
         return_value=json.dumps({
             "supported": True,
-            "supporting_quote": "Transformers process tokens in parallel.",
+            "supporting_quote": "Transformers process tokens in parallel using self-attention.",
             "reason": "Direct textual support found.",
         })
     )
@@ -27,7 +27,7 @@ async def test_v4_llm_fact_checker_supported():
 
     res = await checker.verify_claim(premise=premise, claim=claim)
     assert res.is_supported is True
-    assert res.supporting_quote == "Transformers process tokens in parallel."
+    assert res.supporting_quote == "Transformers process tokens in parallel using self-attention."
 
 
 @pytest.mark.asyncio
@@ -47,6 +47,24 @@ async def test_v4_llm_fact_checker_unsupported():
     )
     assert res.is_supported is False
     assert res.supporting_quote is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supported, quote", [
+    (True, "Transformers process tokens in parallel."),
+    ("false", "Transformers process tokens in parallel using self-attention."),
+    ("true", "Transformers process tokens in parallel using self-attention."),
+    (1, "Transformers process tokens in parallel using self-attention."),
+    (True, None),
+])
+async def test_verifier_rejects_altered_quote_or_non_boolean_approval(supported, quote):
+    client = AsyncMock()
+    client.generate.return_value = json.dumps({"supported": supported, "supporting_quote": quote})
+    result = await LlmFactChecker(client).verify_claim(
+        premise="Transformers process tokens in parallel using self-attention.",
+        claim="Tokens are computed in parallel by transformers.",
+    )
+    assert result.is_supported is False
 
 
 def test_v5_corroboration_checker():

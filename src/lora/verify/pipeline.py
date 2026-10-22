@@ -90,48 +90,56 @@ class VerificationPipeline:
         llm_timed_out = 0
         max_llm_probes = 2
 
-        for claim in atomic_claims:
+        # CPU NLI work must not block cancellation or the desktop event loop.
+        def precheck():
+            checked = []
+            for claim in atomic_claims:
+                cited = [card_map[cid] for cid in claim.cited_sources if cid in card_map]
+                premise = "\n".join(c.exact_quote for c in cited) if cited else combined_premise
+                checked.append((premise, self.v6_numbers.verify_numbers(premise=premise, claim=claim.claim_text),
+                                self.v3_nli.check_entailment(premise=premise, hypothesis=claim.claim_text)))
+            return checked
+
+        preliminary = await asyncio.to_thread(precheck)
+        batch_results = {}
+        client = self.v4_llm.ollama_client
+        if client is not None and callable(getattr(type(client), "verify_claims", None)):
+            indices = [i for i, (_, num, nli) in enumerate(preliminary)
+                       if num.is_valid and not (nli.is_entailed and nli.reliable)
+                       and all(cid in card_map for cid in atomic_claims[i].cited_sources)]
+            if indices:
+                results = await client.verify_claims([(preliminary[i][0], atomic_claims[i].claim_text) for i in indices])
+                batch_results = dict(zip(indices, results, strict=True))
+                llm_probes = len(results)
+                llm_succeeded = sum(r.completed for r in results)
+                llm_timed_out = sum(not r.completed for r in results)
+
+        for claim_index, claim in enumerate(atomic_claims):
             cited_cards = [card_map[cid] for cid in claim.cited_sources if cid in card_map]
-            premise_text = (
-                "\n".join(c.exact_quote for c in cited_cards)
-                if cited_cards
-                else combined_premise
-            )
+            premise_text, num_res, nli_res = preliminary[claim_index]
             claim_premises.append(premise_text)
 
             # V6: Number check (check cited cards first, then full evidence pool if multi-source synthesis)
-            num_res = self.v6_numbers.verify_numbers(premise=premise_text, claim=claim.claim_text)
-            if not num_res.is_valid and cited_cards and len(cards) > len(cited_cards):
-                num_res_all = self.v6_numbers.verify_numbers(premise=combined_premise, claim=claim.claim_text)
-                if num_res_all.is_valid:
-                    num_res = num_res_all
-
-            # V3: NLI groundedness check
-            nli_res = self.v3_nli.check_entailment(
-                premise=premise_text, hypothesis=claim.claim_text
-            )
-            if not nli_res.is_entailed and cited_cards and len(cards) > len(cited_cards):
-                nli_all = self.v3_nli.check_entailment(
-                    premise=combined_premise, hypothesis=claim.claim_text
-                )
-                if nli_all.score > nli_res.score:
-                    nli_res = nli_all
-
-            is_supported = nli_res.is_entailed and num_res.is_valid
+            is_supported = nli_res.is_entailed and getattr(nli_res, "reliable", True) and num_res.is_valid
             reason = ""
 
-            if not num_res.is_valid:
+            if any(cid not in card_map for cid in claim.cited_sources):
+                is_supported = False
+                reason = "Claim cites a source that was not provided"
+            elif not num_res.is_valid:
                 reason = f"Mismatched numbers: {', '.join(num_res.mismatched_numbers)}"
-            elif not nli_res.is_entailed:
+            elif not is_supported:
                 # V4: Escalate to LLM fact checker (bounded probes + 20s timeout so verification never hangs)
-                if self.v4_llm.ollama_client is not None and llm_probes < max_llm_probes:
+                if claim_index in batch_results:
+                    v4_res = batch_results[claim_index]
+                elif self.v4_llm.ollama_client is not None and llm_probes < max_llm_probes:
                     llm_probes += 1
                     try:
                         v4_res = await asyncio.wait_for(
-                            self.v4_llm.verify_claim(premise=premise_text[:2400], claim=claim.claim_text),
+                            self.v4_llm.verify_claim(premise=premise_text, claim=claim.claim_text),
                             timeout=20.0,
                         )
-                        if "Error during LLM verification" in (v4_res.reason or ""):
+                        if not v4_res.completed:
                             llm_timed_out += 1
                             v4_res = await LlmFactChecker(ollama_client=None).verify_claim(
                                 premise=premise_text, claim=claim.claim_text
@@ -155,6 +163,9 @@ class VerificationPipeline:
                     reason = v4_res.reason or "Low NLI entailment score"
 
             # V5: Corroboration check
+            if is_supported and cited_cards and all(card.tier >= 4 for card in cited_cards):
+                is_supported = False
+                reason = "community-reported, unverified"
             corroboration = self.v5_corroborate.check_corroboration(
                 cards=cited_cards if cited_cards else cards
             )
@@ -169,6 +180,7 @@ class VerificationPipeline:
                     claim_id=claim.claim_id,
                     claim_text=claim.claim_text,
                     nli_score=nli_res.score,
+                    nli_reliable=nli_res.reliable,
                     is_supported=is_supported,
                     number_check_passed=num_res.is_valid,
                     corroboration=corroboration,
@@ -185,10 +197,10 @@ class VerificationPipeline:
             llm_probes += 1
             try:
                 v4_spot = await asyncio.wait_for(
-                    self.v4_llm.verify_claim(premise=weakest_premise[:2400], claim=weakest_cd.claim_text),
+                    self.v4_llm.verify_claim(premise=weakest_premise, claim=weakest_cd.claim_text),
                     timeout=20.0,
                 )
-                if "Error during LLM verification" in (v4_spot.reason or ""):
+                if not v4_spot.completed:
                     llm_timed_out += 1
                 else:
                     llm_succeeded += 1
@@ -198,6 +210,7 @@ class VerificationPipeline:
                             claim_id=weakest_cd.claim_id,
                             claim_text=weakest_cd.claim_text,
                             nli_score=weakest_cd.nli_score,
+                            nli_reliable=weakest_cd.nli_reliable,
                             is_supported=False,
                             number_check_passed=weakest_cd.number_check_passed,
                             corroboration=weakest_cd.corroboration,
@@ -217,8 +230,7 @@ class VerificationPipeline:
 
         # V8: Composite Faithfulness Score (blends binary support ratio with continuous NLI entailment)
         support_ratio = supported_count / len(atomic_claims)
-        avg_nli = sum(cd.nli_score for cd in claim_details) / len(claim_details)
-        composite_score = round(0.65 * support_ratio + 0.35 * avg_nli, 4)
+        composite_score = round(support_ratio, 4)
         if not v1_res.is_valid:
             composite_score = min(composite_score, 0.70)
         if llm_timed_out > 0 and llm_succeeded == 0:
@@ -238,7 +250,9 @@ class VerificationPipeline:
             repaired_answer = answer_text
         elif supported_count > 0:
             verdict = VerificationVerdict.REPAIRED
-            supported_texts = [cd.claim_text for cd in claim_details if cd.is_supported]
+            supported_texts = [cd.claim_text + (" " + "".join(f"[{cid}]" for cid in claim.cited_sources)
+                               if claim.cited_sources else "")
+                               for cd, claim in zip(claim_details, atomic_claims, strict=True) if cd.is_supported]
             repaired_core = " ".join(supported_texts)
             unverified_block = "\n\n*Could not verify: " + "; ".join(unverified_list) + "*"
             repaired_answer = f"{repaired_core}{unverified_block}"

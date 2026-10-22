@@ -22,6 +22,7 @@ _EXPORTS = {
     "TtsEngine": "lora.voice.tts.engine",
     "split_sentences": "lora.voice.tts.engine",
     "Qwen3TtsWorkerProcess": "lora.voice.tts.worker",
+    "KokoroTtsWorkerProcess": "lora.voice.tts.worker",
     "SpeechState": "lora.voice.vad",
     "VoiceActivityDetector": "lora.voice.vad",
     "SpeakerVerifier": "lora.voice.wakeword",

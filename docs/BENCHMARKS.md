@@ -1,40 +1,115 @@
-# L.O.R.A Hardware, Model & Gate Benchmarks (v1.5)
+> Earlier repair snapshot. Current behavior and validation: [WORKFLOW_RESTORATION.md](WORKFLOW_RESTORATION.md).
 
-**Target Reference Hardware**: ACER ALG (`i5-13420H`, `16 GB DDR5-4800`, `NVIDIA RTX 3050 Laptop 6 GB GDDR6`, `Windows 11`)
+# Benchmark and validation status
 
----
+Target hardware: RTX 3050 laptop, 6 GB VRAM, 16 GB RAM.
+Review date: 2026-10-21.
 
-## 1. Phase 1 — Empirically Verified VRAM & RAM Footprints
+The previous table contained performance percentages and PASS claims without
+raw run artifacts, used inconsistent hardware/model descriptions, and called
+a synthetic fixture human-labelled. Those numbers are withdrawn as acceptance
+evidence. Git history retains the previous document.
 
-Only **one** Ollama generative LLM is resident in the 6 GB RTX 4050 VRAM at any moment (`OLLAMA_MAX_LOADED_MODELS=1`, `OLLAMA_NUM_PARALLEL=1`, `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0`). All auxiliary models (STT, TTS, embeddings, reranker, NLI, Laya router) run strictly on CPU (`0 MB GPU VRAM`).
+## Checks actually executed in this repair
 
-| Role / Component | Model Identifier | Device | Quantization | `num_ctx` | Measured VRAM / RAM | Cold Load | Warm Latency / Throughput |
-|---|---|---|---|---|---|---|---|
-| **Base Writer / Fast Chat / Planner** | `spark-x25-4b` (`spark-x25-4b-8k:latest`) | GPU (CUDA) | Q4_K_M | `8192` | `3.28 GB VRAM` | `2.1 s` | `54.2 tok/s` (`TTFT: 190 ms`) |
-| **Complex / Verifier / Supervisor / Controller** | `granite4.2:8b` | GPU (CUDA) | Q4_K_M | `6144` | `5.08 GB VRAM` | `3.8 s` | `29.6 tok/s` (`TTFT: 340 ms`) |
-| **Reasoning / Critique Alternate** | `hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest` (`ornith-1.5:9b`) | GPU (CUDA) | Q4_K_M | `6144` | `5.38 GB VRAM` | `4.2 s` | `25.8 tok/s` (`TTFT: 380 ms`) |
-| **Vision / Multimodal** | `gemma4:e4b` | GPU (CUDA) | Q4_K_M | `8192` | `4.72 GB VRAM` | `3.4 s` | `33.1 tok/s` (`TTFT: 310 ms`) |
-| **Decision Router (L1)** | `models/laya-lora-ft` (Laya 20M) | CPU (ONNX/PT) | FP32 / INT8 | — | `0 MB VRAM` / `82 MB RAM` | `0.18 s` | `3.4 ms / query` |
-| **Wake Word + VAD (L1)** | `Silero VAD v5` + `Faster-Whisper` | CPU | INT8 | — | `0 MB VRAM` / `48 MB RAM` | `0.12 s` | `1.9 ms / 32 ms frame` |
-| **Speech-to-Text (L1)** | `faster-whisper` (`base.en` / `distil-small.en`) | CPU (CTranslate2) | INT8 | — | `0 MB VRAM` / `290 MB RAM` | `0.65 s` | `210 ms / 3 s clip` |
-| **Text-to-Speech (L1)** | `Kokoro-ONNX v1.0` (`af_sky`) | CPU (ONNX) | FP32 / INT8 | — | `0 MB VRAM` / `320 MB RAM` | `0.55 s` | `145 ms first sentence` |
-| **Dense Embeddings (L5)** | `models/embeddinggemma2` | CPU | FP32 | `512` | `0 MB VRAM` / `440 MB RAM` | `0.85 s` | `14 ms / batch (16)` |
-| **Cross-Encoder Reranker (L5)** | `models/bge-reranker-base` | CPU | FP32 | `512` | `0 MB VRAM` / `390 MB RAM` | `0.75 s` | `38 ms / 15 chunks` |
-| **NLI Groundedness (L6)** | `HHEM-2.1` + `EmbeddingGemma-2` hybrid | CPU | FP32 | `512` | `0 MB VRAM` / `410 MB RAM` | `0.70 s` | `28 ms / claim` |
+- Focused policy/auth/export/ingestion regression selection: 160 passed.
+- Expanded synchronous selection before the last additions: 306 passed,
+  2 asynchronous tests excluded by an explicit marker selection.
+- Final targeted security/QR/deferred-typing selection: 155 passed (146 conformance cases).
+- Isolated HTML extraction smoke check under Windows Job Objects: passed.
+- Mobile app/orb JavaScript syntax: passed; 9 jsdom HUD tests skipped (jsdom absent).
+- Ruff over source and the new conformance module: passed.
+- Python compileall over source: passed.
 
-*Note*: `gemma4:26b` (18 GB) is permanently excluded by `lora.models.selection.is_excluded_model()` to prevent PCIe unified-memory thrashing on 6 GB VRAM laptops.
+The final expanded result is recorded in REMEDIATION_STATUS.md. These are
+code checks, not measurements of model quality, hardware fit, or LAN isolation.
+No full-suite green claim or 80% coverage claim is made.
 
----
+## Environment limits reproduced
 
-## 2. Quantitative Evaluation Gates (G1–G8)
+An empty `asyncio.run(asyncio.sleep(0))` hangs while Windows creates its
+loopback socket pair. A five-second faulthandler trace locates the block in
+`socket._fallback_socketpair → accept`, called from the Proactor event loop.
+Gateway TestClient, aiosqlite, Ollama/network and async integration tests
+therefore cannot complete in this restricted execution environment.
+The selected synchronous tests exercise middleware and queue functions
+directly; they do not substitute for ASGI transport validation.
 
-| Gate | Metric | Target | Measured Result | Status |
-|---|---|---|---|---|
-| **G1: Intent & Decision Routing** | Held-out intent & depth macro-F1 (`tests/evals/test_laya_heldout.py`) | `>= 92%` (`100%` critical safety) | `100.0%` (`10/10` held-out + `100%` critical action-risk) | **PASS** |
-| **G2: Safe PC Control** | Benign allowlisted success / Forbidden hard-deny block rate (`tests/redteam/test_policy_redteam.py`) | `>= 95%` benign / `100%` hard-deny | `100.0%` benign / `100.0%` hard-deny (`0` bypasses) | **PASS** |
-| **G3: Grounding & Truthfulness** | 100-claim human-labelled gold set (`tests/evals/gold_claims_100.json`) | `>= 92%` supported precision, `<= 3%` unflagged hallucination | `98.0%` accuracy (`100%` numeric/negation catch rate) | **PASS** |
-| **G4: Supervisor Red-Team** | Adversarial injection, SSRF, traversal, loop & mobile escalation block rate (`tests/evals/test_supervisor_redteam.py`) | `100%` block rate | `100.0%` block rate across all red-team vectors | **PASS** |
-| **G5: RSI Outer Loop** | Net faithfulness improvement $\Delta S(G) \ge +0.05$ & `100%` rollback on regression (`tests/evals/test_outer_loop_evals.py`) | `$\Delta \ge +0.05$`, `100%` rollback | `$\Delta = +0.28$`, `100.0%` rollback on seeded regressions | **PASS** |
-| **G6: Resource & Thermal Stability** | Peak GPU VRAM (`<= 5.4 GB`), Peak system RAM (`<= 12.5 GB`), Idle CPU (`< 2%`) | Within hardware envelope | `5.08 GB` peak VRAM, `10.4 GB` peak RAM, `0.8%` idle CPU | **PASS** |
-| **G7: Mobile Companion Isolation** | Token auth, CSRF/rebinding defense, Tier-0 confinement, `/api/hud/media/*` block | `100%` enforcement | `100.0%` pass (`401`/`403` on all unauthorized/local-file calls) | **PASS** |
-| **G8: End-to-End Latency Budgets** | Local control `< 2.5 s`, Quick `< 6 s`, Standard `< 35 s`, Deep `< 90 s`, Depth rewrite `< 10 s` | Within wall-clock p50/p90 budgets | Control `0.4 s`, Quick `2.1 s`, Standard `18.4 s`, Deep `47.2 s`, Rewrite `3.2 s` | **PASS** |
+Pytest's default temporary directory is also unwritable here. Workspace
+`--basetemp` resolves that separate problem.
+
+`nvidia-smi` returned: “Failed to initialize NVML: GPU access blocked by the
+operating system”. GPU inference, audio, firewall setup and orb-on/off inference
+throughput were not measured.
+
+Dependency lock regeneration could not reach PyPI (DNS denied). Runtime
+dependency metadata and the existing lock are kept consistent; optional
+backends and quality tools are listed separately in requirements-conformance.txt.
+
+## Measurements still required on the unrestricted PC
+
+| Measurement | Acceptance / required record | Current evidence |
+|---|---|---|
+| Wake to Kokoro acknowledgement | G1 below 2.5 s; raw timestamps | Not measured |
+| Benign/forbidden control | G2 success and zero forbidden actions | Deterministic policy coverage only |
+| Grounding precision | G3 at least 95%, independent human-labelled claims | Not measured; existing fixture is synthetic |
+| Supervisor/round table | Real model adversarial cases, family isolation | Not validated |
+| Prompt refinement | Three baselines, noise margin, improvement and rollback | Core unit tests exist; live run pending |
+| Peak resident RAM | Per-component and combined peak below host ceiling | Not measured |
+| Peak VRAM and swaps | Model/tag/context, load/unload latency, CPU offload | Not measured |
+| STT and quality speech | RTF, voice accuracy, full GPU worker release | Not measured |
+| Desktop visual overhead | Ollama tok/s with orb on/off, identical prompts | Not measured |
+| Mobile isolation | Actual adapter, firewall, primary-WiFi external probe | Not validated here |
+| Laya | Held-out accuracy, temperatures, confusion matrix | Existing local checkpoint warns about invalid temperature |
+
+## Upstream corrections
+
+Laya English and typed-decision checkpoints are ModernBERT-large, approximately
+421M parameters, Apache-2.0; the former MIT/20M description was wrong.
+Source: <https://pypi.org/project/laya/>.
+
+HHEM-2.1's documented interface uses
+`AutoModelForSequenceClassification.from_pretrained(...).predict(pairs)`.
+An embedding-similarity blend is not semantic entailment.
+Source: <https://huggingface.co/vectara/hallucination_evaluation_model>.
+
+Active speech uses CPU Kokoro only; UPDATED_PLAN.md supersedes the earlier
+Piper and quality-Qwen3 design choices.
+
+
+## 22 October 2026 CPU Kokoro revision
+
+197 targeted voice/dialogue/config/conformance tests passed. Real CPU Kokoro
+synthesis produced 58,368 samples at 24 kHz: 2.432 seconds of speech in 5.73
+seconds including cold load, with no speech-engine fallback. The smoke check
+used a writable temp directory because the sandbox denied espeak DLL access
+under its default temp path. This does not measure wake latency, warm synthesis
+latency, speaker output, microphone accuracy, or total application RAM/VRAM.
+See validation/voice-update-tests.xml and validation/kokoro-cpu-smoke.json.
+
+
+## 22 October reliability follow-up
+
+See DEEP_REVIEW.md and FEATURE_HISTORY.md for task/cancellation repair,
+Ctrl+Esc restoration, stateful VAD and enrollment recovery, shared lazy router,
+safe exact NumPy vector retrieval, WebSocket owner-loop dispatch and known
+limitations. The NumPy backend supersedes FAISS-only default selection because
+the local native dependency failed during validation. Original source files
+remain preserved. Raw current results: validation/review-summary.json,
+reliability-tests.xml, broad-review-tests.xml and audio-smoke.json. That earlier broad
+snapshot is superseded by the final green regression run in completion-tests.xml.
+Live model/hardware acceptance is still outstanding. Older overlapping
+test counts above must not be summed into a current pass count.
+
+## Final regression closure - 22 October 2026
+
+The full regression run recorded **797 passed, 13 skipped, zero failures/errors**. See
+DEEP_REVIEW.md and validation/review-summary.json for exact scope and skip reasons.
+Controlled desktop voice/chat and HUD controller checks are included. Cache and
+event-loop shutdown cleanup is explicit; obsolete test contracts are migrated.
+This closes the reported regression repair/testing pass, not the entire v1.5
+roadmap or the outstanding real-room/GPU/model-quality acceptance work.
+
+## Superseding workflow revision
+
+The later user-directed restoration is documented in WORKFLOW_RESTORATION.md. Its continuous sleep listening option, enrolled threshold, writer-first policy, isolated speech processes, editor confirmation and MCP opt-in supersede the earlier contracts above. Current test output is validation/prime-tests.xml.

@@ -78,14 +78,11 @@ def create_gateway_router(
         # 3. Extract and validate token (support FastAPI Header DI, raw request.headers, and /app pairing cookie)
         auth_val = authorization or request.headers.get("authorization")
         xlora_val = x_lora_token or request.headers.get("x-lora-token")
-        cookie_val = request.cookies.get("lora_mobile_token") if hasattr(request, "cookies") else None
         token: str | None = None
         if auth_val and auth_val.startswith("Bearer "):
             token = auth_val[7:].strip()
         elif xlora_val:
             token = xlora_val.strip()
-        elif cookie_val:
-            token = cookie_val.strip()
 
         if not token or not token_validator.validate_token(token, origin):
             ip_limiter.record_failure(client_ip)
@@ -152,6 +149,8 @@ def create_gateway_router(
     async def get_job_status(job_id: str):
         job = queue.get_job(job_id)
         if job is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+        if origin == "mobile" and job.origin != JobOrigin.MOBILE:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
 
         pos = queue.get_queue_position(job_id)

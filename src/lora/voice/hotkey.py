@@ -13,10 +13,13 @@ class PushToTalkListener:
         on_activate: Callable[[], None] | None = None,
         on_deactivate: Callable[[], None] | None = None,
         on_killswitch: Callable[[], None] | None = None,
+        on_sleep_toggle: Callable[[], None] | None = None,
     ) -> None:
         self.on_activate = on_activate
         self.on_deactivate = on_deactivate
         self.on_killswitch = on_killswitch
+        self.on_sleep_toggle = on_sleep_toggle
+        self._sleep_key_down = False
         self.is_active = False
 
         self._current_keys: set[Any] = set()
@@ -70,7 +73,7 @@ class PushToTalkListener:
         return has_ctrl and has_alt and has_space
 
     def _is_killswitch_pressed(self) -> bool:
-        """Check if Ctrl + Esc (or Ctrl + Alt + Shift + Esc) is currently pressed."""
+        """Ctrl+Esc interrupts; Ctrl+Alt+Shift+Esc remains an alias."""
         from pynput import keyboard
 
         has_ctrl = any(
@@ -84,6 +87,14 @@ class PushToTalkListener:
     def _on_key_press(self, key: Any) -> None:
         with self._lock:
             self._current_keys.add(key)
+            from pynput import keyboard
+            ctrl = any(k in self._current_keys for k in (keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r))
+            alt = any(k in self._current_keys for k in (keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r))
+            if ctrl and alt and getattr(key, "char", "") in ("s", "S") and not self._sleep_key_down:
+                self._sleep_key_down = True
+                if self.on_sleep_toggle:
+                    self.on_sleep_toggle()
+                return
             if self._is_killswitch_pressed():
                 if self.on_killswitch:
                     try:
@@ -103,6 +114,8 @@ class PushToTalkListener:
     def _on_key_release(self, key: Any) -> None:
         with self._lock:
             self._current_keys.discard(key)
+            if getattr(key, "char", "") in ("s", "S"):
+                self._sleep_key_down = False
             if self.is_active and not self._is_hotkey_pressed():
                 self.is_active = False
                 if self.on_deactivate:

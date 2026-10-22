@@ -10,6 +10,22 @@
   let pollTimer = null;
   let currentDepth = 'standard';
   let ttsEnabled = true;
+  let submitting = false;
+  let citationTrigger = null;
+  const completedJobs = new Set();
+  let speechEpoch = 0;
+  let cancelPending = false;
+
+  function finishJob(jobId) {
+    if (jobId && completedJobs.has(jobId)) return false;
+    if (jobId) completedJobs.add(jobId);
+    if (completedJobs.size > 100) completedJobs.delete(completedJobs.values().next().value);
+    clearPollTimer();
+    activeJobId = null;
+    queueBanner.classList.add('hidden');
+    updateStatus('idle', 'Connected');
+    return true;
+  }
 
   // DOM Elements
   const statusText = document.getElementById('status-text');
@@ -30,22 +46,17 @@
 
   // Token retrieval (URL ?token= -> pairing cookie -> localStorage)
   function getToken() {
-    const urlParams = new URLSearchParams(window.location.search);
+    const urlParams = new URLSearchParams(window.location.hash.slice(1));
     const urlToken = urlParams.get('token');
     if (urlToken) {
       localStorage.setItem('lora_mobile_token', urlToken);
+      history.replaceState(null, '', window.location.pathname);
       return urlToken;
-    }
-    const cookieMatch = document.cookie.match(/(?:^|;\s*)lora_mobile_token=([^;]+)/);
-    if (cookieMatch && cookieMatch[1]) {
-      const cTok = decodeURIComponent(cookieMatch[1]);
-      localStorage.setItem('lora_mobile_token', cTok);
-      return cTok;
     }
     return localStorage.getItem('lora_mobile_token') || '';
   }
 
-  // Initialize WebGL Hydro-Orb
+  // Initialize the mobile pearl renderer.
   function initVisualizer() {
     orb = new HydroOrbVisualizer('hydro-orb-canvas');
     if (orb) {
@@ -55,34 +66,30 @@
 
   // Update Status
   function updateStatus(state, message) {
+    document.body.dataset.state = state;
     statusText.textContent = message || state.charAt(0).toUpperCase() + state.slice(1);
     if (orb) {
       orb.setState(state);
     }
 
     if (state === 'idle') {
-      statusDot.style.backgroundColor = '#00e5ff';
-      statusDot.style.boxShadow = '0 0 8px #00e5ff';
       floatingStop.classList.add('hidden');
     } else if (state === 'thinking') {
-      statusDot.style.backgroundColor = '#7c4dff';
-      statusDot.style.boxShadow = '0 0 8px #7c4dff';
       floatingStop.classList.remove('hidden');
     } else if (state === 'verifying') {
-      statusDot.style.backgroundColor = '#0077b6';
-      statusDot.style.boxShadow = '0 0 8px #0077b6';
       floatingStop.classList.remove('hidden');
     } else if (state === 'speaking') {
-      statusDot.style.backgroundColor = '#00e5ff';
-      statusDot.style.boxShadow = '0 0 8px #00e5ff';
+      floatingStop.classList.remove('hidden');
     }
+    document.getElementById('submit-btn').disabled = submitting || !!activeJobId;
+    chatFeed.setAttribute('aria-busy', String(submitting || !!activeJobId));
   }
 
   // WebSocket Connection Lifecycle
   function connectWebSocket() {
     const token = getToken();
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/v1/events${token ? '?token=' + encodeURIComponent(token) : ''}`;
+    const wsUrl = `${protocol}//${window.location.host}/v1/events`;
 
     ws = new WebSocket(wsUrl);
 
@@ -106,12 +113,12 @@
         if (r.ok) {
           updateStatus('idle', 'Connected');
         } else if (r.status === 401 || r.status === 403) {
-          updateStatus('idle', 'Auth Required - Rescan QR');
+          updateStatus('disconnected', 'Rescan your desktop QR');
         } else {
-          updateStatus('idle', 'Disconnected');
+          updateStatus('disconnected', 'Disconnected');
         }
       } catch (_e) {
-        updateStatus('idle', 'Disconnected');
+        updateStatus('disconnected', 'Disconnected');
       }
       setTimeout(connectWebSocket, 3000);
     };
@@ -123,6 +130,7 @@
 
   // Handle incoming events from gateway
   function handleWsEvent(msg) {
+    if (msg.job_id && (completedJobs.has(msg.job_id) || (activeJobId && msg.job_id !== activeJobId))) return;
     if (msg.type === 'auth_ok') {
       updateStatus('idle', 'Connected');
     } else if (msg.type === 'state') {
@@ -138,10 +146,7 @@
       appendPartialToken(msg.text);
     } else if (msg.type === 'answer') {
       if (activeJobId && msg.job_id && msg.job_id !== activeJobId) return;
-      clearPollTimer();
-      activeJobId = null;
-      renderCompletedAnswer(msg);
-      updateStatus('idle', 'Connected');
+      if (finishJob(msg.job_id)) renderCompletedAnswer(msg);
     } else if (msg.type === 'error') {
       clearPollTimer();
       activeJobId = null;
@@ -171,30 +176,32 @@
         });
         if (!res.ok) return;
         const job = await res.json();
+        if (activeJobId !== jobId) return; // A socket answer or cancellation won the race.
         if (job.status === 'completed' && job.result) {
-          clearPollTimer();
-          activeJobId = null;
+          if (!finishJob(jobId)) return;
           const r = job.result;
-          const checked = (r.verification && r.verification.checked) || {};
           const citations = (r.sources || []).map((s, idx) => ({
             id: s.id || `S${idx + 1}`,
             title: s.title || '',
             source_url: s.url || '',
-            quote: s.domain || '',
-            tier: 1
+            quote: s.quote || '',
+            tier: s.tier ?? 2
           }));
           renderCompletedAnswer({
             text: r.answer || '',
             citations: citations,
-            confidence: (checked.score || 0.95) >= 0.85 ? 'HIGH' : 'MEDIUM',
-            unverified: checked.unverified || []
+            kind: r.kind || 'chat',
+            source_check: r.verification?.source_check
           });
-          updateStatus('idle', 'Connected');
         } else if (job.status === 'failed') {
           clearPollTimer();
           activeJobId = null;
           appendSystemMessage(`Error: ${job.error || 'Job failed'}`);
           updateStatus('idle', 'Connected');
+        } else if (job.status === 'cancelled') {
+          finishJob(jobId);
+          discardPartialAnswer();
+          appendSystemMessage('Response stopped.');
         }
       } catch (e) {}
     }, 1200);
@@ -202,6 +209,7 @@
 
   // Append user or assistant messages
   function appendMessage(role, text) {
+    document.getElementById('welcome')?.remove();
     const msgDiv = document.createElement('div');
     msgDiv.className = `message ${role}-message`;
     const bubble = document.createElement('div');
@@ -214,6 +222,7 @@
   }
 
   function appendSystemMessage(text) {
+    document.getElementById('welcome')?.remove();
     const msgDiv = document.createElement('div');
     msgDiv.className = 'message system-message';
     const bubble = document.createElement('div');
@@ -225,6 +234,11 @@
   }
 
   let currentAssistantBubble = null;
+
+  function discardPartialAnswer() {
+    currentAssistantBubble?.parentElement.remove();
+    currentAssistantBubble = null;
+  }
 
   function appendPartialToken(text) {
     if (!currentAssistantBubble) {
@@ -244,8 +258,9 @@
       .replace(/'/g, '&#039;');
   }
 
-  // Render finalized verified answer with clickable citations and confidence
+  // Chat stays conversational. Research has sources, without a truth score.
   function renderCompletedAnswer(data) {
+    if (currentAssistantBubble) currentAssistantBubble.parentElement.remove();
     currentAssistantBubble = null;
     const msgDiv = document.createElement('div');
     msgDiv.className = 'message assistant-message';
@@ -262,31 +277,15 @@
     }
     bubble.innerHTML = formattedText;
 
-    const metaDiv = document.createElement('div');
-    metaDiv.className = 'verif-meta';
-
-    const confLevel = (data.confidence || 'HIGH').toLowerCase();
-    const confPill = document.createElement('span');
-    confPill.className = `confidence-pill conf-${confLevel}`;
-    confPill.textContent = `Confidence: ${confLevel}`;
-    metaDiv.appendChild(confPill);
-
-    bubble.appendChild(metaDiv);
-
-    if (data.unverified && data.unverified.length > 0) {
-      const unverDiv = document.createElement('div');
-      unverDiv.className = 'unverified-box';
-      const strong = document.createElement('strong');
-      strong.textContent = 'Could not verify:';
-      unverDiv.appendChild(strong);
-      const ul = document.createElement('ul');
-      data.unverified.forEach((u) => {
-        const li = document.createElement('li');
-        li.textContent = u;
-        ul.appendChild(li);
-      });
-      unverDiv.appendChild(ul);
-      bubble.appendChild(unverDiv);
+    if (data.source_check) {
+      const details = document.createElement('details');
+      details.className = 'source-check';
+      const label = document.createElement('summary');
+      label.textContent = data.source_check.status === 'references_checked' ? 'Sources cited' : 'Source references need attention';
+      const note = document.createElement('p');
+      note.textContent = data.source_check.note || '';
+      details.append(label, note);
+      bubble.appendChild(details);
     }
 
     msgDiv.appendChild(bubble);
@@ -294,6 +293,12 @@
     chatFeed.scrollTop = chatFeed.scrollHeight;
 
     bubble.querySelectorAll('.citation-badge').forEach((badge) => {
+      badge.setAttribute('role', 'button');
+      badge.tabIndex = 0;
+      badge.setAttribute('aria-label', `Open source ${badge.dataset.id}`);
+      badge.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); badge.click(); }
+      });
       badge.addEventListener('click', () => {
         showCitationSheet(
           badge.dataset.id,
@@ -311,19 +316,23 @@
   }
 
   function showCitationSheet(id, title, url, quote, tier) {
+    citationTrigger = document.activeElement;
     document.getElementById('citation-badge-label').textContent = id;
     document.getElementById('citation-title').textContent = title || 'Source Reference';
     document.getElementById('citation-url').textContent = url || '';
     document.getElementById('citation-tier').textContent = `Tier ${tier}`;
     document.getElementById('citation-quote').textContent = quote || 'Supporting excerpt recorded in notebook.';
     citationSheet.classList.remove('hidden');
+    closeSheetBtn.focus();
   }
 
   function hideCitationSheet() {
     citationSheet.classList.add('hidden');
+    citationTrigger?.focus();
   }
 
   function speakAnswer(text) {
+    const epoch = ++speechEpoch;
     window.speechSynthesis.cancel();
     const cleanSpeech = text.replace(/\[S\d+[^\]]*\]/g, '').trim();
     if (!cleanSpeech) return;
@@ -333,13 +342,15 @@
     utterance.pitch = 1.0;
 
     utterance.onstart = () => {
+      if (epoch !== speechEpoch) return;
       updateStatus('speaking');
       if (orb) {
         orb.setAudioLevel(0.6);
       }
     };
 
-    utterance.onend = () => {
+    utterance.onend = utterance.onerror = () => {
+      if (epoch !== speechEpoch) return;
       updateStatus('idle', 'Connected');
       if (orb) {
         orb.setAudioLevel(0.0);
@@ -371,6 +382,12 @@
 
   // Submit Query
   async function submitQuery(text) {
+    if (submitting || activeJobId) return;
+    submitting = true;
+    cancelPending = false;
+    ++speechEpoch;
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    orb?.setAudioLevel(0);
     const token = getToken();
     appendMessage('user', text);
     updateStatus('thinking', 'Queued...');
@@ -385,7 +402,7 @@
         body: JSON.stringify({
           text: text,
           depth: currentDepth,
-          run_mode: 'standard'
+          run_mode: 'quick'
         })
       });
 
@@ -397,8 +414,15 @@
       }
 
       const data = await res.json();
-      activeJobId = data.job_id;
-      startJobPolling(activeJobId);
+      if (!completedJobs.has(data.job_id)) {
+        activeJobId = data.job_id;
+        if (cancelPending) {
+          await stopJob();
+        } else {
+          startJobPolling(activeJobId);
+          updateStatus('thinking', 'Thinking');
+        }
+      }
       if (data.queue_position > 0) {
         queueBanner.classList.remove('hidden');
         queuePos.textContent = data.queue_position;
@@ -406,29 +430,43 @@
     } catch (err) {
       appendSystemMessage(`Network error: ${err.message}`);
       updateStatus('idle', 'Connected');
+    } finally {
+      submitting = false;
+      document.getElementById('submit-btn').disabled = !!activeJobId;
+      chatFeed.setAttribute('aria-busy', String(!!activeJobId));
     }
   }
 
   // Cancel / Stop
   async function stopJob() {
-    if (!activeJobId) return;
+    ++speechEpoch;
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    orb?.setAudioLevel(0);
+    const jobId = activeJobId;
+    if (!jobId) {
+      cancelPending = submitting;
+      updateStatus(submitting ? 'thinking' : 'idle', submitting ? 'Stopping' : 'Connected');
+      return;
+    }
     const token = getToken();
     clearPollTimer();
     try {
-      await fetch('/v1/stop', {
+      const response = await fetch('/v1/stop', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`
         },
-        body: JSON.stringify({ job_id: activeJobId })
+        body: JSON.stringify({ job_id: jobId })
       });
-      appendSystemMessage("Research cancelled by user.");
-      updateStatus('idle', 'Connected');
-      activeJobId = null;
-      window.speechSynthesis.cancel();
+      if (!response.ok) throw new Error('Stop request failed');
+      if (finishJob(jobId)) {
+        discardPartialAnswer();
+        appendSystemMessage('Response stopped.');
+      }
     } catch (err) {
       console.warn("Failed to stop job:", err);
+      if (activeJobId === jobId) startJobPolling(jobId);
     }
   }
 
@@ -438,6 +476,7 @@
       const val = queryInput.value.trim();
       if (!val) return;
       queryInput.value = '';
+      queryInput.style.height = 'auto';
       submitQuery(val);
     });
 
@@ -446,6 +485,9 @@
         depthChips.forEach(c => c.classList.remove('active'));
         chip.classList.add('active');
         currentDepth = chip.dataset.depth;
+        depthChips.forEach(c => c.setAttribute('aria-pressed', String(c === chip)));
+        document.getElementById('depth-label').textContent = chip.firstChild.textContent.trim();
+        chip.closest('details').open = false;
       });
     });
 
@@ -456,14 +498,39 @@
     ttsToggle.addEventListener('click', () => {
       ttsEnabled = !ttsEnabled;
       ttsToggle.classList.toggle('active', ttsEnabled);
+      ttsToggle.setAttribute('aria-pressed', String(ttsEnabled));
       if (!ttsEnabled) {
+        ++speechEpoch;
         window.speechSynthesis.cancel();
+        orb?.setAudioLevel(0);
+        updateStatus(activeJobId ? 'thinking' : 'idle', activeJobId ? 'Thinking' : 'Connected');
       }
     });
 
     stopBtn.addEventListener('click', stopJob);
     sheetScrim.addEventListener('click', hideCitationSheet);
     closeSheetBtn.addEventListener('click', hideCitationSheet);
+    queryInput.addEventListener('input', () => {
+      queryInput.style.height = 'auto';
+      queryInput.style.height = `${Math.min(queryInput.scrollHeight, 120)}px`;
+    });
+    queryInput.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); askForm.requestSubmit(); }
+    });
+    document.addEventListener('keydown', e => {
+      if (!citationSheet.classList.contains('hidden') && e.key === 'Escape') hideCitationSheet();
+      if (!citationSheet.classList.contains('hidden') && e.key === 'Tab') { e.preventDefault(); closeSheetBtn.focus(); }
+    });
+    document.addEventListener('click', e => {
+      document.querySelectorAll('.style-menu[open]').forEach(menu => { if (!menu.contains(e.target)) menu.open = false; });
+    });
+    const viewport = window.visualViewport;
+    const fitViewport = () => { document.getElementById('app-container').style.height = `${viewport ? viewport.height : window.innerHeight}px`; };
+    viewport?.addEventListener('resize', fitViewport);
+    window.addEventListener('resize', fitViewport);
+    window.addEventListener('pagehide', () => orb?.stop());
+    window.addEventListener('pageshow', () => orb?.start());
+    fitViewport();
   }
 
   window.addEventListener('DOMContentLoaded', () => {

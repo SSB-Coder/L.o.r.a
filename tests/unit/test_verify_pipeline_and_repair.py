@@ -8,7 +8,7 @@ from lora.verify.report import ConfidenceLevel, VerificationVerdict
 
 
 @pytest.mark.asyncio
-async def test_verification_pipeline_fully_supported():
+async def test_verification_pipeline_fully_supported(reliable_nli):
     cards = [
         EvidenceCard(
             card_id="S1",
@@ -32,7 +32,7 @@ async def test_verification_pipeline_fully_supported():
 
 
 @pytest.mark.asyncio
-async def test_verification_pipeline_long_article_with_negations_and_multicitations():
+async def test_verification_pipeline_long_article_with_negations_and_multicitations(reliable_nli):
     """Regression test: long web articles containing 'not' must not poison affirmative claims or multi-citations."""
     long_article_1 = (
         "Mamba is a selective state space model (SSM) that achieves Transformer-quality results on language "

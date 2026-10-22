@@ -1,16 +1,9 @@
 """Quarantined PDF Fetcher and Text Extraction for L.O.R.A."""
 
+import asyncio
 import tempfile
 from pathlib import Path
 from typing import Any
-
-try:
-    import pymupdf as fitz
-except ImportError:
-    try:
-        import fitz
-    except ImportError:
-        fitz = None  # type: ignore
 
 import httpx
 
@@ -63,26 +56,11 @@ class PdfFetcher:
                                 }
                             f.write(chunk)
 
-            pages = []
-            full_text_parts = []
-            if fitz is not None:
-                with fitz.open(str(temp_file)) as doc:
-                    total_pages = len(doc)
-                    for page_idx in range(min(total_pages, 50)):
-                        text = doc[page_idx].get_text()
-                        pages.append({"page": page_idx + 1, "text": text})
-                        full_text_parts.append(text)
-            else:
-                from pypdf import PdfReader
-
-                reader = PdfReader(str(temp_file))
-                total_pages = len(reader.pages)
-                for page_idx in range(min(total_pages, 50)):
-                    text = reader.pages[page_idx].extract_text() or ""
-                    pages.append({"page": page_idx + 1, "text": text})
-                    full_text_parts.append(text)
-
-            raw_content = "\n\n".join(full_text_parts)
+            from lora.safety.parsers import parse_document
+            parsed = await asyncio.to_thread(parse_document, "pdf", temp_file.read_bytes())
+            pages = parsed["pages"]
+            total_pages = len(pages)
+            raw_content = parsed["text"]
             spotlight_res = self.spotlighter.frame_untrusted_data(
                 text=raw_content,
                 source=target_url,

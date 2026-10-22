@@ -43,6 +43,7 @@ htmlcov/
 /logs/
 /cache/
 /models/
+/docs/
 *.db-shm
 *.db-wal
 /outputs/
@@ -59,3 +60,7 @@ scratch/
 
 # Reference codebases (manual clones for architectural inspiration)
 references/
+
+.venv-tts/
+tmp_test/
+scratch/

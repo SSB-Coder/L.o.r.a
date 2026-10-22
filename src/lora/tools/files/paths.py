@@ -10,7 +10,7 @@ from lora.safety.policy import PolicyEngine
 def open_path(path: str | Path, policy_engine: PolicyEngine | None = None) -> dict[str, Any]:
     """Validate path safety and launch the file or folder in Windows Explorer or default viewer."""
     engine = policy_engine or PolicyEngine()
-    policy_res = engine.check_path(path, origin="desktop", mode="read")
+    policy_res = engine.check_path(path, origin="desktop", mode="open")
 
     if not policy_res.allowed:
         return {
@@ -25,29 +25,10 @@ def open_path(path: str | Path, policy_engine: PolicyEngine | None = None) -> di
             "message": f"Target path '{path}' does not exist.",
         }
 
-    # Plan §4.2.1: Guard against spreadsheet formula/DDE payload auto-execution in .csv/.tsv files
-    if target.is_file() and target.suffix.lower() in (".csv", ".tsv"):
-        try:
-            sample = target.read_text(encoding="utf-8", errors="ignore")[:8192]
-            import re as _re
-
-            if _re.search(r"(?:^|[,\t\r\n])\s*[=+\-@](?:cmd|powershell|wscript|mshta|rundll32|hyperlink)\b", sample, _re.IGNORECASE):
-                return {
-                    "status": "error",
-                    "message": f"Blocked opening '{target.name}' in external spreadsheet viewer: potentially unsafe formula/DDE payload detected.",
-                }
-        except Exception:
-            pass
-
-    # Guard against executing runnable scripts or executables via os.startfile
-    RUNNABLE_EXTENSIONS = {".py", ".pyw", ".exe", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".msi", ".reg", ".com", ".scr"}
-    if target.is_file() and target.suffix.lower() in RUNNABLE_EXTENSIONS:
-        return {
-            "status": "error",
-            "message": f"Blocked launching runnable script '{target.name}' in system shell. Use read_file to inspect code files.",
-        }
-
     try:
+        final = engine.check_path(path, origin="desktop", mode="open")
+        if not final.allowed or final.canonical_path != target:
+            return {"status": "error", "message": "Path changed or was denied before opening"}
         # os.startfile opens the file or directory in the default Windows application
         if hasattr(os, "startfile"):
             os.startfile(str(target))

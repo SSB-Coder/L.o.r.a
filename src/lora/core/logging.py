@@ -1,9 +1,12 @@
 """Structured logging and sensitive data scrubbing for LORA."""
 
 import logging
+import os
 import re
+import traceback
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +14,7 @@ from typing import Any
 SENSITIVE_PATTERNS = [
     re.compile(r"(Bearer\s+)[A-Za-z0-9_\-\.]{8,}", re.IGNORECASE),
     re.compile(r"(LORA_TOKEN\s*=\s*)[A-Za-z0-9_\-\.]{8,}", re.IGNORECASE),
-    re.compile(r"([?&]token=)[A-Za-z0-9_\-\.]{8,}", re.IGNORECASE),
+    re.compile(r"([?#&]token=)[A-Za-z0-9_\-\.]{8,}", re.IGNORECASE),
     re.compile(r"(api[_-]?key\s*[:=]\s*)[A-Za-z0-9_\-\.]{8,}", re.IGNORECASE),
     re.compile(r"(sk-[A-Za-z0-9_\-]{16,})", re.IGNORECASE),
 ]
@@ -25,6 +28,10 @@ SENSITIVE_KEYS = {
     "credential",
     "auth_token",
     "bearer_token",
+    "desktop_token",
+    "mobile_token",
+    "lora_desktop_token",
+    "lora_mobile_token",
 }
 
 
@@ -35,7 +42,7 @@ def setup_logging(log_dir: Path | str | None = None, level: int = logging.INFO) 
         try:
             p = Path(log_dir)
             p.mkdir(parents=True, exist_ok=True)
-            handlers.append(logging.FileHandler(p / "lora.log", encoding="utf-8"))
+            handlers.append(RotatingFileHandler(p / "lora.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8"))
         except Exception:
             pass
     logging.basicConfig(
@@ -43,6 +50,34 @@ def setup_logging(log_dir: Path | str | None = None, level: int = logging.INFO) 
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=handlers,
     )
+    install_record_scrubber()
+
+
+def install_record_scrubber() -> None:
+    """Scrub at creation so third-party handlers cannot log unfiltered records."""
+    previous = logging.getLogRecordFactory()
+    if getattr(previous, "_lora_scrubber", False):
+        return
+
+    def clean(text: str) -> str:
+        value = scrub_sensitive_data(text)
+        for key, secret in os.environ.items():
+            if len(secret) >= 8 and any(k in key.upper() for k in ("TOKEN", "API_KEY", "SECRET")):
+                value = value.replace(secret, "[REDACTED]")
+        value = value.replace(str(Path.home()), "[HOME]")
+        return re.sub(r"\b[A-Za-z]:[\\/](?:[^\s\"'<>]+)", "[LOCAL_PATH]", value)
+
+    def factory(*args, **kwargs):
+        record = previous(*args, **kwargs)
+        record.msg = clean(record.getMessage())
+        record.args = ()
+        if record.exc_info:
+            record.exc_text = clean("".join(traceback.format_exception(*record.exc_info)))
+            record.exc_info = None
+        return record
+
+    factory._lora_scrubber = True
+    logging.setLogRecordFactory(factory)
 
 
 def scrub_sensitive_data(data: Any) -> Any:

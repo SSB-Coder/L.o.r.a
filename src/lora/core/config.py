@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 class PolicyDecision(BaseModel):
     allowed: bool
     reason: str
+    action: str = "allow"
 
 
 class DenyRule(BaseModel):
@@ -33,6 +34,10 @@ class PolicyConfig(BaseModel):
     deny_rules: list[DenyRule] = Field(default_factory=list)
     allow_rules: list[AllowRule] = Field(default_factory=list)
     typing_domain_allowlist: list[str] = Field(default_factory=list)
+    allowed_roots: list[str] = Field(default_factory=list)
+    max_actions_per_task: int = 15
+    unattended_seconds: float = 180
+    dry_run_over: int = 3
 
     def evaluate_action(self, tool: str, origin: str, tier: int) -> PolicyDecision:
         """
@@ -55,15 +60,17 @@ class PolicyConfig(BaseModel):
 
         # Step 2: Check allow rules
         allowed = False
+        action = "deny"
         reason = f"No matching allow rule for origin '{origin}', tier {tier}, tool '{tool}'"
 
         for rule in self.allow_rules:
             if rule.origin.lower() == origin.lower() and tier in rule.tiers:
                 if rule.tools is None or tool.lower() in [t.lower() for t in rule.tools]:
-                    allowed = True
+                    action = rule.action
+                    allowed = action in {"allow", "ask"}
                     reason = f"Allowed by rule for origin '{origin}' tier {tier}"
 
-        return PolicyDecision(allowed=allowed, reason=reason)
+        return PolicyDecision(allowed=allowed, reason=reason, action=action)
 
     def evaluate_path(self, path: str | Path, origin: str) -> PolicyDecision:
         """Evaluate filesystem path policy (blocks executable / macro extensions)."""
@@ -80,12 +87,12 @@ class PolicyConfig(BaseModel):
 # Sub-models for lora.yaml
 class SpeakerVerifierConfig(BaseModel):
     enabled: bool = True
-    model: str = "models/voice/user_verifier.onnx"
-    threshold: float = 0.70
+    model: str = "~/.lora/voice/user_verifier.json"
+    threshold: float = 0.55
 
 
 class WakeConfig(BaseModel):
-    engine: str = "openwakeword"
+    engine: str = "transcript"
     model: str = "models/voice/hey_lora.onnx"
     threshold: float = 0.65
     consecutive: int = 2
@@ -95,7 +102,7 @@ class WakeConfig(BaseModel):
 
 class STTConfig(BaseModel):
     engine: str = "faster-whisper"
-    model: str = "distil-small.en"
+    model: str = "base.en"
     device: str = "cpu"
     compute: str = "int8"
     beam: int = 1
@@ -113,12 +120,14 @@ class TTSQualityConfig(BaseModel):
 
 
 class TTSFastConfig(BaseModel):
-    engine: str = "piper"
-    voice: str = "en_US-lessac-medium"
+    engine: str = "kokoro-onnx"
+    voice: str = "af_sky"
 
 
 class VoiceConfig(BaseModel):
     mode: str = "auto"
+    headset_mode: bool = False
+    close_mic_on_sleep: bool = False
     wake: WakeConfig = Field(default_factory=WakeConfig)
     hotkey: str = "ctrl+alt+space"
     vad: str = "silero"
@@ -187,7 +196,7 @@ class GroundingConfig(BaseModel):
     nli_fast: str = "vectara-hhem-2.1-open"
     nli_secondary: str = "minicheck"
     embedder: str = "models/embeddinggemma-2"
-    vector_store: str = "faiss"
+    vector_store: str = "numpy"
     reranker: str = "bge-reranker-base"
 
 
@@ -207,9 +216,9 @@ class OuterLoopConfig(BaseModel):
 
 
 class SafetyConfig(BaseModel):
-    max_actions_per_task: int = 40
+    max_actions_per_task: int = 15
     dry_run_over: int = 3
-    killswitch: str = "ctrl+esc"
+    killswitch: str = "ctrl+alt+shift+esc"
     allowed_roots: list[str] = Field(default_factory=list)
     safe_extensions: list[str] = Field(default_factory=list)
     blocked_extensions: list[str] = Field(default_factory=list)

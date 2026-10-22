@@ -76,20 +76,28 @@ _JSON = re.compile(r"\{.*\}", re.DOTALL)
 def parse_opinion(raw: str) -> Opinion:
     m = _JSON.search(raw or "")
     if not m:
-        return Opinion()
+        return Opinion(verdict="unavailable", independent=False, timed_out=True, error="Reviewer returned no JSON")
     try:
         data = json.loads(m.group(0))
     except Exception:
-        return Opinion()
+        return Opinion(verdict="unavailable", independent=False, timed_out=True, error="Reviewer returned invalid JSON")
+    if not isinstance(data, dict) or data.get("verdict") not in ("approve", "revise") or not isinstance(data.get("issues"), list):
+        return Opinion(verdict="unavailable", independent=False, timed_out=True, error="Reviewer returned an invalid decision")
     issues = [str(i).strip() for i in (data.get("issues") or []) if str(i).strip()][:5]
     verdict = "revise" if str(data.get("verdict", "")).lower().startswith("rev") or issues else "approve"
     return Opinion(issues=issues, verdict=verdict)
 
 
 def opinion_prompt(question: str, answer: str, sources_block: str) -> str:
-    compact_sources = (sources_block or "")[:4500]
+    # Truncating the entire block drops the later source IDs and makes a
+    # reviewer incorrectly report valid citations as missing. Budget per source.
+    blocks = re.split(r"(?m)(?=^\[S\d+\] )", sources_block or "")
+    blocks = [b.strip() for b in blocks if b.strip()]
+    budget = max(200, 10000 // max(1, len(blocks)))
+    compact_sources = "\n\n".join(b[:budget] for b in blocks)
     return (
         "You are a strict reviewer. Compare the ANSWER with the SOURCES.\n"
+        "Sources are bounded excerpts. Missing detail is unverified, not proof of contradiction.\n"
         "List at most 4 concrete problems: claims the sources do not support, important points the sources "
         "contain that the answer left out, or confusing wording. If it is fine, return no issues.\n"
         'Reply with ONLY JSON: {"verdict": "approve" or "revise", "issues": ["..."]}\n\n'
@@ -179,11 +187,12 @@ async def refine(
     max_rounds: int = 2,
     budget_s: float = 150.0,
     clock: Callable[[], float] = time.monotonic,
+    initial_verification: Verification | None = None,
 ) -> RefineResult:
     """Rewrite -> re-check -> keep the best across distinct prompt strategies."""
     scorer = OuterLoopScorer()
     started = clock()
-    best_text, best_ver = draft, await verify_fn(draft)
+    best_text, best_ver = draft, initial_verification or await verify_fn(draft)
     best_score, best_faith = score_answer(scorer, best_text, question, sources, best_ver)
     base_strat_name, _ = PROMPT_REFINEMENT_STRATEGIES[0]
     iterations: list[dict[str, Any]] = [
@@ -191,6 +200,7 @@ async def refine(
             "round": 0,
             "prompt": base_strat_name,
             "score": round(best_score, 3),
+            "quality_score": round(best_score, 3),
             "faithfulness": round(best_faith, 3),
             "supported": best_ver.supported,
             "total": best_ver.total,
@@ -219,6 +229,7 @@ async def refine(
             "round": i,
             "prompt": strat_name,
             "score": round(cand_score, 3),
+            "quality_score": round(cand_score, 3),
             "faithfulness": round(cand_faith, 3),
             "supported": cand_ver.supported,
             "total": cand_ver.total,
@@ -249,24 +260,25 @@ def build_verification_dropdown_meta(
     if roundtable_info and stages:
         judge_name = str(roundtable_info.get("judge_model") or "reviewer")
         rt_timed_out = bool(roundtable_info.get("timed_out"))
-        rt_score = float(roundtable_info.get("score", 0.85))
+        rt_score = float(roundtable_info.get("score") or 0.0)
         rt_decision = str(roundtable_info.get("decision", "approve"))
         for st in stages:
             if st.get("id") == "V7":
                 base_detail = str(st.get("detail") or "Copy & Originality Gate")
                 if "Second-opinion" not in base_detail and "2nd opinion" not in base_detail:
                     if rt_timed_out:
-                        st["score"] = round(min(0.65, float(st.get("score", 0.9)) * 0.65), 2)
+                        st["score"] = round(min(0.65, float(st.get("score") or 0.0) * 0.65), 2)
                         st["status"] = "warn"
                         st["detail"] = f"Second-opinion ({judge_name}) timed out · {base_detail}"
                     else:
-                        blended = round(0.5 * float(st.get("score", 0.9)) + 0.5 * rt_score, 2)
+                        blended = round(0.5 * float(st.get("score") or 0.0) + 0.5 * rt_score, 2)
                         st["score"] = blended
                         st["status"] = "pass" if blended >= 0.80 else ("warn" if blended >= 0.55 else "fail")
                         st["detail"] = f"2nd opinion ({judge_name}): {rt_decision} · {base_detail}"
-        v1_v7 = [float(s.get("score", 0.0)) for s in stages if s.get("id") != "V8"]
-        if v1_v7:
-            recomputed = round(0.50 * eff_score + 0.50 * (sum(v1_v7) / len(v1_v7)), 2)
+        if stages:
+            # A skipped verifier has score=None. Cosmetic stage averages must
+            # neither crash here nor inflate the supported-claim fraction.
+            recomputed = eff_score
             if rt_timed_out:
                 recomputed = round(min(recomputed, 0.84), 2)
             eff_score = recomputed

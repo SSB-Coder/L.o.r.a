@@ -14,7 +14,7 @@ from lora.grounding.chunk import DocumentChunk
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_NOTEBOOK_DB = Path("data/notebooks/notebooks.db")
+DEFAULT_NOTEBOOK_DB = Path.home() / ".lora" / "notebooks" / "notebooks.db"
 
 
 class SavedNotebook(BaseModel):
@@ -129,6 +129,11 @@ class NotebookStore:
             vis = visibility
             depth = depth_mode
             now = time.time()
+
+        from urllib.parse import urlparse
+        source_urls = [c.source_url for c in nb_chunks] + [c.source_url for c in nb_cards]
+        if any(urlparse(url).scheme not in {"http", "https"} for url in source_urls):
+            vis = "desktop_only"
 
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(

@@ -54,3 +54,4 @@ async def test_http_cache_put_get_expiry(tmp_path: Path):
     # 3. Clear expired
     deleted = await cache.clear_expired()
     assert deleted >= 1
+    await cache.close()

@@ -31,6 +31,13 @@ class WebSearchDispatcher:
             "duckduckgo": DuckDuckGoConnector(),
         }
 
+    async def close(self) -> None:
+        """Release connector cache workers before their owning loop stops."""
+        caches = {id(connector.cache): connector.cache for connector in self.connectors.values()
+                  if hasattr(connector, "cache")}
+        for cache in caches.values():
+            await cache.close()
+
     async def search(
         self,
         query: str,

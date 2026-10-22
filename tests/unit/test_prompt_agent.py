@@ -96,6 +96,7 @@ async def test_prompt_optimizer_model_specific_directives():
 
 @pytest.mark.asyncio
 async def test_prompt_optimizer_deep_llm_with_fallback():
+    from lora.agent.prompt_optimizer import PromptOptimizerAgent
     mock_ollama = AsyncMock()
     mock_ollama.generate.return_value = "Optimized deep prompt with advanced constraints."
 

@@ -3,6 +3,7 @@
 Used by test_desktop_query_flow.py (in a subprocess: it owns the QApplication and event loop).
 """
 import json, os, sys, threading, time, argparse, tempfile
+import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -12,36 +13,9 @@ os.environ["LORA_RETRY_DELAY"] = "0"
 sys.path.insert(0, os.environ["LORA_SRC"])
 mode = sys.argv[1]  # ok | down | think
 
-seen_payloads = []
-
-class H(BaseHTTPRequestHandler):
-    def log_message(self, *a): pass
-    def do_GET(self):
-        body = json.dumps({"models": [{"name": "SparkLLM/Spark-X2.5-4B:latest", "size": 1}]}).encode()
-        self.send_response(200); self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
-    def do_POST(self):
-        n = int(self.headers.get("Content-Length", 0)); payload = json.loads(self.rfile.read(n))
-        if self.path.endswith("/api/generate"):  # model warm-up at startup
-            body = b'{"done": true}'
-            self.send_response(200); self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
-        seen_payloads.append(payload)
-        self.send_response(200); self.send_header("Content-Type", "application/x-ndjson")
-        self.send_header("Transfer-Encoding", "chunked"); self.end_headers()
-        toks = ["<think>hmm</think>", "Right ", "away, ", "boss. ", "Anything else?"] if mode == "think" else ["Right ", "away, ", "boss. ", "Anything else?"]
-        for t in toks:
-            line = json.dumps({"message": {"role": "assistant", "content": t}, "done": False}).encode() + b"\n"
-            self.wfile.write(f"{len(line):x}\r\n".encode() + line + b"\r\n"); self.wfile.flush(); time.sleep(0.12)
-        line = json.dumps({"message": {"role": "assistant", "content": ""}, "done": True}).encode() + b"\n"
-        self.wfile.write(f"{len(line):x}\r\n".encode() + line + b"\r\n0\r\n\r\n"); self.wfile.flush()
-
-srv = ThreadingHTTPServer(("127.0.0.1", 0), H); port = srv.server_address[1]
-if mode != "down":
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-else:
-    srv.server_close()  # nothing listening: connections are refused
-url = f"http://127.0.0.1:{port}"
+from _controlled_desktop import configure
+seen_payloads = configure(mode, voice=False)
+url = "http://127.0.0.1:11434"
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
@@ -51,6 +25,12 @@ import lora.main as lm
 from lora.ui.hud import LoraDesktopHUD
 
 log = []; hud_ref = []
+ui_errors = []
+class UiErrors(logging.Handler):
+    def emit(self, record):
+        if record.levelno >= logging.ERROR:
+            ui_errors.append(record.getMessage())
+logging.getLogger("lora.ui.threadsafe").addHandler(UiErrors())
 class RecHUD(LoraDesktopHUD):
     def __init__(self, *a, **k): super().__init__(*a, **k); hud_ref.append(self)
     def stream_begin(self, q, label=""): log.append(("begin", threading.current_thread().name, label)); super().stream_begin(q, label)
@@ -70,6 +50,15 @@ args = argparse.Namespace(no_audio=True, headless=False, port=0, host="127.0.0.1
 t0 = [time.monotonic()]
 done = {"v": False}
 def finish_check():
+    if mode == "sleepbusy" and time.monotonic() - t0[0] > 5:
+        app.quit()
+        return
+    if mode == "interrupt" and len([e for e in log if e[0] == "present"]) == 1 and not done.get("followup"):
+        done["followup"] = True
+        hud_ref[0].query_submitted.emit("Good night", "")
+        return
+    if mode == "interrupt" and len([e for e in log if e[0] == "present"]) < 2:
+        return
     if any(e[0] == "present" for e in log) and any(e[:2] == ("state", "idle") for e in log[[i for i,e in enumerate(log) if e[0]=="present"][0]:]):
         app.quit()
     elif time.monotonic() - t0[0] > 45:
@@ -77,13 +66,20 @@ def finish_check():
 
 def submit():
     t0[0] = time.monotonic()
-    hud_ref[0].query_submitted.emit("explain gradient descent briefly", "")
+    hud_ref[0].query_submitted.emit("tell me a joke about cats", "")
+    if mode == "interrupt":
+        QTimer.singleShot(250, lambda: hud_ref[0].query_submitted.emit("stop", ""))
+    if mode == "sleepbusy":
+        def sleep_now():
+            log.append(("sleep-requested",))
+            hud_ref[0].sleep_toggled.emit(True)
+        QTimer.singleShot(250, sleep_now)
     t = QTimer(); t.setInterval(100); t.timeout.connect(finish_check); t.start(); done["t"] = t
 QTimer.singleShot(500, submit)
 
 with patch("lora.main.LoraDesktopHUD", RecHUD), \
      patch("lora.main.start_gateway_thread", return_value=None), \
-     patch("lora.grounding.media_vector_db.MediaVectorDB", MagicMock()):
+     patch("lora.grounding.media_vector_db.MediaVectorDB", MagicMock(return_value=MagicMock(file_count=0))):
     rc = lm.run_desktop_app(cfg_mgr, user_cfg, args)
 
 main_thread = threading.main_thread().name
@@ -103,4 +99,7 @@ print("RESULT:" + json.dumps({
     "model": payload.get("model"), "think": payload.get("think"),
     "options": payload.get("options"), "keep_alive": payload.get("keep_alive"),
     "roles": [m["role"] for m in payload.get("messages", [])],
+    "answers": [e[2] for e in present],
+    "ui_errors": ui_errors,
+    "states_after_sleep": [e[1] for e in log[next((i for i,e in enumerate(log) if e[0]=='sleep-requested'), len(log)):] if e[0]=='state'],
 }))

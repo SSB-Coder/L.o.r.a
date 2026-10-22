@@ -8,7 +8,7 @@ from lora.verify.report import VerificationVerdict
 
 
 @pytest.mark.asyncio
-async def test_eval_answerable_grounded_question():
+async def test_eval_answerable_grounded_question(live_semantic_verifier):
     cards = [
         EvidenceCard(
             card_id="S1",
@@ -64,7 +64,7 @@ async def test_eval_false_premise_detection():
 
 
 @pytest.mark.asyncio
-async def test_eval_conflicting_sources_handling():
+async def test_eval_conflicting_sources_handling(live_semantic_verifier):
     cards = [
         EvidenceCard(
             card_id="S1",
@@ -94,7 +94,7 @@ async def test_eval_conflicting_sources_handling():
 
 
 @pytest.mark.asyncio
-async def test_eval_gold_100_claims_benchmark():
+async def test_eval_gold_100_claims_benchmark(live_semantic_verifier):
     import json
     from pathlib import Path
     from lora.verify.nli import NliGroundednessChecker
@@ -113,6 +113,7 @@ async def test_eval_gold_100_claims_benchmark():
         expected = bool(item["expected_supported"])
         num_res = num_checker.verify_numbers(premise=premise, claim=claim)
         nli_res = nli.check_entailment(premise=premise, hypothesis=claim)
+        assert nli_res.reliable, "Heuristic output is not a model evaluation"
         predicted = bool(num_res.is_valid and nli_res.is_entailed)
         if predicted == expected:
             correct += 1

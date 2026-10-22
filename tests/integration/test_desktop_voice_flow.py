@@ -3,7 +3,7 @@
 import pytest
 
 pytest.importorskip("PySide6")
-pytest.importorskip("faiss")
+pytest.importorskip("numpy")
 
 from test_desktop_query_flow import run_harness  # noqa: E402
 
@@ -24,3 +24,29 @@ def test_missing_microphone_is_reported_not_hidden():
     ok, text = r["mic"][-1]
     assert ok is False and "no input device" in text
     assert any("microphone isn't running" in m[1] for m in r["messages"])
+
+
+def test_capture_stays_open_and_transcription_waits_until_execution_finishes():
+    r = run_harness("_desktop_voice_harness.py", "busy", timeout=120)
+    assert r["queries"] == ["tell me a joke", "how are you"]
+    assert r["results"]["no_stt_during_execution"]
+    assert r["results"]["deferred_after_answer"]
+    assert r["results"]["capture_starts"] == 1
+    assert r["results"]["capture_stops_before_exit"] == 0
+
+
+def test_sleep_keeps_addressed_wake_listening_without_executing_chatter():
+    r = run_harness("_desktop_voice_harness.py", "sleepwake", timeout=120)
+    assert r["results"]["sleep_chatter_ignored"]
+    assert r["queries"] == ["tell me a joke"]
+    assert r["results"]["capture_stops_before_exit"] == 0
+
+
+def test_exit_during_synthesis_has_no_closed_pipe_traceback_or_queued_retries():
+    r = run_harness("_desktop_voice_harness.py", "shutdownspeech", timeout=120)
+    result = r["results"]
+    assert result["synthesis_was_pending"]
+    assert result["speech_stopped_before_worker_closed"]
+    assert result["speech_calls"] == 1
+    assert result["speech_threads_joined"]
+    assert result["terminal_errors"] == []

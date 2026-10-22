@@ -1,13 +1,26 @@
 """Embedding engine running on CPU for zero VRAM consumption."""
 
+import functools
+import hashlib
 import logging
 import os
+import threading
+import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def _serialized(method):
+    @functools.wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return locked
 
 
 def _resolve_default_embedding_path() -> str:
@@ -40,7 +53,7 @@ class EmbeddingEngine:
         self,
         model_name_or_path: str | None = None,
         device: str = "cpu",
-        batch_size: int = 16,
+        batch_size: int = 8,
     ) -> None:
         resolved = model_name_or_path or _resolve_default_embedding_path()
         # If caller passed legacy "C:/Models/embeddinggemma-2" that doesn't exist, resolve to local models/embeddinggemma2
@@ -49,12 +62,16 @@ class EmbeddingEngine:
             if Path(alt).exists():
                 resolved = alt
         self.model_path = resolved
+        self._lock = threading.RLock()
         self.device = device
         self.batch_size = batch_size
         self._model: Any = None
         self._use_fallback: bool = False
         self._fallback_dim: int = 768
+        self._cache: OrderedDict[bytes, np.ndarray] = OrderedDict()
+        self.last_encode_stats: dict[str, int | float] = {}
 
+    @_serialized
     def _ensure_model(self) -> Any:
         if self._model is None and not self._use_fallback:
             path = Path(self.model_path)
@@ -69,7 +86,10 @@ class EmbeddingEngine:
                         self.model_path,
                     )
             try:
+                import torch
                 from sentence_transformers import SentenceTransformer
+
+                torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
 
                 logger.info("Loading embedding model from '%s' on %s", self.model_path, self.device)
                 kwargs = {"trust_remote_code": True}
@@ -89,6 +109,7 @@ class EmbeddingEngine:
                 self._use_fallback = True
         return self._model
 
+    @_serialized
     def encode(self, texts: list[str]) -> np.ndarray:
         """Generate normalized float32 embeddings for a list of strings."""
         dim = self.dimension
@@ -108,14 +129,27 @@ class EmbeddingEngine:
                 vecs.append(vec)
             return np.asarray(vecs, dtype=np.float32)
 
-        embeddings = model.encode(
-            texts,
+        started = time.perf_counter()
+        keys = [hashlib.sha256(t.encode("utf-8")).digest() for t in texts]
+        missing = dict((key, text) for key, text in zip(keys, texts, strict=True) if key not in self._cache)
+        fresh = model.encode(
+            list(missing.values()),
             batch_size=self.batch_size,
             show_progress_bar=False,
             normalize_embeddings=True,
             convert_to_numpy=True,
-        )
-        return np.asarray(embeddings, dtype=np.float32)
+        ) if missing else []
+        computed = {key: np.asarray(vector, dtype=np.float32) for key, vector in zip(missing, fresh, strict=True)}
+        # Gather before evicting so a large batch cannot evict its own output.
+        output = np.asarray([computed[key] if key in computed else self._cache[key] for key in keys], dtype=np.float32)
+        for key in keys:
+            self._cache[key] = computed[key] if key in computed else self._cache[key]
+            self._cache.move_to_end(key)
+        while len(self._cache) > 256:
+            self._cache.popitem(last=False)
+        self.last_encode_stats = {"texts": len(texts), "encoded": len(missing), "cached": len(texts) - len(missing),
+                                  "seconds": round(time.perf_counter() - started, 4)}
+        return output.copy()
 
     @property
     def dimension(self) -> int:

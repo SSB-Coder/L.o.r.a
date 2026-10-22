@@ -165,70 +165,21 @@ class AppLauncher:
             }
 
     def _check_blocked_host(self, host: str) -> tuple[bool, str]:
-        """Check if a host is localhost, private/loopback IP, or router gateway."""
-        if not host:
-            return True, "URL host is missing or invalid."
+        # Reject numeric aliases locally even if DNS is unavailable. Windows DNS
+        # does not consistently resolve the legacy hex/octal IPv4 forms.
+        from lora.safety.egress import EgressFilter
 
-        host_clean = host.strip("[]").lower()
-
-        # 1. Localhost or internal domain checks
-        if (
-            host_clean == "localhost"
-            or host_clean.endswith(".localhost")
-            or host_clean.endswith(".local")
-            or host_clean.endswith(".internal")
-            or host_clean.endswith(".lan")
-        ):
-            return True, f"Access to local or private host '{host_clean}' is prohibited."
-
-        # 2. Known router admin host checks
-        if host_clean in self.BLOCKED_ROUTER_HOSTS:
-            return True, f"Access to internal router administration host '{host_clean}' is blocked."
-
-        # 3. Check for integer / hex IP formats (e.g. 2130706433 or 0x7f000001)
+        blocked, reason = EgressFilter()._is_ip_or_loopback_blocked(host)
+        if blocked:
+            return True, reason
+        if not host or host.lower() in self.BLOCKED_ROUTER_HOSTS or host.lower().endswith((".local", ".lan", ".internal", ".localhost")) or host.lower() == "localhost":
+            return True, "Local/private destination blocked"
         try:
-            val = None
-            if host_clean.isdigit():
-                val = int(host_clean)
-            elif host_clean.startswith("0x") or host_clean.startswith("0X"):
-                val = int(host_clean, 16)
-            if val is not None:
-                ip_obj = ipaddress.ip_address(val)
-                if ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_reserved or ip_obj.is_unspecified:
-                    return True, f"Access to private/loopback IP '{ip_obj}' is blocked."
-        except Exception:
-            pass
-
-        # 4. Standard dotted / IPv6 IP check
-        try:
-            ip = ipaddress.ip_address(host_clean)
-            if ip.is_loopback or ip.is_unspecified:
-                return True, f"Access to loopback IP '{host_clean}' is blocked."
-            if ip.is_private and (
-                str(ip).endswith(".1")
-                or str(ip).endswith(".254")
-                or str(ip).startswith("127.")
-                or str(ip).startswith("10.")
-                or str(ip).startswith("192.168.")
-            ):
-                return True, f"Access to internal gateway/private IP '{host_clean}' is blocked."
-        except ValueError:
-            pass
-
-        # 5. Socket-level parsing for octal or other alternative notations (e.g. 0177.0.0.1)
-        try:
-            packed = socket.inet_aton(host_clean)
-            ip_str = socket.inet_ntoa(packed)
-            ip_from_socket = ipaddress.ip_address(ip_str)
-            if ip_from_socket.is_loopback or ip_from_socket.is_unspecified:
-                return True, f"Access to loopback IP '{ip_str}' is blocked."
-            if ip_from_socket.is_private and (
-                ip_str.endswith(".1") or ip_str.endswith(".254") or ip_str.startswith("127.")
-            ):
-                return True, f"Access to internal gateway/private IP '{ip_str}' is blocked."
+            addresses = {info[4][0] for info in socket.getaddrinfo(host.strip("[]"), None, type=socket.SOCK_STREAM)}
+            if not addresses or any(not ipaddress.ip_address(addr).is_global for addr in addresses):
+                return True, "Local/private destination blocked"
         except (OSError, ValueError):
-            pass
-
+            return True, "Destination could not be validated"
         return False, ""
 
     def open_url(self, url: str) -> dict[str, Any]:
@@ -241,6 +192,8 @@ class AppLauncher:
             return {"status": "error", "message": f"Invalid URL structure: {e}"}
 
         # 1. Enforce HTTP/HTTPS protocol
+        if parsed.username is not None or parsed.password is not None:
+            return {"status": "error", "message": "Credentials in URLs are prohibited."}
         if (parsed.scheme or "").lower() not in ["http", "https"]:
             return {
                 "status": "error",

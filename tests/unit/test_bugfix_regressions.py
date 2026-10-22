@@ -67,16 +67,17 @@ async def test_open_folder_uses_the_real_known_folder_location(tmp_path, monkeyp
     assert res.text == "Opening Documents." and startfile.call_args.args[0] == str(onedrive_docs)
 
 
-def test_known_folder_roots_feed_the_default_policy(tmp_path, monkeypatch):
-    from lora.tools import registry as registry_mod
-    from lora.tools.files import known
-
+def test_configured_roots_do_not_implicitly_grant_other_known_folders(tmp_path):
+    import yaml
+    allowed = tmp_path / "approved"
+    allowed.mkdir()
     redirected = tmp_path / "OneDrive" / "Desktop"
     redirected.mkdir(parents=True)
-    monkeypatch.setattr(known, "_windows_known_folder", lambda name: redirected if name == "desktop" else None)
-    monkeypatch.setattr(registry_mod, "known_folder_roots", known.known_folder_roots)
-    reg = registry_mod.ToolRegistry(media_db=MagicMock())
-    assert reg.action_gate.policy_engine.check_path(str(redirected / "x.txt"), origin="desktop", mode="read").allowed
+    cfg = tmp_path / "policy.yaml"
+    cfg.write_text(yaml.safe_dump({"allowed_roots": [str(allowed)]}))
+    policy = PolicyEngine(config_path=cfg)
+    assert policy.check_path(str(allowed / "x.txt"), origin="desktop", mode="read").allowed
+    assert not policy.check_path(str(redirected / "x.txt"), origin="desktop", mode="read").allowed
 
 
 # ---- open a file by name, compound browse commands ----------------------------------------------------------
@@ -97,7 +98,7 @@ async def test_open_file_by_name_finds_it_and_opens_it(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_open_site_and_search_in_one_sentence(tmp_path, monkeypatch):
+async def test_open_site_and_search_in_one_sentence(tmp_path, monkeypatch, public_dns):
     rt = _runtime(tmp_path, monkeypatch)
     with patch("webbrowser.open") as wb:
         r1 = await _turn(rt, "open youtube and search for lofi beats")
@@ -149,97 +150,32 @@ async def test_read_url_summarises_a_page(tmp_path, monkeypatch):
     assert "doubles throughput" in json.loads(chat.calls[0].request.content)["messages"][-1]["content"].lower()
 
 
-# ---- Qwen TTS loader --------------------------------------------------------------------------------------------------
-def _fake_torch(cuda=True, free_gb=5.0, version="2.8.0"):
-    torch = types.ModuleType("torch")
-    torch.__version__ = version
-    torch.bfloat16 = "bf16"
-    torch.cuda = types.SimpleNamespace(
-        is_available=lambda: cuda, mem_get_info=lambda: (int(free_gb * 1e9), int(6e9)), empty_cache=lambda: None
-    )
-    return torch
-
-
-@pytest.fixture
-def tts(monkeypatch):
+# ---- CPU-only Kokoro contract (replaces retired Qwen GPU assumptions) ----
+@pytest.mark.parametrize("gpu_available", [True, False])
+def test_kokoro_never_loads_qwen_or_uses_gpu(monkeypatch, gpu_available):
+    import numpy as np
     from lora.voice.tts import worker
-
-    monkeypatch.setattr(worker, "_CACHED_QWEN_MODEL", None)
-    monkeypatch.setattr(worker, "_QWEN_STATUS", {"state": "unloaded", "reason": "", "fix": "", "dir": ""})
-    monkeypatch.delenv("LORA_TTS_ENGINE", raising=False)
-    monkeypatch.delenv("LORA_TTS_MODEL_DIR", raising=False)
-    return worker
-
-
-def _model_dir(tmp_path, name, gb):
-    d = tmp_path / name
-    d.mkdir()
-    (d / "model.safetensors").write_bytes(b"\0" * int(gb * 1e6))  # scaled: 1 'GB' == 1 MB here
-    return d
-
-
-def test_cpu_only_torch_gives_a_clear_reason_and_fix(tts, monkeypatch, tmp_path):
-    monkeypatch.setitem(sys.modules, "torch", _fake_torch(cuda=False, version="2.8.0+cpu"))
-    assert tts.get_qwen_model(str(tmp_path)) is None
-    diag = tts.tts_diagnosis(str(tmp_path))
-    assert not diag["ok"] and "no GPU support" in diag["summary"] and "install_tts.ps1" in diag["fix"]
-
-
-def test_model_loads_in_bf16_not_float32(tts, monkeypatch, tmp_path):
-    """Default float32 loading needs ~7 GB for the 1.7B model, which cannot fit in 6 GB."""
-    monkeypatch.setitem(sys.modules, "torch", _fake_torch())
-    calls = {}
-
-    class FakeModel:
-        @classmethod
-        def from_pretrained(cls, path, **kw):
-            calls.update(path=path, **kw)
-            return cls()
-
-    monkeypatch.setitem(sys.modules, "qwen_tts", types.SimpleNamespace(Qwen3TTSModel=FakeModel))
-    monkeypatch.setattr(tts, "_weights_gb", lambda p: 3.8)
-    d = _model_dir(tmp_path, "Qwen3-TTS-12Hz-1.7B-CustomVoice", 1)
-    assert tts.get_qwen_model(str(d)) is not None
-    assert calls["dtype"] == "bf16" and calls["device_map"] == "cuda:0"
-    assert tts.tts_diagnosis(str(d))["ok"]
-
-
-def test_smaller_model_is_chosen_when_the_big_one_does_not_fit(tts, monkeypatch, tmp_path):
-    monkeypatch.setitem(sys.modules, "torch", _fake_torch(free_gb=3.0))
-    loaded = []
-
-    class FakeModel:
-        @classmethod
-        def from_pretrained(cls, path, **kw):
-            loaded.append(path)
-            return cls()
-
-    monkeypatch.setitem(sys.modules, "qwen_tts", types.SimpleNamespace(Qwen3TTSModel=FakeModel))
-    big = _model_dir(tmp_path, "Qwen3-TTS-12Hz-1.7B-CustomVoice", 1)
-    small = _model_dir(tmp_path, "Qwen3-TTS-12Hz-0.6B-CustomVoice", 1)
-    monkeypatch.setattr(tts, "_weights_gb", lambda p: 3.8 if "1.7B" in str(p) else 1.3)
-    assert tts.get_qwen_model(str(big)) is not None
-    assert loaded == [str(small)]
-
-
-def test_not_enough_vram_says_so_and_does_not_retry_every_sentence(tts, monkeypatch, tmp_path):
-    monkeypatch.setitem(sys.modules, "torch", _fake_torch(free_gb=1.0))
-    monkeypatch.setitem(sys.modules, "qwen_tts", types.SimpleNamespace(Qwen3TTSModel=MagicMock()))
-    d = _model_dir(tmp_path, "Qwen3-TTS-12Hz-1.7B-CustomVoice", 1)
-    monkeypatch.setattr(tts, "_weights_gb", lambda p: 3.8)
-    assert tts.get_qwen_model(str(d)) is None
-    diag = tts.tts_diagnosis(str(d))
-    assert "not enough free GPU memory" in diag["summary"] and "0.6B" in diag["fix"]
-    sys.modules["qwen_tts"].Qwen3TTSModel.from_pretrained.assert_not_called()
-
-
-def test_speaker_names_are_canonicalised(tts):
     model = MagicMock()
-    model.get_supported_speakers.return_value = ["Vivian", "Uncle_Fu"]
-    assert tts._canonical_speaker(model, "uncle_fu") == "Uncle_Fu"
-    assert tts._canonical_speaker(model, "nobody") == "Vivian"
-    plain = types.SimpleNamespace()
-    assert tts._canonical_speaker(plain, "ono_anna") == "Ono_Anna"
+    model.get_voices.return_value = ["af_sky"]
+    model.create.return_value = (np.ones(2400, dtype=np.float32), 24000)
+    monkeypatch.setattr(worker, "get_kokoro_model", lambda path: model)
+    qwen = MagicMock(side_effect=AssertionError("Qwen must remain inactive"))
+    monkeypatch.setattr(worker, "get_qwen_model", qwen)
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: gpu_available)))
+    w = worker.KokoroTtsWorkerProcess()
+    chunk = w.synthesize("Hi there.")
+    assert len(chunk.samples) == 2400 and chunk.error is None
+    assert w.diagnosis()["device"] == "cpu"
+    qwen.assert_not_called()
+
+
+def test_missing_kokoro_returns_error_without_fake_audio(monkeypatch):
+    from lora.voice.tts import worker
+    monkeypatch.setattr(worker, "get_kokoro_model", lambda path: None)
+    w = worker.KokoroTtsWorkerProcess()
+    chunk = w.synthesize("Hi there.")
+    assert len(chunk.samples) == 0 and "Kokoro" in chunk.error
+    assert not w.diagnosis()["ok"] and "--kokoro-only" in w.diagnosis()["fix"]
 
 
 # ---- diagnostics ------------------------------------------------------------------------------------------------------------
@@ -272,8 +208,9 @@ def test_v8_sleep_wakeword_word_boundaries_and_inline_query():
     matched_false, _ = det.match_text("The awakening of spring was loud", is_sleeping=True)
     assert matched_false is False
 
-    # Saying "Awaken LORA, open Chrome" from sleep wakes and extracts the inline command
-    matched_true, inline_q = det.match_text("Awaken LORA, open Chrome", is_sleeping=True)
+    # Sleep closes the microphone; only an awake addressed phrase extracts a command.
+    assert det.match_text("Awaken LORA, open Chrome", is_sleeping=True)[0] is False
+    matched_true, inline_q = det.match_text("Awaken LORA, open Chrome", is_sleeping=False)
     assert matched_true is True
     assert inline_q == "open Chrome"
 
@@ -369,7 +306,7 @@ def test_v8_csv_formula_injection_blocked_in_open_path(tmp_path):
     policy = PolicyEngine(allowed_roots=[str(tmp_path)])
     res = open_path(evil_csv, policy_engine=policy)
     assert res["status"] == "error"
-    assert "formula" in res["message"].lower() or "dde" in res["message"].lower()
+    assert "no approved safe viewer" in res["message"].lower()
 
 
 
@@ -379,12 +316,12 @@ def test_v8_mobile_qr_websocket_connects_on_real_lan_ip_and_port_8766():
     from lora.gateway.server import create_gateway_app
 
     tv = TokenValidator(desktop_token="desk_tok", mobile_token="mob_tok_xyz")
-    guard = HostOriginGuard(listener_origin="mobile", mobile_ip="0.0.0.0", port=8766)
+    guard = HostOriginGuard(listener_origin="mobile", mobile_ip="192.168.1.42", port=8766)
     mob_app = create_gateway_app(origin="mobile", token_validator=tv, host_guard=guard)
 
     # Simulate phone connecting from real Wi-Fi LAN IP (e.g. 192.168.1.42:8766)
     client = TestClient(mob_app, base_url="http://192.168.1.42:8766")
-    with client.websocket_connect("/v1/events?token=mob_tok_xyz", headers={"Host": "192.168.1.42:8766", "Origin": "http://192.168.1.42:8766"}) as ws:
+    with client.websocket_connect("/v1/events", headers={"Host": "192.168.1.42:8766", "Origin": "http://192.168.1.42:8766"}) as ws:
         ws.send_json({"type": "auth", "token": "mob_tok_xyz"})
         reply = ws.receive_json()
         assert reply == {"type": "auth_ok", "origin": "mobile"}

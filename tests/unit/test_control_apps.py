@@ -56,7 +56,7 @@ def test_open_app_denied_not_in_allowlist(launcher: AppLauncher):
 
 
 @patch("webbrowser.open")
-def test_open_url_valid(mock_webbrowser, launcher: AppLauncher):
+def test_open_url_valid(mock_webbrowser, launcher: AppLauncher, public_dns):
     res = launcher.open_url("https://arxiv.org")
     assert res["status"] == "success"
     assert res["url"] == "https://arxiv.org"

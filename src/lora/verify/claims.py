@@ -1,5 +1,6 @@
 """V2: Atomic claim decomposition."""
 
+import logging
 import re
 import uuid
 
@@ -128,7 +129,14 @@ class ClaimDecomposer:
                 continue
 
             # Skip uncited conversational sign-offs, friendly nudges, or persona rest advice (not factual claims)
-            if not cited and _CONVERSATIONAL_SIGNOFF.search(clean_text):
+            if not cited and re.fullmatch(
+                r"(?:hope this helps|take care|good night|ready when you are|you(?:'ve| have) got this|"
+                r"get (?:some )?(?:sleep|rest)|rest your (?:eyes|mind|head)|"
+                r"i'd suggest taking a break to rest your eyes and mind[-—]you've got this, "
+                r"and i'll be here when you're ready to pick up)[.!]?",
+                clean_text, flags=re.IGNORECASE,
+            ):
+                logging.getLogger(__name__).debug("Skipped complete conversational sign-off")
                 continue
 
             clean_text = clean_text[0].upper() + clean_text[1:]

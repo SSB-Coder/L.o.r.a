@@ -10,7 +10,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import threading
+import time
 from dataclasses import dataclass, field
+from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
@@ -30,29 +33,22 @@ PAGE_CHARS = 2400
 
 _SHARED_EMBEDDER = None
 _SHARED_RERANKER = None
+_RAG_LOCK = threading.RLock()
 
 
 def _get_rag_components():
     """Lazy-initialize shared EmbeddingEngine and CrossEncoderReranker for SessionVectorIndex chunk selection.
 
-    On CPU-only environments without CUDA, running a 1.5GB embedding model across multiple web pages
-    blocks the event loop for minutes. We skip heavy neural RAG unless CUDA is present or
-    LORA_ENABLE_CPU_PAGE_RAG=1 is set, falling back to instant lexical/BM25 chunk selection.
+    CPU page RAG is enabled by default and runs in bounded worker batches.
+    LORA_ENABLE_CPU_PAGE_RAG=0 opts out; unavailable weights use lexical retrieval.
     """
     global _SHARED_EMBEDDER, _SHARED_RERANKER
     if _SHARED_EMBEDDER is None:
         try:
             import os
 
-            enable_cpu = os.getenv("LORA_ENABLE_CPU_PAGE_RAG", "0").lower() in ("1", "true", "yes")
-            try:
-                import torch
-
-                has_cuda = torch.cuda.is_available()
-            except Exception:
-                has_cuda = False
-
-            if not has_cuda and not enable_cpu:
+            enable_cpu = os.getenv("LORA_ENABLE_CPU_PAGE_RAG", "1").lower() in ("1", "true", "yes")
+            if not enable_cpu:
                 _SHARED_EMBEDDER = False
                 _SHARED_RERANKER = False
                 return None, None
@@ -60,7 +56,12 @@ def _get_rag_components():
             from lora.grounding.embed import EmbeddingEngine
             from lora.grounding.rerank import CrossEncoderReranker
 
-            _SHARED_EMBEDDER = EmbeddingEngine()
+            _SHARED_EMBEDDER = EmbeddingEngine(device="cpu", batch_size=8)
+            _SHARED_EMBEDDER._ensure_model()
+            if _SHARED_EMBEDDER._use_fallback:
+                _SHARED_EMBEDDER = False
+                _SHARED_RERANKER = False
+                return None, None
             _SHARED_RERANKER = CrossEncoderReranker()
         except Exception:
             _SHARED_EMBEDDER = False
@@ -86,12 +87,20 @@ class Source:
     def is_preprint(self) -> bool:
         return self.domain in PREPRINT_DOMAINS
 
+    @property
+    def tier(self) -> int:
+        if self.domain in {"news.ycombinator.com", "reddit.com", "stackoverflow.com", "chatgpt.com", "perplexity.ai", "gemini.google.com"}:
+            return 4
+        return 1 if self.is_preprint else 2
+
 
 @dataclass
 class ResearchResult:
     query: str
     sources: list[Source] = field(default_factory=list)
     session_index: Any = None
+    quarantined_sources: int = 0
+    timings: dict[str, float] = field(default_factory=dict)
 
     def prompt_block(self) -> str:
         parts = []
@@ -119,8 +128,8 @@ def _egress_ok(url: str) -> bool:
 
         return EgressFilter().check_egress(url).allowed
     except Exception:  # if the guard itself is unavailable, fall back to a basic scheme/host check
-        p = urlparse(url)
-        return p.scheme in ("http", "https") and (p.hostname or "") not in ("localhost", "127.0.0.1", "::1")
+        logger.error("Egress policy unavailable; denying fetch")
+        return False
 
 
 def _decode_ddg(href: str) -> str:
@@ -282,26 +291,15 @@ async def web_search(query: str, client: httpx.AsyncClient, limit: int = 8) -> l
 
 
 def extract_text(html: str) -> str:
+    from lora.safety.parsers import parse_document
     try:
-        import trafilatura
-
-        text = trafilatura.extract(html, include_comments=False, include_tables=False) or ""
-        if text.strip():
-            return text.strip()
-    except Exception:
-        pass
-    try:
-        from bs4 import BeautifulSoup
-
-        soup = BeautifulSoup(html, "html.parser")
-        for t in soup(["script", "style", "nav", "footer", "header", "aside"]):
-            t.decompose()
-        return re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
-    except Exception:
+        return parse_document("html", html.encode("utf-8"))["text"]
+    except Exception as exc:
+        logger.warning("Isolated page extraction failed: %s", exc)
         return ""
 
 
-def select_best_passages(full_text: str, query: str = "", max_chars: int = PAGE_CHARS) -> str:
+def select_best_passages(full_text: str, query: str = "", max_chars: int = PAGE_CHARS, neural: bool = True) -> str:
     """Select the most query-relevant semantic chunks from a long article using SessionVectorIndex + CrossEncoderReranker."""
     if len(full_text) <= max_chars or not query.strip():
         return full_text[:max_chars]
@@ -315,7 +313,7 @@ def select_best_passages(full_text: str, query: str = "", max_chars: int = PAGE_
         if len(chunks) <= 2:
             return full_text[:max_chars]
 
-        embedder, reranker = _get_rag_components()
+        embedder, reranker = _get_rag_components() if neural else (None, None)
         if embedder is not None:
             try:
                 sess = SessionVectorIndex(session_id="page-rag", embedding_engine=embedder)
@@ -365,7 +363,7 @@ def select_best_passages(full_text: str, query: str = "", max_chars: int = PAGE_
         return full_text[:max_chars]
 
 
-async def fetch_text(url: str, client: httpx.AsyncClient, query: str = "") -> str:
+async def fetch_text(url: str, client: httpx.AsyncClient, query: str = "", max_chars: int = PAGE_CHARS) -> str:
     if not _egress_ok(url):
         return ""
 
@@ -376,7 +374,7 @@ async def fetch_text(url: str, client: httpx.AsyncClient, query: str = "") -> st
 
             pdf_res = await PdfFetcher().fetch_pdf(url)
             if pdf_res.get("status") == "success" and pdf_res.get("content"):
-                return select_best_passages(pdf_res["content"], query=query, max_chars=PAGE_CHARS)
+                return await asyncio.to_thread(select_best_passages, pdf_res["content"], query, max_chars)
         except Exception as exc:
             logger.info("Direct PDF fetch failed for %s: %s", url, exc)
             return ""
@@ -392,7 +390,7 @@ async def fetch_text(url: str, client: httpx.AsyncClient, query: str = "") -> st
 
                     pdf_res = await PdfFetcher().fetch_pdf(url)
                     if pdf_res.get("status") == "success" and pdf_res.get("content"):
-                        return select_best_passages(pdf_res["content"], query=query, max_chars=PAGE_CHARS)
+                        return await asyncio.to_thread(select_best_passages, pdf_res["content"], query, max_chars)
                 except Exception as exc:
                     logger.info("PDF fetch via Content-Type failed for %s: %s", url, exc)
                 return ""
@@ -407,7 +405,11 @@ async def fetch_text(url: str, client: httpx.AsyncClient, query: str = "") -> st
     except Exception as exc:
         logger.info("Fetch failed for %s: %s", url, exc)
         return ""
-    raw_text = extract_text(html)
+    raw_text = await asyncio.to_thread(extract_text, html)
+    from lora.safety.injection import classify_chunk
+    if classify_chunk(raw_text).quarantined:
+        logger.warning("Source quarantined: embedded instructions detected")
+        return ""
     # Inspect with Spotlighter to strip any active prompt injection payloads from scraped web prose
     try:
         from lora.tools.web.spotlight import Spotlighter
@@ -422,7 +424,7 @@ async def fetch_text(url: str, client: httpx.AsyncClient, query: str = "") -> st
             )
     except Exception:
         pass
-    return select_best_passages(raw_text, query=query, max_chars=PAGE_CHARS)
+    return await asyncio.to_thread(select_best_passages, raw_text, query, max_chars)
 
 
 async def research(
@@ -431,8 +433,10 @@ async def research(
     max_pages: int = 4,
     queries: list[str] | None = None,
     topic_type: str = "background",
+    embedding_engine: Any = None,
 ) -> ResearchResult:
     """Search the web and read the best few pages. ``queries`` are the prompt engineer's search phrases."""
+    started = time.perf_counter()
     phrases = list(dict.fromkeys(q.strip() for q in (queries or [query]) if q and q.strip()))[:2] or [query]
     async with async_client(HEADERS, httpx.Timeout(12.0, connect=6.0)) as client:
         status("Searching the web…")
@@ -476,29 +480,90 @@ async def research(
         if not picked:
             return ResearchResult(query)
         status(f"Reading {len(picked)} pages…")
-        texts = await asyncio.gather(*(fetch_text(s.url, client, query=query) for s in picked), return_exceptions=True)
+        searched_at = time.perf_counter()
+        texts = await asyncio.gather(*(fetch_text(s.url, client, max_chars=18000) for s in picked), return_exceptions=True)
         for s, t in zip(picked, texts, strict=True):
             s.text = t if isinstance(t, str) else ""
-        usable = [s for s in picked if len(s.text) >= 200 or s.snippet]
+        from lora.safety.injection import classify_chunk
+        candidates = [s for s in picked if len(s.text) >= 200 or s.snippet]
+        usable = [s for s in candidates if not classify_chunk(s.text + " " + s.snippet).quarantined]
+        quarantined_sources = len(candidates) - len(usable)
+        if quarantined_sources:
+            status(f"Quarantined {quarantined_sources} sources containing embedded instructions.")
         for i, s in enumerate(usable, 1):
             s.id = f"S{i}"
+        if not usable:
+            return ResearchResult(query, quarantined_sources=quarantined_sources)
+        fetched_at = time.perf_counter()
 
         # Accumulate chunks across all search results in SessionVectorIndex during research task
         session_index = None
-        embedder, _ = _get_rag_components()
+        status("Preparing EmbeddingGemma page retrieval on CPU.")
+        def components():
+            with _RAG_LOCK:
+                if embedding_engine is not None:
+                    import os
+
+                    if os.getenv("LORA_ENABLE_CPU_PAGE_RAG", "1").lower() not in ("1", "true", "yes"):
+                        return None, None
+                    # Reuse the file index's CPU weights rather than loading a
+                    # second copy into a 16 GB desktop process.
+                    embedding_engine._ensure_model()
+                    return (None, None) if embedding_engine._use_fallback else (embedding_engine, None)
+                return _get_rag_components()
+        embedder, _ = await asyncio.to_thread(components)
+        prepared_at = time.perf_counter()
         if embedder is not None and usable:
             try:
                 import time as _time
+
                 from lora.grounding.chunk import DocumentChunker
                 from lora.grounding.session_index import SessionVectorIndex
 
                 chunker = DocumentChunker(target_chunk_tokens=180, overlap_tokens=25)
                 session_index = SessionVectorIndex(session_id=f"research-{int(_time.time())}", embedding_engine=embedder)
+                chunks = []
                 for s in usable:
                     if s.text:
                         s_chunks = chunker.chunk_text(s.text, source_url=s.url, title=s.title)
-                        session_index.add_chunks(s_chunks)
+                        chunks.extend(s_chunks)
+                chunks = chunks[:128]
+                for start in range(0, len(chunks), 8):
+                    status(f"Embedding sources: {start}/{len(chunks)} chunks")
+                    def add_batch(batch=chunks[start:start + 8]):
+                        with _RAG_LOCK:
+                            session_index.add_chunks(batch)
+                    await asyncio.to_thread(add_batch)
+                status(f"Embedding sources: {len(chunks)}/{len(chunks)} chunks")
             except Exception as exc:
-                logger.debug("Accumulating chunks in SessionVectorIndex failed: %s", exc)
+                session_index = None
+                status("Embedding unavailable; using lexical page retrieval.")
+                logger.warning("Page embedding failed: %s", exc)
+        elif usable:
+            status("Embedding disabled or unavailable; using lexical page retrieval.")
 
-        return ResearchResult(query, usable, session_index=session_index)
+        indexed_at = time.perf_counter()
+        if session_index is not None:
+            def retrieve():
+                with _RAG_LOCK:
+                    return session_index.search_hybrid(query, top_k=128)
+            try:
+                hits = await asyncio.to_thread(retrieve)
+            except Exception as exc:
+                logger.warning("Semantic retrieval failed: %s", exc)
+                status("Semantic retrieval unavailable; using lexical page retrieval.")
+                hits = []
+            for s in usable:
+                passages = [chunk.text for chunk, _ in hits if chunk.source_url == s.url]
+                s.text = "\n\n".join(passages[:4])[:PAGE_CHARS] if passages else await asyncio.to_thread(
+                    select_best_passages, s.text, query, PAGE_CHARS, False,
+                )
+        else:
+            for s in usable:
+                s.text = await asyncio.to_thread(select_best_passages, s.text, query, PAGE_CHARS, False)
+        timings = {"search": searched_at - started, "fetch_parse": fetched_at - searched_at,
+                   "embedding_prepare": prepared_at - fetched_at, "embedding_index": indexed_at - prepared_at,
+                   "retrieval": time.perf_counter() - indexed_at, "total": time.perf_counter() - started}
+        timings = {name: round(value, 3) for name, value in timings.items()}
+        logger.info("Research stage timings (seconds): %s", timings)
+        return ResearchResult(query, usable, session_index=session_index, quarantined_sources=quarantined_sources, timings=timings)

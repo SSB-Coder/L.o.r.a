@@ -1,10 +1,6 @@
 """HTML Cleaning and Trafilatura Article Extraction for L.O.R.A."""
 
-import re
 from typing import Any
-
-import trafilatura
-from bs4 import BeautifulSoup
 
 from lora.tools.web.spotlight import SpotlightedContent, Spotlighter
 
@@ -34,31 +30,9 @@ class ContentExtractor:
                 "flagged_patterns": [],
             }
 
-        # 1. Parse Title and basic metadata with BeautifulSoup
-        soup = BeautifulSoup(html_content, "html.parser")
-
-        title = ""
-        if soup.title and soup.title.string:
-            title = soup.title.string.strip()
-        elif soup.find("h1"):
-            title = soup.find("h1").get_text(strip=True)
-
-        # 2. Extract clean main text via Trafilatura
-        extracted_text = trafilatura.extract(
-            html_content,
-            include_comments=False,
-            include_tables=True,
-            no_fallback=False,
-        )
-
-        # 3. Fallback to BeautifulSoup if Trafilatura returns empty
-        if not extracted_text:
-            # Remove scripts, styles, navigations, footers
-            for elem in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
-                elem.decompose()
-            extracted_text = soup.get_text(separator="\n", strip=True)
-            # Collapse excess blank lines
-            extracted_text = re.sub(r"\n{3,}", "\n\n", extracted_text)
+        from lora.safety.parsers import parse_document
+        parsed = parse_document("html", html_content.encode("utf-8"))
+        title, extracted_text = parsed["title"], parsed["text"]
 
         # 4. Spotlighting & Injection Framing
         spotlight_res: SpotlightedContent | None = None

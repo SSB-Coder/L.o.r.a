@@ -110,7 +110,7 @@ class AudioCueManager:
                 if sys.platform == "win32":
                     import winsound
 
-                    winsound.PlaySound(wav_bytes, winsound.SND_MEMORY | winsound.SND_ASYNC)
+                    winsound.PlaySound(wav_bytes, winsound.SND_MEMORY)  # already on a background thread
                 else:
                     logger.debug("Sound playback on non-Windows skipped for cue: %s", cue)
             except Exception as e:

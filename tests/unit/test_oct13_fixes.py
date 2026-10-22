@@ -2,7 +2,6 @@
 
 import json
 import sys
-import textwrap
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -89,7 +88,7 @@ def test_persona_no_longer_tells_the_model_it_cannot_browse():
     low = PERSONA.lower()
     assert "cannot browse" not in low.replace("never say you cannot browse", "")
     assert "research the web" in low and "open apps" in low
-    assert "tony stark" not in low and "never call the user 'stark'" in low
+    assert "tony stark" not in low and 'never address them as "stark"' in low
 
 
 # ---- fuzzy names, launching ------------------------------------------------------------------------------------------
@@ -173,156 +172,47 @@ async def test_video_and_login_walled_sites_are_not_fetched():
     assert page.called and not yt.called and [s.domain for s in res.sources] == ["example.org"]
 
 
-# ---- the GPU voice runs in its own environment ------------------------------------------------------------------------
-@pytest.fixture
-def voice_env(monkeypatch):
+# ---- CPU voice and deliberately deferred MCP ----
+def test_voice_failure_keeps_text_working_without_another_speech_backend(monkeypatch):
     from lora.voice.tts import worker
-
-    monkeypatch.setattr(worker, "_EXTERNAL", None)
-    monkeypatch.setenv("LORA_TTS_PYTHON", sys.executable)
-    monkeypatch.delenv("LORA_TTS_ENGINE", raising=False)
-    yield worker
-    if worker._EXTERNAL is not None:
-        worker._EXTERNAL.stop()
-    worker._EXTERNAL = None
-
-
-def test_voice_server_speaks_through_the_separate_environment(voice_env, monkeypatch):
-    monkeypatch.setenv("LORA_TTS_FAKE", "1")
-    w = voice_env.Qwen3TtsWorkerProcess(models_dir=r"C:\nowhere")
-    assert w.preload() is True
-    chunk = w.synthesize("Hello there, friend.", voice="vivian")
-    assert len(chunk.samples) > 1000 and chunk.sample_rate == 22050
-    assert abs(float(chunk.samples.max())) <= 1.0
-    diag = w.diagnosis()
-    assert diag["ok"] and "ready" in diag["summary"]
-    w.shutdown()
+    monkeypatch.setattr(worker, "get_kokoro_model", lambda path: None)
+    w = worker.KokoroTtsWorkerProcess()
+    assert not w.preload()
+    assert not w.diagnosis()["ok"]
+    assert "--kokoro-only" in w.diagnosis()["fix"]
+    chunk = w.synthesize("Hi.")
+    assert chunk.error and len(chunk.samples) == 0
 
 
-def test_voice_server_failure_reports_reason_and_fix_and_falls_back(voice_env, monkeypatch, tmp_path):
-    monkeypatch.delenv("LORA_TTS_FAKE", raising=False)
-    # the real server in an interpreter without torch/qwen-tts: a clear message, then the Windows voice
-    w = voice_env.Qwen3TtsWorkerProcess(models_dir=str(tmp_path))
-    assert w.preload() is False
-    diag = w.diagnosis()
-    assert not diag["ok"] and "install_tts.ps1" in diag["fix"] and "Windows voice" in diag["summary"]
-    with patch.object(voice_env, "_windows_speech_synth", return_value=None):
-        chunk = w.synthesize("Hi.")
-    assert chunk is not None  # no crash even when every voice is unavailable
+def test_installer_uses_locked_runtime_and_kokoro_cpu_only():
+    from pathlib import Path
+    script = Path("scripts/install_tts.ps1").read_text(encoding="utf-8")
+    assert "uv sync --locked" in script and "--kokoro-only" in script
+    assert "KokoroTtsWorkerProcess" in script
+    assert "qwen" not in script.lower() and "cuda" not in script.lower()
 
 
-def test_installer_creates_a_separate_environment_and_never_touches_the_main_one():
-    script = open("scripts/install_tts.ps1", encoding="utf-8").read()
-    assert ".venv-tts" in script and "uv pip install --python $Py" in script
-    assert "uv sync" not in script and '".venv\\Scripts' not in script
-
-
-# ---- MCP: a real server over stdio ------------------------------------------------------------------------------------
-FAKE_MCP = textwrap.dedent(
-    """
-    import sys, json
-    TOOLS = [
-      {"name": "echo", "description": "Echo text back", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}},
-      {"name": "write_note", "description": "Write a note", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "text": {"type": "string"}}}},
-      {"name": "delete_everything", "description": "danger", "inputSchema": {"type": "object"}},
-    ]
-    for line in sys.stdin:
-        msg = json.loads(line)
-        if "id" not in msg:
-            continue
-        m = msg["method"]
-        if m == "initialize":
-            res = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake", "version": "1"}}
-        elif m == "tools/list":
-            res = {"tools": TOOLS}
-        elif m == "tools/call":
-            n, a = msg["params"]["name"], msg["params"]["arguments"]
-            res = {"content": [{"type": "text", "text": "echo: " + a.get("text", "")}]} if n == "echo" else {"content": [{"type": "text", "text": "wrote"}]}
-        else:
-            res = {}
-        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": res}), flush=True)
-    """
-)
-
-
-@pytest.fixture
-def mcp_rt(tmp_path, monkeypatch):
-    script = tmp_path / "fake_mcp.py"
-    script.write_text(FAKE_MCP)
+@pytest.mark.parametrize("command", [sys.executable, "definitely-not-installed-xyz"])
+def test_mcp_configuration_never_launches_servers(tmp_path, monkeypatch, command):
     cfg = tmp_path / "mcp.json"
-    cfg.write_text(json.dumps({"mcpServers": {
-        "fake": {"command": sys.executable, "args": [str(script)]},
-        "off": {"command": "nonexistent-program", "disabled": True},
-    }}))
+    cfg.write_text(json.dumps({"mcpServers": {"fake": {"command": command}}}))
     rt = make_rt(tmp_path, monkeypatch, mcp_config_path=cfg)
-    rt.start_mcp()
-    yield rt
-    rt.mcp_hub.close()
-
-
-def test_mcp_server_connects_registers_safe_tools_and_blocks_dangerous_ones(mcp_rt):
-    hub = mcp_rt.mcp_hub
-    assert list(hub.servers) == ["fake"] and not hub.errors
-    names = set(mcp_rt.mcp_tool_defs())
-    assert names == {"fake__echo", "fake__write_note"} and "fake.delete_everything" in hub.skipped
-    from lora.safety.policy import ActionRiskTier
-
-    assert mcp_rt.mcp_tool_defs()["fake__echo"].tier == ActionRiskTier.TIER1
-    assert mcp_rt.mcp_tool_defs()["fake__write_note"].tier == ActionRiskTier.TIER2  # looks like it changes things
-
-
-@pytest.mark.asyncio
-async def test_mcp_tool_call_goes_through_the_gate(mcp_rt, tmp_path):
-    ok = await mcp_rt.call_mcp("fake__echo", {"text": "hi"}, tainted=False)
-    assert ok == {"status": "success", "text": "echo: hi"}
-    tainted = await mcp_rt.call_mcp("fake__write_note", {"path": str(tmp_path / "n.md"), "text": "x"}, tainted=True)
-    assert tainted["status"] in ("denied", "error")  # a write after reading untrusted content is refused
-    outside = await mcp_rt.call_mcp("fake__write_note", {"path": "C:/Windows/evil.txt", "text": "x"}, tainted=False)
-    assert outside["status"] in ("denied", "error")
-    assert (await mcp_rt.call_mcp("fake__nope", {}, False))["status"] == "error"
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_free_form_loop_can_use_an_mcp_tool_and_is_tainted_afterwards(mcp_rt, tmp_path):
-    script = [
-        '{"tool": "fake__echo", "args": {"text": "ping"}}',
-        '{"tool": "open_app", "args": {"name": "chrome"}}',
-        '{"final": "The tool said echo: ping."}',
-    ]
-    seen = []
-
-    def llm(request):
-        seen.append(json.loads(request.content)["messages"])
-        return httpx.Response(200, content=nd(script.pop(0)))
-
-    respx.get(f"{URL}/api/tags").respond(200, json={"models": [{"name": "m:1"}]})
-    respx.post(f"{URL}/api/chat").mock(side_effect=llm)
     with patch("subprocess.Popen") as popen:
-        res = await turn(mcp_rt, "use fake to echo ping")
-    popen.assert_not_called()  # opening an app after an external tool's output is refused
-    assert res.kind == "agent" and "echo: ping" in res.text
-    assert "fake__echo(text)" in seen[0][0]["content"] and "untrusted" in seen[0][0]["content"].lower()
+        rt.start_mcp()
+        rt.start_mcp()
+    popen.assert_not_called()
+    assert rt.mcp_hub is None and rt.mcp_tool_defs() == {}
+    assert not rt._mentions_mcp("use fake to echo ping")
 
 
 @pytest.mark.asyncio
-async def test_broken_mcp_server_is_reported_not_fatal(tmp_path, monkeypatch):
-    cfg = tmp_path / "mcp.json"
-    cfg.write_text(json.dumps({"mcpServers": {"bad": {"command": "definitely-not-installed-xyz"}}}))
-    rt = make_rt(tmp_path, monkeypatch, mcp_config_path=cfg)
-    rt.start_mcp()
-    assert "bad" in rt.mcp_hub.errors and not rt.mcp_tool_defs()
-    rt.diag_extras = lambda: {}
-    from lora.agent.diagnostics import run_diagnostics
-
-    with respx.mock:
-        respx.get(f"{URL}/api/tags").mock(side_effect=httpx.ConnectError("x"))
-        respx.post("https://html.duckduckgo.com/html/").respond(500)
-        respx.get("https://lite.duckduckgo.com/lite/").respond(500)
-        respx.get("https://www.bing.com/search").respond(500)
-        respx.get("https://en.wikipedia.org/w/api.php").respond(500)
-        text = await run_diagnostics(rt)
-    assert "Other tools" in text and "bad" in text
+@pytest.mark.parametrize("tainted", [True, False])
+async def test_deferred_mcp_cannot_execute_any_tool(tmp_path, monkeypatch, tainted):
+    rt = make_rt(tmp_path, monkeypatch)
+    with patch("subprocess.Popen") as popen:
+        result = await rt.call_mcp("fake__echo", {"text": "hi"}, tainted=tainted)
+    assert result["status"] == "error" and "Unknown tool" in result["message"]
+    popen.assert_not_called()
 
 
 # ---- skills, persona, roles -----------------------------------------------------------------------------------------------
@@ -344,10 +234,14 @@ async def test_skill_trigger_adds_instructions_and_persona_file_replaces_the_per
 
     respx.get(f"{URL}/api/tags").respond(200, json={"models": [{"name": "m:1"}]})
     respx.post(f"{URL}/api/chat").mock(side_effect=llm)
-    await turn(rt, "please summarise this paper about attention")
+    query = "please summarise this paper about attention"
+    kwargs = rt._persona_kwargs(query)
+    assert kwargs["persona"].startswith("You are a chill study buddy")
+    assert "one-line TL;DR" in kwargs["addon"]
+    await turn(rt, "tell me a joke about cats")
     system = bodies[-1][0]["content"]
-    assert system.startswith("You are a chill study buddy") and "one-line TL;DR" in system
-    await turn(rt, "explain gradient descent briefly")
+    assert system.startswith("You are a chill study buddy") and "TL;DR" not in system
+    await turn(rt, "how are you doing")
     assert "TL;DR" not in bodies[-1][0]["content"]  # only when the trigger phrase matches
 
 
@@ -383,9 +277,10 @@ def test_kokoro_tts_default_voice_is_af_sky(tmp_path, monkeypatch):
     calls = {}
 
     class FakeKokoro:
-        def __init__(self, model_path: str, voices_path: str):
-            calls["model_path"] = model_path
+        @classmethod
+        def from_session(cls, session, voices_path):
             calls["voices_path"] = voices_path
+            return cls()
 
         def get_voices(self):
             return ["af_sky", "af_heart", "bm_george"]
@@ -399,16 +294,20 @@ def test_kokoro_tts_default_voice_is_af_sky(tmp_path, monkeypatch):
     monkeypatch.setattr(tts_worker, "_KOKORO_STATUS", {"state": "unloaded", "reason": "", "fix": "", "dir": ""})
     monkeypatch.setitem(sys.modules, "kokoro_onnx", types.SimpleNamespace(Kokoro=FakeKokoro))
 
-    w = tts_worker.Qwen3TtsWorkerProcess(models_dir=str(kokoro_dir))
+    monkeypatch.setitem(sys.modules, "onnxruntime", types.SimpleNamespace(
+        SessionOptions=lambda: types.SimpleNamespace(),
+        InferenceSession=lambda *a, **kw: calls.update(providers=kw["providers"]),
+    ))
+    w = tts_worker.KokoroTtsWorkerProcess(models_dir=str(kokoro_dir))
     assert w.default_voice == "af_sky"
     chunk = w.synthesize("Hello from Kokoro Sky!")
     assert len(chunk.samples) == 2400 and chunk.sample_rate == 24000
     assert calls["voice"] == "af_sky" and calls["lang"] == "en-us"
-    assert w.diagnosis()["ok"] is True and "af_sky" in w.diagnosis()["summary"]
+    assert w.diagnosis()["ok"] is True and calls["providers"] == ["CPUExecutionProvider"]
 
 
 @pytest.mark.asyncio
-async def test_open_wikipedia_on_page_and_open_chatgpt_and_ask(tmp_path, monkeypatch):
+async def test_open_wikipedia_on_page_and_open_chatgpt_and_ask(tmp_path, monkeypatch, public_dns):
     c_wiki = parse_command("Open wikipedia on Alan Turing")
     assert c_wiki is not None and c_wiki.kind == "site_search"
     assert c_wiki.target == "wikipedia" and c_wiki.args["query"] == "Alan Turing"
@@ -465,7 +364,7 @@ async def test_simple_questions_get_clean_prompts_not_bloated_rubrics():
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_eight_way_verification_scorecard_and_iterations(tmp_path, monkeypatch):
+async def test_research_displays_reference_check_without_scorecard(tmp_path, monkeypatch):
     from lora.agent.research import ResearchResult, Source
 
     rt = make_rt(tmp_path, monkeypatch)
@@ -479,13 +378,10 @@ async def test_eight_way_verification_scorecard_and_iterations(tmp_path, monkeyp
     respx.get(f"{URL}/api/tags").respond(200, json={"models": [{"name": "SparkLLM/Spark-X2.5-4B:latest"}, {"name": "granite4.2:8b"}]})
     respx.post(f"{URL}/api/chat").respond(200, content=nd("Mamba scales linearly with sequence length [S1]."))
 
-    res = await turn(rt, "research mamba state space models")
-    assert "verification_loop" in res.meta
-    vl = res.meta["verification_loop"]
-    assert len(vl["stages"]) == 8
-    assert [s["id"] for s in vl["stages"]] == ["V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8"]
-    assert len(vl["iterations"]) >= 1
-    assert vl["iterations"][0]["decision"] == "baseline"
+    res = await turn(rt, "verified research on mamba state space models")
+    assert res.meta["source_check"]["status"] == "references_checked"
+    assert "verification_loop" not in res.meta and "checked" not in res.meta
+    assert "score" not in res.meta["source_check"]
 
 
 def test_builtin_skills_and_subagents_loaded():

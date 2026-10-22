@@ -6,7 +6,7 @@ from collections.abc import Callable
 
 import numpy as np
 
-from lora.voice.tts.worker import Qwen3TtsWorkerProcess, TtsAudioChunk
+from lora.voice.tts.worker import KokoroTtsWorkerProcess, TtsAudioChunk
 
 
 def split_sentences(text: str) -> list[str]:
@@ -24,10 +24,10 @@ class TtsEngine:
 
     def __init__(
         self,
-        worker: Qwen3TtsWorkerProcess | None = None,
+        worker: KokoroTtsWorkerProcess | None = None,
         audio_playback_sink: Callable[[np.ndarray, int], None] | None = None,
     ) -> None:
-        self.worker = worker or Qwen3TtsWorkerProcess()
+        self.worker = worker or KokoroTtsWorkerProcess()
         self.audio_playback_sink = audio_playback_sink
         self.is_speaking = False
         self._interrupt_event = threading.Event()
@@ -38,11 +38,6 @@ class TtsEngine:
         with self._lock:
             self._interrupt_event.set()
             self.is_speaking = False
-            try:
-                import sounddevice as sd
-                sd.stop()
-            except Exception:
-                pass
 
     def synthesize_and_speak(self, text: str, voice: str = "default") -> list[TtsAudioChunk]:
         """Synthesize sentences sequentially with barge-in check between sentences."""
@@ -85,35 +80,6 @@ class TtsEngine:
             self.audio_playback_sink(samples, sample_rate)
             return
 
-        duration = len(samples) / sample_rate
-        played_with_sd = False
-        try:
-            import sounddevice as sd
-            sd.play(samples, samplerate=sample_rate)
-            played_with_sd = True
-            self._interrupt_event.wait(timeout=duration)
-            if self._interrupt_event.is_set():
-                sd.stop()
-        except Exception:
-            if not played_with_sd:
-                try:
-                    import io
-                    import sys
-                    import wave
+        from lora.voice.playback import play_audio
 
-                    if sys.platform == "win32":
-                        import winsound
-
-                        pcm16 = (np.clip(samples, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
-                        buf = io.BytesIO()
-                        with wave.open(buf, "wb") as wf:
-                            wf.setnchannels(1)
-                            wf.setsampwidth(2)
-                            wf.setframerate(sample_rate)
-                            wf.writeframes(pcm16)
-                        winsound.PlaySound(buf.getvalue(), winsound.SND_MEMORY | winsound.SND_ASYNC)
-                        self._interrupt_event.wait(timeout=duration)
-                        if self._interrupt_event.is_set():
-                            winsound.PlaySound(None, winsound.SND_PURGE)
-                except Exception:
-                    pass
+        play_audio(samples, sample_rate, self._interrupt_event, lambda _: None, threading.Event())

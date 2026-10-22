@@ -1,4 +1,4 @@
-"""In-memory ephemeral SessionVectorIndex using FAISS CPU + BM25 Reciprocal Rank Fusion."""
+"""Ephemeral exact CPU vector retrieval and BM25 Reciprocal Rank Fusion."""
 
 import logging
 import math
@@ -6,10 +6,9 @@ import re
 from collections import Counter
 from typing import Any
 
-import faiss
-
 from lora.grounding.chunk import DocumentChunk
 from lora.grounding.embed import EmbeddingEngine
+from lora.grounding.vector_index import make_index
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +33,7 @@ class SessionVectorIndex:
         self._embedding_engine = embedding_engine
         self._max_chunks = max(16, max_chunks)
         self._chunks: list[DocumentChunk] = []
+        self.quarantined_chunks: list[DocumentChunk] = []
         self._index: Any = None
         self._dimension: int | None = None
 
@@ -48,13 +48,19 @@ class SessionVectorIndex:
     def _init_index(self, dim: int) -> None:
         self._dimension = dim
         # IndexFlatIP calculates inner product, which equals cosine similarity for normalized vectors
-        self._index = faiss.IndexFlatIP(dim)
+        self._index = make_index(dim)
 
     def add_chunks(self, chunks: list[DocumentChunk]) -> None:
         """Embeds and indexes new document chunks in RAM (with automatic rolling cap)."""
         if not chunks:
             return
 
+        from lora.safety.injection import safe_chunks
+        chunks, quarantined = safe_chunks(chunks)
+        self.quarantined_chunks.extend(quarantined)
+        self.quarantined_chunks = self.quarantined_chunks[-64:]
+        if not chunks:
+            return
         # Enforce rolling session chunk cap so multi-hour desktop sessions never grow unbounded
         if len(self._chunks) + len(chunks) > self._max_chunks:
             keep_old = max(0, self._max_chunks - len(chunks))
@@ -187,6 +193,7 @@ class SessionVectorIndex:
     def clear(self) -> None:
         """Immediately release all indexed vectors and text chunks from memory."""
         self._chunks.clear()
+        self.quarantined_chunks.clear()
         self._index = None
         self._dimension = None
         logger.info("SessionVectorIndex (%s) wiped from memory.", self._session_id)

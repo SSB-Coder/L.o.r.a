@@ -8,9 +8,10 @@ Implements strict, non-bypassable policy evaluation:
 5. Domain allowlists for browser typing.
 """
 
+import logging
 import os
+import re
 from enum import Enum, StrEnum
-from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -18,6 +19,8 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field
 
 from lora.core.config import ConfigManager, PolicyConfig
+
+logger = logging.getLogger(__name__)
 
 
 class ActionRiskTier(int, Enum):
@@ -77,6 +80,14 @@ class PolicyEngine:
         ".docm",
         ".xlsm",
         ".pptm",
+        ".lnk",
+        ".url",
+        ".jar",
+        ".msc",
+        ".appref-ms",
+        ".chm",
+        ".iso",
+        ".vhd",
     ]
 
     DEFAULT_SAFE_EXTENSIONS = [
@@ -160,6 +171,7 @@ class PolicyEngine:
         typing_domain_allowlist: list[str] | None = None,
     ) -> None:
         self.config: PolicyConfig | None = None
+        self._config_error = False
         repo_root = Path(__file__).resolve().parents[3]
         repo_policy = repo_root / "config" / "policy.yaml"
         user_policy = Path.home() / ".lora" / "policy.yaml"
@@ -171,12 +183,16 @@ class PolicyEngine:
             else (cwd_policy if cwd_policy.is_file() else None))
         )
         resolved_cfg_path = config_path or default_policy_path
+        if config_path is not None and not Path(config_path).is_file():
+            self._config_error = True
+            logger.error("Requested policy configuration is missing")
         if resolved_cfg_path and Path(resolved_cfg_path).exists():
             try:
                 self.config = ConfigManager().load_policy(resolved_cfg_path)
             except Exception as exc:
                 logger.warning("Failed to load policy config from %s: %s", resolved_cfg_path, exc)
                 self.config = None
+                self._config_error = True
 
         # Resolve allowed roots to absolute canonical paths
         roots = allowed_roots if allowed_roots is not None else self.DEFAULT_ALLOWED_ROOTS
@@ -190,6 +206,24 @@ class PolicyEngine:
             ext.lower()
             for ext in (safe_extensions if safe_extensions is not None else self.DEFAULT_SAFE_EXTENSIONS)
         }
+        # Opening a document invokes external code; reading text does not.
+        # CSV/DOCX stay excluded until a non-evaluating viewer is configured.
+        self.open_extensions = {".pdf", ".md", ".txt", ".png", ".jpg", ".jpeg"}
+        if self.config:
+            for rule in self.config.deny_rules:
+                self.blocked_extensions.update(rule.path_extensions or [])
+            if allowed_roots is None and self.config.allowed_roots:
+                from lora.tools.files.known import FOLDER_NAMES, known_folder
+
+                self.allowed_roots = []
+                for configured in self.config.allowed_roots:
+                    # A configured ~/Documents means the user's Documents,
+                    # including Windows Known Folder redirection into OneDrive.
+                    # Do not implicitly grant any unconfigured known folders.
+                    token = configured.replace("\\", "/")
+                    folder = token[2:].lower() if token.startswith("~/") else ""
+                    resolved = known_folder(folder) if folder in FOLDER_NAMES else Path(os.path.expandvars(configured)).expanduser()
+                    self.allowed_roots.append(resolved.resolve())
 
         # Typing domain allowlist
         if typing_domain_allowlist is not None:
@@ -219,6 +253,11 @@ class PolicyEngine:
         tool_lower = tool.lower()
         origin_lower = origin.lower()
         tier_int = int(tier)
+        if self._config_error:
+            return PolicyResult(allowed=False, verdict=PolicyVerdict.HARD_DENY,
+                                reason="Policy configuration failed to load", rule_matched="policy_load_failed")
+        # Token boundaries avoid denying harmless names such as model_information.
+        tokens = set(re.sub(r"([a-z])([A-Z])", r"\1_\2", tool).lower().replace("-", "_").split("_"))
 
         # -------------------------------------------------------------
         # STEP 1: Hard Deny Rules (Evaluated FIRST, Non-overridable)
@@ -226,7 +265,7 @@ class PolicyEngine:
 
         # 1.1 Deletion / destructive tool match
         for pat in self.DESTRUCTIVE_TOOL_PATTERNS:
-            if fnmatch(tool_lower, pat):
+            if pat.strip("*") in tokens or tool_lower == pat.strip("*"):
                 return PolicyResult(
                     allowed=False,
                     verdict=PolicyVerdict.HARD_DENY,
@@ -236,7 +275,7 @@ class PolicyEngine:
 
         # 1.2 Shell execution match
         for pat in self.SHELL_TOOL_PATTERNS:
-            if fnmatch(tool_lower, pat):
+            if pat.strip("*") in tokens:
                 return PolicyResult(
                     allowed=False,
                     verdict=PolicyVerdict.HARD_DENY,
@@ -291,6 +330,15 @@ class PolicyEngine:
         # -------------------------------------------------------------
         # STEP 2: Allow / Ask Rules
         # -------------------------------------------------------------
+
+        if self.config:
+            configured = self.config.evaluate_action(tool, origin_lower, tier_int)
+            if not configured.allowed:
+                return PolicyResult(allowed=False, verdict=PolicyVerdict.HARD_DENY,
+                                    reason=configured.reason, rule_matched="configured_policy")
+            if configured.action == "ask":
+                return PolicyResult(allowed=True, verdict=PolicyVerdict.ASK,
+                                    reason=configured.reason, rule_matched="configured_confirmation")
 
         # Mobile allowed research tools
         if origin_lower in ("mobile", "user_remote") and tier_int == ActionRiskTier.TIER0:
@@ -352,9 +400,12 @@ class PolicyEngine:
     ) -> PolicyResult:
         """Validate filesystem path against allowed roots, system restrictions, and extension blocklists."""
         origin_lower = origin.lower()
+        if self._config_error:
+            return PolicyResult(allowed=False, verdict=PolicyVerdict.HARD_DENY,
+                                reason="Policy configuration failed to load", rule_matched="policy_load_failed")
 
         # Rule 1: Mobile origin cannot access local filesystem paths under any circumstances
-        if origin_lower == "mobile":
+        if origin_lower != "desktop":
             return PolicyResult(
                 allowed=False,
                 verdict=PolicyVerdict.HARD_DENY,
@@ -362,7 +413,10 @@ class PolicyEngine:
                 rule_matched="mobile_filesystem_block",
             )
 
-        path_str = str(path).strip()
+        path_str = str(path)
+        if any(part.endswith((".", " ")) or re.search(r"~\d", part) for part in re.split(r"[\\/]", path_str) if part):
+            return PolicyResult(allowed=False, verdict=PolicyVerdict.HARD_DENY,
+                                reason="Forbidden ambiguous Windows path component", rule_matched="ambiguous_path")
         path_lower = path_str.lower()
 
         # Rule 2: Block URI schemes, malformed paths, or null bytes
@@ -425,6 +479,12 @@ class PolicyEngine:
             )
 
         resolved_str = str(resolved).lower()
+        if resolved.suffix.lower() in self.blocked_extensions:
+            return PolicyResult(allowed=False, verdict=PolicyVerdict.HARD_DENY,
+                                reason="Resolved target has a blocked extension", rule_matched="blocked_extension")
+        if mode == "open" and not resolved.is_dir() and resolved.suffix.lower() not in self.open_extensions:
+            return PolicyResult(allowed=False, verdict=PolicyVerdict.HARD_DENY,
+                                reason="File type has no approved safe viewer", rule_matched="unsafe_open_extension")
 
         # Rule 5: Check protected operating system directories (against both resolved and raw normalized path)
         norm_raw = path_lower.replace("/", "\\")

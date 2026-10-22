@@ -10,7 +10,7 @@ No GPL/AGPL source code is copied into `src/lora/`. The following open-source pr
 
 | Project | License | Architectural Pattern Adapted |
 |---|---|---|
-| `convaiinnovations/laya` | MIT | Multi-head 20M parameter CPU decision routing (`src/lora/models/laya_router.py`) |
+| `convaiinnovations/laya` | Apache-2.0 | ModernBERT-large 421M parameter CPU decision routing (`src/lora/models/laya_router.py`) |
 | `stanford-oval/storm` | MIT | Multi-perspective query decomposition and cited synthesis (`src/lora/agent/research.py`) |
 | `langchain-ai/langgraph` | MIT | Typed state graph and SQLite checkpointing concepts (`src/lora/supervisor/`) |
 | `stanfordnlp/dspy` | MIT | Declarative prompt genome compilation and signature scoring (`src/lora/outer_loop/`) |

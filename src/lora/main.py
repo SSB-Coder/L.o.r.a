@@ -4,12 +4,14 @@ import os
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import uvicorn
 
 from lora.config.manager import ConfigManager, LoraUserConfig
 from lora.gateway.server import create_gateway_app
+from lora.storage.notebook import NotebookStore
 from lora.ui.audio_cues import AudioCueManager, SoundCue
 
 try:
@@ -76,7 +78,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     start_parser = subparsers.add_parser("start", help="Start L.O.R.A desktop HUD or daemon")
     _add_run_arguments(start_parser)
 
-    subparsers.add_parser("stop", help="Send a stop trigger to active tasks")
+    stop_parser = subparsers.add_parser("stop", aliases=["kill"], help="Cleanly shut down LORA and its workers")
+    stop_parser.add_argument("--config-dir", type=Path, default=None)
 
     net_parser = subparsers.add_parser("net-check", help="Verify LAN IP, Ollama status, and ports")
     net_parser.add_argument("--ollama-url", default="http://127.0.0.1:11434", help="Ollama base URL")
@@ -93,6 +96,8 @@ def init_platform(base_dir: Path | None = None) -> tuple[ConfigManager, LoraUser
     """Initializes the ~/.lora directory hierarchy, locks NTFS ACLs, and loads configuration."""
     cfg_mgr = ConfigManager(base_dir=base_dir)
     cfg_mgr.ensure_ecosystem(apply_acls=True)
+    from lora.storage.migration import migrate_notebooks
+    migrate_notebooks(cfg_mgr.paths.base_dir, Path(__file__).resolve().parents[2])
     user_cfg = cfg_mgr.load_config()
     return cfg_mgr, user_cfg
 
@@ -120,6 +125,7 @@ def start_gateway_thread(
     token_validator=None,
     media_db=None,
     connection_manager=None,
+    notebook_store=None,
 ) -> uvicorn.Server | None:
     """Launches the FastAPI Gateway inside a dedicated background thread."""
     import socket
@@ -140,6 +146,7 @@ def start_gateway_thread(
         host_guard=host_guard,
         media_db=media_db,
         connection_manager=connection_manager,
+        notebook_store=notebook_store,
     )
     config = uvicorn.Config(
         app=app,
@@ -167,6 +174,7 @@ def run_desktop_app(
     ``ui.post(fn)``. ``QTimer.singleShot(0, fn)`` from those threads silently never fires.
     """
     import asyncio
+
     from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication
 
@@ -190,11 +198,26 @@ def run_desktop_app(
     widget = AmbientDropletWidget()
 
     capture = None
+    vad = None
     hotkey = None
+    from lora.agent.turns import TurnCoordinator, run_coroutine
+
+    turns = TurnCoordinator()
     is_exiting = threading.Event()
+    current_streamer: list[object] = [None]
     speech_cooldown_until = [time.monotonic() + 1.0]  # ignore startup chime during initial 1.0s
+    pending_utterances = deque(maxlen=2)
+    deferred_utterances = deque(maxlen=2)
+    transcription_lock = threading.Lock()
+    armed_until = [0.0]
+    voice_generation = [0]
 
     def on_sleep_toggled(is_sleeping: bool, play_sound: bool = True) -> None:
+        with transcription_lock:
+            voice_generation[0] += 1
+            armed_until[0] = 0.0
+            pending_utterances.clear()
+            deferred_utterances.clear()
         speech_cooldown_until[0] = time.monotonic() + 0.6
         if is_sleeping:
             if play_sound and hud._current_voice_state not in ("sleep", "sleeping"):
@@ -202,6 +225,13 @@ def run_desktop_app(
             tray.update_state(WidgetState.SLEEPING)
             widget.set_state(WidgetState.SLEEPING)
             hud.set_voice_state("sleeping")
+            stop_current_speech(update_ui=False)
+            if capture is not None:
+                if master_config.voice.close_mic_on_sleep:
+                    capture.stop()
+                capture.buffer.clear()
+            if vad is not None:
+                vad.reset()
         else:
             if play_sound and hud._current_voice_state in ("sleep", "sleeping"):
                 audio.play_cue(SoundCue.WAKE)
@@ -224,11 +254,17 @@ def run_desktop_app(
         if is_exiting.is_set():
             return
         is_exiting.set()
+        turns.cancel()
+        # Speech can outlive the model turn. Stop its producer before closing
+        # the native worker, otherwise queued sentences hit a closed pipe.
+        streamer = current_streamer[0]
+        if streamer is not None:
+            streamer.stop()
         logger.info("Exiting L.O.R.A, releasing audio capture stream...")
         audio.play_cue(SoundCue.SLEEP)
         if capture is not None:
             try:
-                capture.stop()
+                capture.close() if hasattr(capture, "close") else capture.stop()
             except Exception:
                 pass
         if hotkey is not None:
@@ -256,7 +292,11 @@ def run_desktop_app(
     active_voice = ["af_sky"]
     voice_enabled = [True]
     voice_init_error = [""]
-    headset_mode = os.environ.get("LORA_HEADSET_MODE", "0").strip().lower() in ("1", "true", "yes")
+    from lora.core.config import load_config as load_master_config
+    master_config = load_master_config(Path(__file__).resolve().parents[2] / "config" / "lora.yaml")
+    from lora.core.paths import project_path
+    model_root = project_path(master_config.models_dir)
+    headset_mode = master_config.voice.headset_mode
 
     def on_voice_changed(new_voice: str) -> None:
         active_voice[0] = new_voice or "af_sky"
@@ -269,18 +309,16 @@ def run_desktop_app(
     if not args.no_audio:
         try:
             from lora.voice.tts.engine import TtsEngine
-            from lora.voice.tts.worker import Qwen3TtsWorkerProcess
+            from lora.voice.tts.worker import KokoroTtsWorkerProcess
+            tts_worker_class = KokoroTtsWorkerProcess
+            if os.environ.get("LORA_IN_PROCESS_SPEECH") != "1":
+                from lora.voice.isolation import ProcessKokoro
+                tts_worker_class = ProcessKokoro
 
-            kokoro_dir = (
-                str(Path("models/kokoro").resolve())
-                if Path("models/kokoro").exists()
-                else r"C:\Models\kokoro"
-            )
-            tts_worker = Qwen3TtsWorkerProcess(
+            kokoro_dir = str(model_root / "kokoro")
+            tts_worker = tts_worker_class(
                 models_dir=kokoro_dir,
-                tokenizer_dir=r"C:\Models\Qwen3-TTS-Tokenizer-12Hz",
                 default_voice=active_voice[0],
-                spawn_process=False,
             )
             tts_engine = TtsEngine(worker=tts_worker)
             logger.info("TTS engine initialized (default voice: %s).", active_voice[0])
@@ -288,80 +326,60 @@ def run_desktop_app(
             logger.warning("Could not initialize TTS engine: %s", e)
 
     # ---- speech: sentences are spoken while the reply is still being written ----
-    current_streamer: list[object] = [None]
+    tts_error_reported = threading.Event()
 
     def synth_sentence(sentence: str):
-        if tts_engine is None:
+        if tts_engine is None or is_exiting.is_set():
             return None
-        return tts_engine.worker.synthesize(sentence, voice=active_voice[0])
+        try:
+            chunk = tts_engine.worker.synthesize(sentence, voice=active_voice[0])
+        except Exception:
+            if is_exiting.is_set():
+                return None  # Shutdown intentionally interrupts the worker pipe.
+            logger.exception("Speech output worker failed; keeping desktop alive")
+            if not tts_error_reported.is_set():
+                tts_error_reported.set()
+                ui.post(lambda: hud.append_message("System", "My voice stopped, but text chat is still available. I'll restart the voice worker for the next reply."))
+            return None
+        if is_exiting.is_set():
+            return None
+        if chunk.error and not tts_error_reported.is_set():
+            tts_error_reported.set()
+            ui.post(lambda: hud.append_message("L.O.R.A", "My Kokoro voice isn't available. Run python scripts/download_models.py --kokoro-only; you can still chat with me here."))
+        return chunk
 
     def play_chunk(chunk, stop_event: threading.Event) -> None:
-        import io
-        import wave
-        import numpy as np
+        from lora.voice.playback import play_audio
 
-        samples, sample_rate = chunk.samples, chunk.sample_rate
-        if len(samples) == 0 or stop_event.is_set() or is_exiting.is_set():
-            return
         speech_active.set()
-        duration = len(samples) / sample_rate
-        used_winsound = False
-        # On Windows, prefer winsound.PlaySound (OS waveOut mixer) so PortAudio's 16kHz microphone InputStream
-        # is never disrupted or aborted by 24kHz sd.play() / sd.stop() stream switching!
-        if sys.platform == "win32":
-            try:
-                import winsound
+        try:
+            play_audio(chunk.samples, chunk.sample_rate, stop_event,
+                       lambda rms: ui.post(lambda lvl=min(1.0, rms * 8.0): (
+                           hud.set_audio_level(lvl), widget.set_audio_level(lvl))),
+                       is_exiting)
+        finally:
+            speech_cooldown_until[0] = time.monotonic() + 0.45
 
-                pcm16 = (np.clip(samples, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
-                buf = io.BytesIO()
-                with wave.open(buf, "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(sample_rate)
-                    wf.writeframes(pcm16)
-                winsound.PlaySound(buf.getvalue(), winsound.SND_MEMORY | winsound.SND_ASYNC)
-                used_winsound = True
-            except Exception:
-                used_winsound = False
-
-        if not used_winsound:
-            try:
-                import sounddevice as sd
-
-                sd.play(samples, samplerate=sample_rate)
-            except Exception:
-                return
-
-        num_steps = max(1, int(duration * 25))
-        slice_size = max(1, len(samples) // num_steps)
-        for step_idx in range(num_steps):
-            if stop_event.is_set() or is_exiting.is_set():
-                if used_winsound and sys.platform == "win32":
-                    try:
-                        import winsound
-
-                        winsound.PlaySound(None, winsound.SND_PURGE)
-                    except Exception:
-                        pass
-                return
-            step = samples[step_idx * slice_size : (step_idx + 1) * slice_size]
-            rms = float(np.sqrt(np.mean(step**2))) if len(step) else 0.0
-            ui.post(lambda lvl=min(1.0, rms * 8.0): (hud.set_audio_level(lvl), widget.set_audio_level(lvl)))
-            time.sleep(duration / num_steps)
-        speech_cooldown_until[0] = time.monotonic() + 0.45
-
-    def make_streamer(turn_done: threading.Event, is_sleep_turn: list[bool] | None = None):
+    def make_streamer(turn_done: threading.Event, is_sleep_turn: list[bool] | None = None, is_current=lambda: True):
         """A SpeechStreamer for one turn, or None when audio/voice is off."""
-        if args.no_audio or not voice_enabled[0]:
+        if args.no_audio or not voice_enabled[0] or is_exiting.is_set():
             return None
         from lora.voice.speech_stream import SpeechStreamer
 
+        def post_voice(fn) -> None:
+            ui.post(lambda: fn() if is_current() and not is_exiting.is_set() else None)
+
         def _started() -> None:
+            if not is_current() or is_exiting.is_set():
+                return
             speech_active.set()
             if not (is_sleep_turn and is_sleep_turn[0]):
-                ui.post(lambda: (hud.set_voice_state("speaking"), widget.set_state(WidgetState.SPEAKING)))
+                post_voice(lambda: (hud.set_voice_state("speaking"), widget.set_state(WidgetState.SPEAKING))
+                           if hud._current_voice_state not in ("sleep", "sleeping") else None)
 
         def _done(spoke: bool) -> None:
+            if not is_current() or is_exiting.is_set():
+                return
             speech_active.clear()
             speech_cooldown_until[0] = time.monotonic() + 0.45
             if not spoke and turn_done.is_set():
@@ -373,13 +391,13 @@ def run_desktop_app(
                     or widget.state == WidgetState.SLEEPING
                 )
                 if is_sleeping:
-                    ui.post(lambda: (
+                    post_voice(lambda: (
                         on_sleep_toggled(True, play_sound=False),
                         hud.set_audio_level(0.0),
                         widget.set_audio_level(0.0),
                     ))
                 else:
-                    ui.post(lambda: (
+                    post_voice(lambda: (
                         hud.set_voice_state("idle"),
                         widget.set_state(WidgetState.IDLE),
                         hud.set_audio_level(0.0),
@@ -413,11 +431,9 @@ def run_desktop_app(
             ))
 
     hud.stop_audio_requested.connect(stop_current_speech)
+    widget.exit_requested.connect(on_exit)
 
-    last_query = [""]
     history = ConversationHistory(max_turns=6)
-    inflight = threading.Event()
-    inflight_since = [0.0]
 
     def _profile_text() -> str:
         try:
@@ -442,7 +458,7 @@ def run_desktop_app(
         mcp_config_path=cfg_mgr.paths.mcp_file,
         skills_dir=cfg_mgr.paths.skills_dir,
         agents_dir=cfg_mgr.paths.agents_dir,
-        notebook_db_path=Path(cfg_mgr.paths.user_profile_file).parent / "notebooks.db",
+        notebook_db_path=cfg_mgr.paths.notebooks_dir / "notebooks.db",
     )
     logger.info("Laya decision router initialized (%s).", runtime.laya_router.backend)
 
@@ -476,11 +492,13 @@ def run_desktop_app(
                 current_streamer[0].stop()
             except Exception:
                 pass
-        inflight.clear()
-        ui.post(lambda: hud.append_message("System", "User stopped Task."))
-        ui.post(lambda: hud.set_engine_state("idle"))
-        ui.post(lambda: hud.set_voice_state("idle"))
-        ui.post(lambda: widget.set_state(WidgetState.IDLE))
+        turns.cancel()
+        ui.post(lambda: hud.append_message("System", "Stopped. Waiting for active work to release its resources."))
+        def show_stopped() -> None:
+            sleeping = hud._current_voice_state in ("sleep", "sleeping")
+            hud.set_voice_state("sleeping" if sleeping else "idle")
+            widget.set_state(WidgetState.SLEEPING if sleeping else WidgetState.IDLE)
+        ui.post(show_stopped)
 
     def _handle_power_cmd(action: str) -> None:
         if action == "sleep":
@@ -517,11 +535,11 @@ def run_desktop_app(
         return await asyncio.to_thread(_confirm_blocking, text)
 
     bg_loop = asyncio.new_event_loop()
-    threading.Thread(target=bg_loop.run_forever, daemon=True, name="lora-async-loop").start()
+    bg_thread = threading.Thread(target=bg_loop.run_forever, daemon=True, name="lora-async-loop")
+    bg_thread.start()
 
-    def _run_coro(coro, timeout: float = 1800.0):
-        fut = asyncio.run_coroutine_threadsafe(coro, bg_loop)
-        return fut.result(timeout=timeout)
+    def _run_coro(coro, timeout: float = 1800.0, handle=None):
+        return run_coroutine(bg_loop, coro, timeout, handle=handle)
 
     runtime.confirm = _confirm
     runtime.on_sources = lambda srcs: ui.post(lambda s=srcs: hud.set_sources(s))
@@ -551,34 +569,30 @@ def run_desktop_app(
             _on_emergency_stop("User stop command")
             return
 
-        if inflight.is_set():
-            # Auto-recover if a previous turn has been stuck > 90s
-            if inflight_since[0] > 0 and (time.monotonic() - inflight_since[0]) > 90.0:
-                logger.warning("Previous turn exceeded 90s lock window; clearing inflight flag.")
-                inflight.clear()
-            else:
-                fast_cmd = incoming_cmd
-                if fast_cmd is not None and fast_cmd.kind in ("open", "google", "site_search", "list_dir", "switch_model", "switch_voice", "switch_skill", "sleep"):
-                    def _fast_worker() -> None:
-                        try:
-                            if fast_cmd.kind == "sleep":
-                                stop_current_speech(update_ui=False)
-                            res = _run_coro(runtime._run_command(fast_cmd, query, lambda _s: None, lambda _t, _sp=True: None), timeout=25.0)
-                            if res and res.text:
-                                ui.post(lambda t=res.text: hud.append_message("L.O.R.A", t))
-                        except Exception:
-                            pass
+        if turns.busy:
+            fast_cmd = incoming_cmd
+            if fast_cmd is not None and fast_cmd.kind in ("open", "google", "site_search", "list_dir", "switch_model", "switch_voice", "switch_skill", "sleep"):
+                def _fast_worker() -> None:
+                    try:
+                        if fast_cmd.kind == "sleep":
+                            stop_current_speech(update_ui=False)
+                        res = _run_coro(runtime._run_command(fast_cmd, query, lambda _s: None, lambda _t, _sp=True: None), timeout=25.0)
+                        if res and res.text:
+                            ui.post(lambda t=res.text: hud.append_message("L.O.R.A", t))
+                    except Exception:
+                        pass
 
-                    threading.Thread(target=_fast_worker, daemon=True).start()
-                    return
-                logger.info("Ignoring query while another is still running: %r", query)
+                threading.Thread(target=_fast_worker, daemon=True).start()
                 return
+            hud.set_status("Still working. Press Ctrl+Esc to cancel before starting another request.")
+            return
 
-        # Starting a new turn: reset kill switch so previous stop doesn't block it
+
+        handle = turns.begin()
+        if handle is None:
+            return
+        # Only reset after the old asyncio task has completed cancellation.
         KillSwitch.get_global().reset()
-        inflight.set()
-        inflight_since[0] = time.monotonic()
-        last_query[0] = query
         turn_is_sleep = [False]
 
         if incoming_cmd is not None and incoming_cmd.kind == "sleep":
@@ -594,24 +608,30 @@ def run_desktop_app(
 
         def _worker() -> None:
             started = time.monotonic()
-            streamer = make_streamer(turn_done, is_sleep_turn=turn_is_sleep)
-            current_streamer[0] = streamer
+            def post_turn(fn) -> None:
+                ui.post(lambda: fn() if turns.is_current(handle) and not is_exiting.is_set() else None)
+
+            streamer = None
             last_push = [0.0]
 
             def on_status(text: str) -> None:
-                ui.post(lambda t=text: hud.set_status(t))
+                post_turn(lambda t=text: hud.set_status(t))
 
             def on_text(full: str, speak: bool = True) -> None:
-                if KillSwitch.get_global().is_halted():
+                if handle.cancelled.is_set() or not turns.is_current(handle):
                     return
                 now = time.monotonic()
                 if now - last_push[0] >= 0.06:
                     last_push[0] = now
-                    ui.post(lambda t=full: hud.stream_update(t))
+                    post_turn(lambda t=full: hud.stream_update(t))
                 if speak and streamer is not None:
                     streamer.feed(full)
 
+            turn_timeout = 1200.0
             try:
+                streamer = make_streamer(turn_done, is_sleep_turn=turn_is_sleep,
+                                         is_current=lambda: turns.is_current(handle))
+                current_streamer[0] = streamer
                 default_timeout = "1800.0" if mode_override in ("deep", "deep_with_refinement") else "1200.0"
                 turn_timeout = float(os.environ.get("LORA_TURN_TIMEOUT", default_timeout))
                 result = _run_coro(
@@ -621,12 +641,14 @@ def run_desktop_app(
                         on_text,
                         mode=mode_override,
                         attachments=turn_attachments or None,
-                        should_abort=lambda: "User stopped Task" if KillSwitch.get_global().is_halted() else None,
+                        should_abort=lambda: "User stopped Task" if handle.cancelled.is_set() else None,
                     ),
                     timeout=turn_timeout,
+                    handle=handle,
                 )
             except Exception as exc:
-                if "abort" in str(exc).lower() or "halt" in str(exc).lower() or "stopped" in str(exc).lower():
+                import concurrent.futures
+                if isinstance(exc, concurrent.futures.CancelledError) or (handle.cancelled.is_set() and not isinstance(exc, TimeoutError)):
                     logger.info("Turn cancelled by user stop: %s", exc)
                     result = TurnResult(text="User stopped Task.", kind="command")
                 elif isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
@@ -640,9 +662,12 @@ def run_desktop_app(
                     logger.exception("Turn crashed")
                     result = TurnResult(text="Something went wrong on my side. Try again in a moment.", kind="error", failure=str(exc))
             finally:
-                # Always release inflight even if the UI callback is delayed
-                inflight.clear()
-                inflight_since[0] = 0.0
+                # A cancelled Future can finish before native work unwinds.
+                # The coordinator remains busy until the actual task is done.
+                turn_done.set()
+                handle.finish_if_unsubmitted()
+                if handle.cancelled.is_set() and streamer is not None:
+                    streamer.stop()
 
             logger.info(
                 "Turn finished: kind=%s in %.1fs, sources=%d%s",
@@ -654,37 +679,40 @@ def run_desktop_app(
                 turn_is_sleep[0] = True
 
             def _post() -> None:
-                try:
-                    hud.present_answer(
-                        query, result.text, sources=result.sources, confidence=0.0, label="", streamed=True,
-                        meta=result.meta,
-                    )
-                    turn_done.set()
-                    if turn_is_sleep[0]:
-                        if streamer is None:
-                            on_sleep_toggled(True)
-                        else:
-                            spoken = result.spoken if result.spoken is not None else result.text
-                            if result.spoken is not None:
-                                streamer.feed(spoken)
-                            streamer.finish(spoken)
-                            if not streamer.has_pending:
-                                on_sleep_toggled(True)
-                        return
+                if not turns.owns(handle) or is_exiting.is_set():
+                    return
+                # Sleep may have been requested while this task was finishing.
+                if hud._current_voice_state in ("sleep", "sleeping"):
+                    if streamer is not None:
+                        streamer.stop()
+                    return
+                hud.present_answer(
+                    query, result.text, sources=result.sources, confidence=0.0, label="", streamed=True,
+                    meta=result.meta,
+                )
+                turn_done.set()
+                if turn_is_sleep[0]:
                     if streamer is None:
-                        hud.set_voice_state("idle")
-                        widget.set_state(WidgetState.IDLE)
-                        return
-                    spoken = result.spoken if result.spoken is not None else result.text
-                    if result.spoken is not None:
-                        streamer.feed(spoken)
-                    streamer.finish(spoken)
-                    is_sp = streamer.has_pending
-                    hud.set_voice_state("speaking" if is_sp else "idle")
-                    widget.set_state(WidgetState.SPEAKING if is_sp else WidgetState.IDLE)
-                finally:
-                    inflight.clear()
-                    inflight_since[0] = 0.0
+                        on_sleep_toggled(True)
+                    else:
+                        spoken = result.spoken if result.spoken is not None else result.text
+                        if result.spoken is not None:
+                            streamer.feed(spoken)
+                        streamer.finish(spoken)
+                        if not streamer.has_pending:
+                            on_sleep_toggled(True)
+                    return
+                if streamer is None:
+                    hud.set_voice_state("idle")
+                    widget.set_state(WidgetState.IDLE)
+                    return
+                spoken = result.spoken if result.spoken is not None else result.text
+                if result.spoken is not None:
+                    streamer.feed(spoken)
+                streamer.finish(spoken)
+                is_sp = streamer.has_pending
+                hud.set_voice_state("speaking" if is_sp else "idle")
+                widget.set_state(WidgetState.SPEAKING if is_sp else WidgetState.IDLE)
 
             ui.post(_post)
 
@@ -695,25 +723,28 @@ def run_desktop_app(
 
     def _preload_voice() -> None:
         """Load the Kokoro CPU voice and Faster-Whisper STT model at startup so turn 1 is instant."""
-        if args.no_audio:
+        if args.no_audio or is_exiting.is_set():
             return
         if transcriber is not None:
             try:
                 transcriber.preload()
             except Exception as exc:
-                logger.warning("STT preload failed: %s", exc)
-        if tts_engine is None:
+                if not is_exiting.is_set():
+                    logger.warning("STT preload failed: %s", exc)
+        if tts_engine is None or is_exiting.is_set():
             return
         try:
             ok = tts_engine.worker.preload()
             diag = tts_engine.worker.diagnosis()
             (logger.info if ok else logger.warning)("Voice: %s %s", diag["summary"], diag.get("fix", "") if not ok else "")
         except Exception as exc:
-            logger.warning("Voice preload failed: %s", exc)
+            if not is_exiting.is_set():
+                logger.warning("Voice preload failed: %s", exc)
 
     def _warm_up_model() -> None:
         """Load the model in the background at startup and sync installed models to the UI dropdown."""
-        _preload_voice()
+        if is_exiting.is_set():
+            return
         if os.environ.get("LORA_ENABLE_MCP", "0") == "1":
             threading.Thread(target=runtime.start_mcp, daemon=True, name="lora-mcp").start()
         async def _go() -> None:
@@ -723,6 +754,8 @@ def run_desktop_app(
             client = OllamaClient(base_url=user_cfg.models.ollama_url)
             plan = None
             for _ in range(30):
+                if is_exiting.is_set():
+                    return
                 try:
                     installed = await client.installed_models()
                     if installed:
@@ -742,6 +775,8 @@ def run_desktop_app(
             _run_coro(_go(), timeout=240.0)
         except Exception as exc:
             logger.warning("Model warm-up failed: %s", exc)
+        if not is_exiting.is_set():
+            _preload_voice()
 
     if not args.no_audio:
         try:
@@ -751,21 +786,38 @@ def run_desktop_app(
             from lora.voice.stt import FasterWhisperTranscriber
             from lora.voice.vad import SpeechState, VoiceActivityDetector
             from lora.voice.wakeword import WakeWordDetector
+            transcriber_class = FasterWhisperTranscriber
+            vad_class = VoiceActivityDetector
+            if os.environ.get("LORA_IN_PROCESS_SPEECH") != "1":
+                from lora.voice.isolation import ProcessTranscriber, ProcessVad
+                transcriber_class = ProcessTranscriber
+                vad_class = ProcessVad
 
             capture = AudioCapture(sample_rate=16000)
-            transcriber = FasterWhisperTranscriber(lazy_load=True)
-            speaker_verifier_enabled = os.environ.get("LORA_SPEAKER_VERIFY_ENABLED", "0").lower() in ("1", "true", "yes")
+            stt_config = master_config.voice.stt
+            transcriber = transcriber_class(
+                model_size_or_path=stt_config.model, device="cpu", compute_type=stt_config.compute,
+                initial_prompt=stt_config.initial_prompt or None, lazy_load=True,
+            )
+            speaker_config = master_config.voice.wake.speaker_verifier
+            enabled_override = os.environ.get("LORA_SPEAKER_VERIFY_ENABLED")
+            speaker_verifier_enabled = speaker_config.enabled if enabled_override is None else enabled_override.lower() in ("1", "true", "yes")
             from lora.voice.wakeword import SpeakerVerifier
-            verifier = SpeakerVerifier(enabled=speaker_verifier_enabled)
+            verifier = SpeakerVerifier(enabled=speaker_verifier_enabled,
+                                       profile_path=speaker_config.model, threshold=speaker_config.threshold)
+            if verifier.enabled and not verifier.reference_embeddings:
+                hud.append_message("System", "No valid owner voice profile was found. Run lora enroll for owner filtering; wake-phrase listening is still available.")
             wakeword = WakeWordDetector(
                 wake_phrase="Awaken LORA",
                 chat_phrase="Hey LORA",
-                model_path="models/voice/hey_lora.onnx" if Path("models/voice/hey_lora.onnx").is_file() else None,
+                model_path=str(project_path(master_config.voice.wake.model)) if project_path(master_config.voice.wake.model).is_file() else None,
                 speaker_verifier=verifier,
                 transcriber=transcriber,
+                engine=master_config.voice.wake.engine,
+                listen_while_sleeping=not master_config.voice.close_mic_on_sleep,
             )
-            vad_threshold = float(os.environ.get("LORA_VAD_THRESHOLD", "0.50"))
-            vad = VoiceActivityDetector(
+            vad_threshold = float(os.environ.get("LORA_VAD_THRESHOLD", "0.35"))
+            vad = vad_class(
                 sample_rate=16000,
                 threshold=vad_threshold,
                 silence_duration_seconds=0.60,
@@ -778,9 +830,9 @@ def run_desktop_app(
             is_ptt_active = threading.Event()
             ptt_start_time = [0.0]
             ptt_chunks: list[np.ndarray] = []
-            armed_until = [0.0]
-            ARM_SECONDS = 12.0
+            arm_seconds = 12.0
             stt_error_shown = [False]
+            vad_error_shown = [False]
 
             def _stt_failed(ex: Exception) -> None:
                 logger.warning("Speech recognition error: %s", ex, exc_info=True)
@@ -800,37 +852,41 @@ def run_desktop_app(
                     return True
                 avg_lp = getattr(stt_res, "avg_logprob", 0.0)
                 if isinstance(avg_lp, (int, float)) and not isinstance(avg_lp, bool):
-                    return float(avg_lp) < -0.85
+                    return float(avg_lp) < -0.70
                 return False
 
-            def _submit_voice_query(q: str, low_confidence: bool = False) -> None:
+            def _submit_voice_query(q: str, low_confidence: bool = False, generation: int | None = None) -> None:
                 """GUI thread."""
+                if hud._current_voice_state in ("sleep", "sleeping"):
+                    return  # Drop transcripts queued before sleep closed the microphone.
+                if generation is not None and generation != voice_generation[0]:
+                    return
                 hud.append_message("You", q)
                 hud.set_input_text(q)
                 if low_confidence:
-                    from lora.agent.commands import parse_command
+                    # Never load/run Laya on the GUI thread while checking an
+                    # uncertain transcript. Ask directly and leave the UI live.
+                    from PySide6.QtWidgets import QMessageBox
 
-                    maybe_cmd = parse_command(q)
-                    if maybe_cmd is not None or not runtime.laya_router.check_stt_plausible(q):
-                        from PySide6.QtWidgets import QMessageBox
-
-                        ans = QMessageBox.question(
-                            hud,
-                            "Confirm Voice Command",
-                            f"Low audio confidence — did you mean:\n\n\"{q}\"?",
-                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                        )
-                        if ans != QMessageBox.StandardButton.Yes:
-                            hud.append_message("L.O.R.A", "Cancelled low-confidence voice command.")
-                            hud.set_voice_state("idle")
-                            return
+                    ans = QMessageBox.question(
+                        hud,
+                        "Confirm Voice Command",
+                        f"Low audio confidence - did you mean:\n\n\"{q}\"?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    )
+                    if ans != QMessageBox.StandardButton.Yes:
+                        hud.append_message("L.O.R.A", "Cancelled low-confidence voice command.")
+                        hud.set_voice_state("idle")
+                        return
                 on_query_submitted(q, getattr(hud, "_depth_mode", ""))
 
             def _trigger_transcription(audio_samples: np.ndarray) -> None:
-                if is_transcribing.is_set():
-                    logger.info("Push-to-talk ignored: still transcribing the previous clip.")
-                    return
-                is_transcribing.set()
+                with transcription_lock:
+                    if is_transcribing.is_set():
+                        logger.info("Push-to-talk ignored: still transcribing the previous clip.")
+                        return
+                    is_transcribing.set()
+                    generation = voice_generation[0]
                 logger.info("Transcribing %.1fs of push-to-talk audio.", len(audio_samples) / 16000)
                 ui.post(lambda: hud.set_voice_state("thinking"))
 
@@ -846,12 +902,14 @@ def run_desktop_app(
                             ))
                             return
                         res = transcriber.transcribe(audio_samples)
+                        if generation != voice_generation[0]:
+                            return
                         query_text = res.text.strip()
                         if query_text:
                             logger.info("Transcribed voice input: '%s' (conf=%.2f)", query_text, res.confidence)
                             submitted = True
                             is_low = _is_low_stt_confidence(res)
-                            ui.post(lambda q=query_text, lc=is_low: _submit_voice_query(q, low_confidence=lc))
+                            ui.post(lambda q=query_text, lc=is_low: _submit_voice_query(q, low_confidence=lc, generation=generation))
                         else:
                             logger.info("No speech detected in audio segment.")
                             ui.post(lambda: hud.append_message("L.O.R.A", "I didn't catch that. Try again?"))
@@ -860,30 +918,50 @@ def run_desktop_app(
                     finally:
                         is_transcribing.clear()
                         if not submitted and not speech_active.is_set():
-                            ui.post(lambda: hud.set_voice_state("idle"))
+                            ui.post(lambda: hud.set_voice_state("idle") if generation == voice_generation[0] else None)
 
                 threading.Thread(target=_worker, daemon=True).start()
 
             def _process_utterance_async(audio_clip: np.ndarray) -> None:
                 """Hands-free path: transcribe ONCE, then decide wake word vs query vs ignore."""
-                if is_transcribing.is_set() or is_ptt_active.is_set():
-                    return
-                is_transcribing.set()
+                with transcription_lock:
+                    if is_ptt_active.is_set():
+                        return
+                    if turns.busy:
+                        deferred_utterances.append((time.monotonic(), audio_clip))
+                        return
+                    if is_transcribing.is_set():
+                        pending_utterances.append(audio_clip)
+                        return
+                    is_transcribing.set()
+                    generation = voice_generation[0]
 
                 def _bg() -> None:
+                    submitted = False
                     try:
                         current_st = hud._current_voice_state
                         sleeping = current_st in ("sleep", "sleeping")
+                        if sleeping and master_config.voice.close_mic_on_sleep:
+                            return
+                        if not verifier.verify(audio_clip)[0]:
+                            return  # Reject non-owner wake AND following prompt before STT.
+                        if time.monotonic() >= armed_until[0] and wakeword.engine == "openwakeword":
+                            if wakeword._oww_model is not None:
+                                if not wakeword.process_audio(audio_clip, current_state=current_st).detected:
+                                    return
                         res = transcriber.transcribe(audio_clip)
+                        if generation != voice_generation[0]:
+                            return
                         text = res.text.strip()
                         if not text:
                             return
-                        logger.info("Heard: '%s' (state=%s, avg_logprob=%.2f)", text, current_st, res.avg_logprob)
+                        logger.debug("Voice candidate (state=%s, avg_logprob=%.2f)", current_st, res.avg_logprob)
 
                         if not sleeping and time.monotonic() < armed_until[0]:
                             armed_until[0] = 0.0
+                            submitted = True
                             is_low = _is_low_stt_confidence(res)
-                            ui.post(lambda q=text, lc=is_low: _submit_voice_query(q, low_confidence=lc))
+                            ui.post(lambda q=text, lc=is_low: _submit_voice_query(q, low_confidence=lc, generation=generation))
                             return
 
                         wake = wakeword.evaluate_text(text, audio_clip, current_state=current_st)
@@ -896,38 +974,46 @@ def run_desktop_app(
                                     wakeword.speaker_verifier.threshold,
                                 )
                             return
+                        if sleeping:
+                            def resume_voice(q=wake.extracted_query, lc=_is_low_stt_confidence(res)):
+                                on_sleep_toggled(False)
+                                if q:
+                                    _submit_voice_query(q, low_confidence=lc, generation=voice_generation[0])
+                                else:
+                                    armed_until[0] = time.monotonic() + arm_seconds
+                                    hud.set_voice_state("listening")
+                            submitted = True
+                            ui.post(resume_voice)
+                            return
                         speech_cooldown_until[0] = time.monotonic() + 0.35
                         is_low = _is_low_stt_confidence(res)
-                        if sleeping:
-                            logger.info("Wake word detected while sleeping. Waking up.")
-                            if wake.extracted_query:
-                                logger.info("Wake from sleep with trailing query: '%s'", wake.extracted_query)
-                                ui.post(
-                                    lambda q=wake.extracted_query, lc=is_low: (
-                                        on_sleep_toggled(False),
-                                        _submit_voice_query(q, low_confidence=lc),
-                                    )
-                                )
-                            else:
-                                armed_until[0] = time.monotonic() + ARM_SECONDS
-                                ui.post(lambda: (on_sleep_toggled(False), hud.set_voice_state("listening")))
-                        elif wake.extracted_query:
+                        if wake.extracted_query:
                             from lora.agent.commands import parse_command
 
                             maybe_cmd = parse_command(wake.extracted_query)
                             if maybe_cmd is None or maybe_cmd.kind != "sleep":
                                 audio.play_cue(SoundCue.WAKE)
                             logger.info("Wake word with trailing query: '%s'", wake.extracted_query)
-                            ui.post(lambda q=wake.extracted_query, lc=is_low: _submit_voice_query(q, low_confidence=lc))
+                            submitted = True
+                            ui.post(lambda q=wake.extracted_query, lc=is_low: _submit_voice_query(q, low_confidence=lc, generation=generation))
                         else:
                             audio.play_cue(SoundCue.WAKE)
                             logger.info("Wake word detected. Listening for the query...")
-                            armed_until[0] = time.monotonic() + ARM_SECONDS
-                            ui.post(lambda: hud.set_voice_state("listening"))
+                            with transcription_lock:
+                                if generation != voice_generation[0]:
+                                    return
+                                armed_until[0] = time.monotonic() + arm_seconds
+                            ui.post(lambda: hud.set_voice_state("listening") if generation == voice_generation[0] else None)
                     except Exception as ex:
                         _stt_failed(ex)
                     finally:
-                        is_transcribing.clear()
+                        with transcription_lock:
+                            is_transcribing.clear()
+                            if submitted or hud._current_voice_state in ("sleep", "sleeping"):
+                                pending_utterances.clear()
+                            following = pending_utterances.popleft() if pending_utterances else None
+                        if following is not None:
+                            _process_utterance_async(following)
 
                 threading.Thread(target=_bg, daemon=True).start()
 
@@ -962,10 +1048,20 @@ def run_desktop_app(
                     vad.reset()
                     return
 
-                if is_transcribing.is_set() or hud._current_voice_state in ("thinking", "think", "verify"):
+                if hud._current_voice_state in ("sleep", "sleeping") and master_config.voice.close_mic_on_sleep:
+                    vad.reset()
                     return
 
-                vad_state, _prob = vad.process_chunk(chunk)
+                try:
+                    vad_state, _prob = vad.process_chunk(chunk)
+                except Exception:
+                    if is_exiting.is_set():
+                        return
+                    logger.exception("Voice detector failed; capture remains open")
+                    if not vad_error_shown[0]:
+                        vad_error_shown[0] = True
+                        ui.post(lambda: hud.append_message("System", "Voice detection stopped. I'll restart it on the next audio block; you can still type here."))
+                    return
                 if vad_state == SpeechState.ENDED:
                     utterance = vad.get_and_reset_utterance()
                     if len(utterance) >= 2400:  # >= 150ms (includes 500ms pre-roll + "Hey LORA")
@@ -973,6 +1069,24 @@ def run_desktop_app(
 
             capture.register_chunk_callback(_on_mic_chunk)
             capture.start()
+
+            def _drain_deferred_voice() -> None:
+                streamer = current_streamer[0]
+                if turns.busy or speech_active.is_set() or (streamer is not None and streamer.has_pending):
+                    return
+                if time.monotonic() < speech_cooldown_until[0] or is_exiting.is_set():
+                    return
+                with transcription_lock:
+                    if is_transcribing.is_set() or not deferred_utterances:
+                        return
+                    recorded_at, clip = deferred_utterances.popleft()
+                if time.monotonic() - recorded_at < 30:
+                    _process_utterance_async(clip)
+
+            deferred_voice_timer = QTimer(hud)
+            deferred_voice_timer.setInterval(100)
+            deferred_voice_timer.timeout.connect(_drain_deferred_voice)
+            deferred_voice_timer.start()
             if not capture.is_streaming:
                 logger.warning("Microphone is not running: %s", capture.status_text())
 
@@ -992,6 +1106,8 @@ def run_desktop_app(
                 ui.post(lambda: hud.set_voice_state("listening"))
                 if capture:
                     capture.buffer.clear()
+                    if not capture.is_streaming:
+                        capture.start()
 
             def _on_ptt_up() -> None:
                 if not is_ptt_active.is_set():
@@ -1025,10 +1141,11 @@ def run_desktop_app(
                 from lora.voice.hotkey import PushToTalkListener
 
                 hotkey = PushToTalkListener(
-                    on_activate=_on_ptt_down,
-                    on_deactivate=_on_ptt_up,
-                    on_killswitch=lambda: _on_emergency_stop("Hotkey pressed (Ctrl+Esc)"),
+                    on_activate=lambda: ui.post(_on_ptt_down),
+                    on_deactivate=lambda: ui.post(_on_ptt_up),
+                    on_killswitch=lambda: ui.post(lambda: _on_emergency_stop("Hotkey pressed (Ctrl+Esc)")),
                 )
+                hotkey.on_sleep_toggle = lambda: ui.post(lambda: on_sleep_toggled(hud._current_voice_state not in ("sleep", "sleeping")))
                 hotkey.start()
             except Exception as e:
                 logger.warning("Global push-to-talk hotkey unavailable: %s", e)
@@ -1041,8 +1158,10 @@ def run_desktop_app(
             hud.set_mic_status(False, "disabled (--no-audio)")
         elif capture is None:
             hud.set_mic_status(False, f"voice pipeline failed to start ({voice_init_error[0] or 'see log'})")
-        elif hud._current_voice_state in ("sleep", "sleeping"):
-            hud.set_mic_status(True, f"{capture.device_name or 'microphone'} (sleep mode)")
+        elif hud._current_voice_state in ("sleep", "sleeping") and master_config.voice.close_mic_on_sleep:
+            hud.set_mic_status(False, "Microphone closed (sleep mode)")
+        elif speech_active.is_set() and not headset_mode:
+            hud.set_mic_status(True, "Microphone on; recognition waits for speaker playback")
         else:
             age = capture.seconds_since_audio()
             if not capture.is_streaming or (age is not None and age > 4.0):
@@ -1091,6 +1210,7 @@ def run_desktop_app(
         queue=job_queue,
         media_db=media_db,
         connection_manager=ws_manager,
+        notebook_store=NotebookStore(cfg_mgr.paths.notebooks_dir / "notebooks.db"),
     )
 
     def _make_job_runtime(origin: str) -> AgentRuntime:
@@ -1099,10 +1219,12 @@ def run_desktop_app(
             user_default_model=user_cfg.models.default_model,
             history=ConversationHistory(max_turns=4),
             registry_factory=_make_registry,
-            profile_fn=_profile_text,
-            media_db=media_db,
+            profile_fn=_profile_text if origin == "desktop" else (lambda: ""),
+            media_db=media_db if origin == "desktop" else None,
+            embedding_engine=media_db.embedding_engine,
             allow_actions=(origin == "desktop"),
-            notebook_db_path=Path(cfg_mgr.paths.user_profile_file).parent / "notebooks.db",
+            notebook_db_path=cfg_mgr.paths.notebooks_dir / "notebooks.db",
+            laya_router=runtime.laya_router,
         )
 
     async def _broadcast_by_origin(event: dict) -> None:
@@ -1115,7 +1237,7 @@ def run_desktop_app(
     job_worker = JobWorker(
         job_queue,
         _make_job_runtime,
-        desktop_busy=inflight.is_set,
+        desktop_busy=lambda: turns.busy,
         broadcaster=_broadcast_by_origin,
     )
     job_worker.start()
@@ -1127,6 +1249,7 @@ def run_desktop_app(
         if mobile_url_ref[0]:
             return mobile_url_ref[0]
         import secrets as _secrets
+
         from lora.gateway.auth import TokenValidator
         from lora.gateway.qr import generate_pairing_qr_terminal, get_pairing_url
 
@@ -1149,6 +1272,7 @@ def run_desktop_app(
             token_validator=TokenValidator(mobile_token=token),
             media_db=media_db,
             connection_manager=mobile_ws_manager,
+            notebook_store=NotebookStore(cfg_mgr.paths.notebooks_dir / "notebooks.db"),
         )
         if srv is not None:
             mobile_server_ref[0] = srv
@@ -1215,25 +1339,48 @@ def run_desktop_app(
     QTimer.singleShot(250, lambda: threading.Thread(target=_warm_up_model, daemon=True).start())
     logger.info("L.O.R.A Desktop Platform initialized successfully.")
 
+    from lora.safety.lifecycle import consume_shutdown_request
+    started_at = time.time()
+    shutdown_timer = QTimer()
+    shutdown_timer.timeout.connect(lambda: on_exit() if consume_shutdown_request(cfg_mgr.paths.base_dir, started_at) else None)
+    shutdown_timer.start(500)
     exit_code = app.exec()
 
     # Clean shutdown
     on_exit()
     job_worker.stop()
+    job_worker.join(timeout=10.0)
+    if job_worker.is_alive():
+        logger.warning("Job worker is still releasing resources during shutdown")
+    from lora.agent.turns import drain_pending_tasks
+
+    loop_drained = False
+    try:
+        _run_coro(drain_pending_tasks(), timeout=10.0)
+        loop_drained = True
+    except Exception:
+        logger.warning("Background work is still releasing resources during shutdown", exc_info=True)
     if runtime._registry is not None:
         try:
-            _run_coro(runtime._registry.browser_driver.close(), timeout=10.0)
+            _run_coro(runtime._registry.close(), timeout=10.0)
         except Exception:
             pass
-    try:
+    if loop_drained:
         bg_loop.call_soon_threadsafe(bg_loop.stop)
-    except Exception:
-        pass
+        bg_thread.join(timeout=2.0)
+        if not bg_thread.is_alive():
+            bg_loop.close()
     if tts_engine is not None:
         try:
             tts_engine.worker.shutdown()
         except Exception:
             pass
+    streamer = current_streamer[0]
+    if streamer is not None:
+        streamer.wait(timeout=2.0)
+    for speech_worker in (transcriber, vad):
+        if speech_worker is not None and hasattr(speech_worker, "shutdown"):
+            speech_worker.shutdown()
     if runtime.mcp_hub is not None:
         runtime.mcp_hub.close()
     for server in (gateway_server, mobile_server_ref[0]):
@@ -1246,11 +1393,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_argument_parser()
     args = parser.parse_args(argv)
 
-    if getattr(args, "subcommand", None) == "stop":
-        from lora.safety.killswitch import KillSwitch
+    if getattr(args, "subcommand", None) in {"stop", "kill"}:
+        from lora.safety.lifecycle import request_shutdown
 
-        KillSwitch.get_global().trigger()
-        print("User stopped Task.")
+        request_shutdown(getattr(args, "config_dir", None))
+        print("LORA shutdown requested.")
         return 0
 
     if getattr(args, "subcommand", None) == "net-check":
@@ -1321,10 +1468,11 @@ def main(argv: list[str] | None = None) -> int:
         session.run_interactive(speaker_name=getattr(args, "speaker", "owner"))
         return 0
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    from lora.core.logging import setup_logging
+    log_dir = Path(__file__).resolve().parents[2] / "logs"
+    setup_logging(log_dir=log_dir)
+    from lora.core.diagnostics import enable_fault_reporting
+    enable_fault_reporting(log_dir)
 
     cfg_mgr, user_cfg = init_platform(base_dir=getattr(args, "config_dir", None))
 
@@ -1340,20 +1488,27 @@ def main(argv: list[str] | None = None) -> int:
         from lora.gateway.queue import JobQueue
         from lora.gateway.ws import ConnectionManager
         from lora.grounding.media_vector_db import MediaVectorDB
+        from lora.safety.lifecycle import consume_shutdown_request
+        from lora.tools.registry import ToolRegistry
 
         logger.info("Starting L.O.R.A in headless daemon mode...")
         h_queue = JobQueue()
         h_ws = ConnectionManager()
         h_media = MediaVectorDB()
+        from lora.models.laya_router import LayaDecisionRouter
+        h_router = LayaDecisionRouter(lazy_load=True)
         h_worker = JobWorker(
             h_queue,
             lambda origin: AgentRuntime(
                 ollama_url=user_cfg.models.ollama_url,
                 user_default_model=user_cfg.models.default_model,
                 history=ConversationHistory(max_turns=4),
-                media_db=h_media,
+                registry_factory=lambda: ToolRegistry(media_db=h_media),
+                media_db=h_media if origin == "desktop" else None,
+                embedding_engine=h_media.embedding_engine,
                 allow_actions=(origin == "desktop"),
-                notebook_db_path=Path(cfg_mgr.paths.user_profile_file).parent / "notebooks.db",
+                notebook_db_path=cfg_mgr.paths.notebooks_dir / "notebooks.db",
+                laya_router=h_router,
             ),
             broadcaster=h_ws.broadcast,
         )
@@ -1364,12 +1519,17 @@ def main(argv: list[str] | None = None) -> int:
             queue=h_queue,
             media_db=h_media,
             connection_manager=h_ws,
+            notebook_store=NotebookStore(cfg_mgr.paths.notebooks_dir / "notebooks.db"),
         )
+        started_at = time.time()
         try:
             while server and not server.should_exit:
+                if consume_shutdown_request(cfg_mgr.paths.base_dir, started_at):
+                    break
                 time.sleep(0.5)
         except KeyboardInterrupt:
             logger.info("Shutting down L.O.R.A headless daemon...")
+        finally:
             h_worker.stop()
             if server is not None:
                 server.should_exit = True

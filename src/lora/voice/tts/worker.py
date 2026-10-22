@@ -227,9 +227,6 @@ def get_kokoro_model(models_dir: str = "models/kokoro") -> Any:
     global _CACHED_KOKORO_MODEL
     if _CACHED_KOKORO_MODEL is not None:
         return _CACHED_KOKORO_MODEL
-    engine_pref = os.environ.get("LORA_TTS_ENGINE", "auto").lower()
-    if engine_pref in ("windows", "qwen", "qwen3-tts"):
-        return None
     with _KOKORO_LOAD_LOCK:
         if _CACHED_KOKORO_MODEL is not None:
             return _CACHED_KOKORO_MODEL
@@ -259,7 +256,15 @@ def get_kokoro_model(models_dir: str = "models/kokoro") -> Any:
         onnx_path, voices_path = files
         try:
             logger.info("Loading Kokoro-ONNX TTS on CPU from %s ...", onnx_path.parent)
-            model = Kokoro(str(onnx_path), str(voices_path))
+            import onnxruntime as ort
+
+            options = ort.SessionOptions()
+            options.intra_op_num_threads = 2
+            options.inter_op_num_threads = 1
+            session = ort.InferenceSession(
+                str(onnx_path), sess_options=options, providers=["CPUExecutionProvider"]
+            )
+            model = Kokoro.from_session(session, str(voices_path))
             _CACHED_KOKORO_MODEL = model
             _KOKORO_STATUS.update({
                 "state": "loaded",
@@ -604,11 +609,13 @@ class Qwen3TtsWorkerProcess:
         tokenizer_dir: str = r"C:\Models\Qwen3-TTS-Tokenizer-12Hz",
         default_voice: str = DEFAULT_KOKORO_VOICE,
         spawn_process: bool = False,
+        cpu_only: bool = False,
     ) -> None:
         self.models_dir = models_dir
         self.tokenizer_dir = tokenizer_dir
         self.default_voice = default_voice
         self.spawn_process = spawn_process
+        self.cpu_only = cpu_only
 
         self._in_queue: mp.Queue | None = None
         self._out_queue: mp.Queue | None = None
@@ -619,6 +626,8 @@ class Qwen3TtsWorkerProcess:
 
     def preload(self) -> bool:
         """Load the natural voice now (Kokoro-ONNX on CPU first, then external/Qwen fallback)."""
+        if self.cpu_only:
+            return get_kokoro_model(self.models_dir) is not None
         if not os.environ.get("LORA_TTS_PYTHON") and not os.environ.get("LORA_TTS_FAKE"):
             if get_kokoro_model(self.models_dir) is not None:
                 return True
@@ -685,6 +694,12 @@ class Qwen3TtsWorkerProcess:
                 except Exception as exc:
                     logger.warning("Kokoro-ONNX generation failed, trying fallback: %s", exc)
 
+        if self.cpu_only:
+            result = _windows_speech_synth(text, voice=target_voice)
+            samples, rate = result if result is not None else (np.zeros(0, dtype=np.float32), 24000)
+            return TtsAudioChunk(job_id=job_id, text=text, samples=samples, sample_rate=rate,
+                                 duration=len(samples) / rate,
+                                 error=None if len(samples) else "No CPU speech backend available")
         # 1. External GPU voice environment (.venv-tts), if configured
         ext = get_external_server(self.models_dir)
         if ext is not None:
@@ -758,4 +773,44 @@ class Qwen3TtsWorkerProcess:
             self._process = None
 
 
-KokoroTtsWorkerProcess = Qwen3TtsWorkerProcess
+class KokoroTtsWorkerProcess:
+    """Kokoro-only CPU speech. Missing voice files return an actionable error."""
+
+    def __init__(self, models_dir: str = "models/kokoro", default_voice: str = DEFAULT_KOKORO_VOICE):
+        self.models_dir = models_dir
+        self.default_voice = resolve_kokoro_voice(default_voice)
+
+    def preload(self) -> bool:
+        return get_kokoro_model(self.models_dir) is not None
+
+    def diagnosis(self) -> dict[str, Any]:
+        ready = self.preload()
+        return {
+            "ok": ready, "backend": "kokoro", "device": "cpu",
+            "summary": "Kokoro CPU voice ready." if ready else "Kokoro voice unavailable.",
+            "detail": _KOKORO_STATUS["reason"],
+            "fix": "" if ready else FIX_KOKORO,
+        }
+
+    def get_supported_voices(self) -> list[str]:
+        return list(KOKORO_VOICES)
+
+    def synthesize(self, text: str, job_id: str = "1", voice: str = "default") -> TtsAudioChunk:
+        samples, rate, error = np.zeros(0, dtype=np.float32), 24000, None
+        if text.strip():
+            try:
+                model = get_kokoro_model(self.models_dir)
+                if model is None:
+                    raise RuntimeError(f"{_KOKORO_STATUS['reason']}. {FIX_KOKORO}")
+                target = self.default_voice if voice == "default" else resolve_kokoro_voice(voice)
+                samples, rate = _kokoro_generate(model, text, target)
+            except Exception as exc:
+                error = f"Kokoro CPU speech failed: {exc}"
+                logger.warning("%s", error)
+        return TtsAudioChunk(job_id=job_id, text=text, samples=samples, sample_rate=rate,
+                             duration=len(samples) / rate, error=error)
+
+    def shutdown(self) -> None:
+        """No external speech process or GPU allocation to release."""
+
+    stop = shutdown

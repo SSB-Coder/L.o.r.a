@@ -11,6 +11,7 @@ import logging
 import queue
 import re
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -100,12 +101,23 @@ class SpeechStreamer:
             except queue.Empty:
                 pass
         self._text_q.put(_SENTINEL)
-        self._audio_q.put(_SENTINEL)
+        try:
+            self._audio_q.put_nowait(_SENTINEL)
+        except queue.Full:
+            pass  # Consumer checks _stop; never block a GUI interrupt.
+
+    def wait(self, timeout: float = 2.0) -> bool:
+        """Bounded shutdown join; call after interrupting any pending native work."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        for thread in self._threads:
+            if thread is not threading.current_thread():
+                thread.join(max(0.0, deadline - time.monotonic()))
+        return all(not thread.is_alive() for thread in self._threads)
 
     @property
     def has_pending(self) -> bool:
         """True if anything was queued to be spoken (so audio is on its way)."""
-        return self._spoken_chars > 0 and not self._stop.is_set()
+        return self._spoken_chars > 0 and not self._stop.is_set() and not self._done_called
 
     @property
     def active(self) -> bool:
@@ -123,22 +135,32 @@ class SpeechStreamer:
             return
         if self._spoken_chars >= self.max_chars:
             return  # long detailed answers: read the opening, the rest is on screen
+        clean = clean[:self.max_chars - self._spoken_chars].rstrip()
         self._spoken_chars += len(clean)
         self._text_q.put(clean)
 
     def _synth_loop(self) -> None:
         while not self._stop.is_set():
             item = self._text_q.get()
-            if item is _SENTINEL:
+            if item is _SENTINEL or self._stop.is_set():
                 break
             try:
                 chunk = self._synthesize(item)
             except Exception as exc:
                 logger.warning("TTS synthesis failed: %s", exc)
                 chunk = None
-            if chunk is not None and not self._stop.is_set():
-                self._audio_q.put(chunk)
-        self._audio_q.put(_SENTINEL)
+            samples = getattr(chunk, "samples", None)
+            if chunk is not None and (samples is None or len(samples)) and not self._stop.is_set():
+                self._put_audio(chunk)
+        self._put_audio(_SENTINEL)
+
+    def _put_audio(self, value: Any) -> None:
+        while not self._stop.is_set():
+            try:
+                self._audio_q.put(value, timeout=0.05)
+                return
+            except queue.Full:
+                continue
 
     def _play_loop(self) -> None:
         while True:
@@ -148,7 +170,10 @@ class SpeechStreamer:
             if not self._spoke:
                 self._spoke = True
                 if self._on_start:
-                    self._on_start()
+                    try:
+                        self._on_start()
+                    except Exception:
+                        logger.exception("TTS start callback failed")
             try:
                 self._play(chunk, self._stop)
             except Exception as exc:

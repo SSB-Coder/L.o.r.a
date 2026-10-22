@@ -39,7 +39,7 @@ def test_mcp_config_parsing(tmp_path: Path):
 
 
 def test_mcp_tool_registration_and_sandboxing(tmp_path: Path):
-    engine = PolicyEngine()
+    engine = PolicyEngine(allowed_roots=[str(tmp_path)])
     gate = ActionGate(policy_engine=engine)
     manager = McpClientManager(gate=gate)
 
@@ -65,7 +65,7 @@ def test_mcp_tool_registration_and_sandboxing(tmp_path: Path):
     # Executing safe desktop user action should succeed
     res = manager.execute_tool(
         "read_note",
-        {"path": str(Path.home() / "Documents" / "note.txt")},
+        {"path": str(tmp_path / "note.txt")},
         origin="desktop",
     )
     assert res.success is True
@@ -104,7 +104,7 @@ def test_mcp_tool_registration_and_sandboxing(tmp_path: Path):
     # Executing with UNTRUSTED taint should be denied by ActionGate
     taint_res = manager.execute_tool(
         "read_note",
-        {"path": str(Path.home() / "Documents" / "note.txt")},
+        {"path": str(tmp_path / "note.txt")},
         origin="desktop",
         provenance={"source": DataProvenance.UNTRUSTED},
     )

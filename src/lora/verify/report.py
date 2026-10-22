@@ -31,6 +31,7 @@ class ClaimVerificationDetail(BaseModel):
     claim_id: str
     claim_text: str
     nli_score: float
+    nli_reliable: bool = True
     is_supported: bool
     number_check_passed: bool = True
     corroboration: CorroborationResult | None = None

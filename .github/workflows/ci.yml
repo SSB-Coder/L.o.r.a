@@ -1,0 +1,57 @@
+name: LORA checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      QT_QPA_PLATFORM: offscreen
+      QTWEBENGINE_CHROMIUM_FLAGS: --no-sandbox --disable-gpu
+      HF_HUB_OFFLINE: '1'
+      LORA_VERIFY_OFFLINE: '1'
+      LORA_TTS_FAKE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pip install -r requirements-conformance.txt
+      - run: python -m pytest tests -q --cov=lora --cov-report=xml --junitxml=test-results.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.os }}
+          path: |
+            coverage.xml
+            test-results.xml
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pip install -r requirements-conformance.txt
+      - run: python -m ruff check src tests/unit/test_plan_conformance.py
+      - run: python -m mypy src/lora/core/config.py src/lora/safety/policy.py --follow-imports=silent --ignore-missing-imports
+      - run: python -m bandit -r src -ll -f json -o bandit.json
+      - run: python -m pip_audit --format json --output pip-audit.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-reports
+          path: |
+            bandit.json
+            pip-audit.json

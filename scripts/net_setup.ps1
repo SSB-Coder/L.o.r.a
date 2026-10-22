@@ -24,7 +24,8 @@
 #>
 
 param (
-    [string]$InterfaceAlias = "Ethernet 2",
+    [string]$InterfaceAlias = "",
+    [string]$LocalAddress = "192.168.50.10",
     [int]$LocalPort = 8765,
     [string]$RemoteSubnet = "192.168.50.0/24",
     [string]$RuleName = "LORA Gateway (Isolated)",
@@ -44,11 +45,15 @@ if (-not $isAdmin) {
 }
 
 Write-Host "[1/3] Checking network interface '$InterfaceAlias'..." -ForegroundColor Yellow
+if (-not $InterfaceAlias) {
+    $InterfaceAlias = (Get-NetIPAddress -IPAddress $LocalAddress -ErrorAction Stop).InterfaceAlias
+    if (-not $InterfaceAlias) { throw "No adapter owns $LocalAddress" }
+}
 $adapter = Get-NetAdapter -Name $InterfaceAlias -ErrorAction SilentlyContinue
 if (-not $adapter) {
     Write-Warning "Adapter '$InterfaceAlias' not found. Available adapters:"
     Get-NetAdapter | Format-Table -Property Name, InterfaceDescription, Status, LinkSpeed
-    Write-Host "Proceeding with rule creation for interface alias '$InterfaceAlias'..." -ForegroundColor DarkYellow
+    throw "Cannot configure isolated firewall without the designated adapter"
 } else {
     Write-Host "Found adapter '$InterfaceAlias' (Status: $($adapter.Status))" -ForegroundColor Green
 }

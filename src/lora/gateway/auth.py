@@ -156,24 +156,6 @@ class HostOriginGuard:
         clean = netloc.strip().lower()
         if clean in self.allowed_hosts:
             return True
-        if self.listener_origin == "mobile":
-            import ipaddress
-
-            host_only, _, port_str = clean.rpartition(":") if ":" in clean else (clean, "", "")
-            port_ok = (not port_str) or (port_str.isdigit() and int(port_str) == self.port)
-            if not port_ok:
-                return False
-            # Allow localhost/127.0.0.1 on the dedicated mobile port (e.g. 8766) for local browser testing,
-            # while keeping 127.0.0.1:8765 blocked on the mobile guard per unit tests.
-            if host_only in ("127.0.0.1", "localhost") and self.port != 8765:
-                return True
-            try:
-                ip = ipaddress.ip_address(host_only)
-                if ip.is_private and not ip.is_loopback:
-                    if self.mobile_ip in ("0.0.0.0", "") or self.port != 8765 or str(ip) == self.mobile_ip:
-                        return True
-            except ValueError:
-                pass
         return False
 
     def validate_host(self, host: str | None) -> bool:
@@ -186,12 +168,9 @@ class HostOriginGuard:
         """Check if the Origin header (if present) matches the expected host for this listener."""
         if not origin:
             return True  # Direct non-browser requests or same-origin GETs omit Origin
-        if self.listener_origin == "mobile" and origin.strip().lower() == "null":
-            return True  # Mobile QR scanner WebViews often send Origin: null
-
         parsed = urlparse(origin)
         netloc = parsed.netloc.lower()
-        return self._is_allowed_netloc(netloc)
+        return parsed.scheme in {"http", "https"} and parsed.path in {"", "/"} and self._is_allowed_netloc(netloc)
 
 
 def scrub_token(text: str, known_tokens: Sequence[str]) -> str:

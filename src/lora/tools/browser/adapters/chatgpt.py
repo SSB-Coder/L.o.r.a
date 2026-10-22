@@ -84,7 +84,6 @@ class ChatGPTAdapter(ChatbotAdapter):
         await asyncio.sleep(2.0)
         start_time = asyncio.get_event_loop().time()
         last_text = ""
-        stable_ticks = 0
 
         while (asyncio.get_event_loop().time() - start_time) < timeout_seconds:
             for resp_sel in self.RESPONSE_SELECTORS:

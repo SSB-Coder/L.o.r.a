@@ -37,24 +37,41 @@ class SpeakerVerifier:
     ) -> None:
         env_thresh = os.environ.get("LORA_SPEAKER_VERIFY_THRESHOLD")
         self.threshold = float(env_thresh) if env_thresh else threshold
-        self.profile_path = Path(profile_path) if profile_path else Path("data/voice/user_verifier.json")
+        self.profile_path = Path(profile_path).expanduser() if profile_path else Path.home() / ".lora" / "voice" / "user_verifier.json"
         if enabled is not None:
             self.enabled = enabled
         else:
             self.enabled = os.environ.get("LORA_SPEAKER_VERIFY_ENABLED", "1").lower() not in ("0", "false", "no")
         self.reference_embeddings: list[list[float]] = []
+        self.loaded_profile_path: Path | None = None
         self._load_profile()
 
     def _load_profile(self) -> None:
         """Load enrolled speaker embeddings if profile file exists."""
-        if self.profile_path.exists():
+        profile = self.profile_path
+        canonical = Path.home() / ".lora" / "voice" / "user_verifier.json"
+        if profile == canonical and not profile.exists():
+            # Read the existing enrollment in place. Never overwrite a user's
+            # profile or silently require them to enroll again after an upgrade.
+            legacy = Path(__file__).resolve().parents[3] / "data" / "voice" / "user_verifier.json"
+            if legacy.is_file():
+                profile = legacy
+        if profile.exists():
             try:
-                data = json.loads(self.profile_path.read_text(encoding="utf-8"))
-                self.reference_embeddings = data.get("embeddings", [])
+                data = json.loads(profile.read_text(encoding="utf-8"))
+                embeddings = np.asarray(data.get("embeddings", []), dtype=np.float32)
+                if embeddings.ndim != 2 or embeddings.shape[1] != 32 or not np.all(np.isfinite(embeddings)):
+                    raise ValueError("Expected finite 32-bin speaker embeddings")
+                if np.any(np.linalg.norm(embeddings, axis=1) == 0):
+                    raise ValueError("Empty speaker embedding")
+                self.reference_embeddings = embeddings.tolist()
+                self.loaded_profile_path = profile
                 if "threshold" in data and "LORA_SPEAKER_VERIFY_THRESHOLD" not in os.environ:
                     file_thresh = float(data["threshold"])
-                    self.threshold = min(self.threshold, file_thresh) if file_thresh > 0 else self.threshold
-            except Exception:
+                    if 0.0 < file_thresh < 1.0:
+                        self.threshold = file_thresh
+            except (OSError, ValueError, TypeError):
+                logger.warning("Speaker enrollment is invalid; run lora enroll")
                 self.reference_embeddings = []
 
     def save_profile(self, embeddings: list[list[float]], speaker_name: str = "owner") -> None:
@@ -129,19 +146,15 @@ class SpeakerVerifier:
 
         max_sim = max(similarities)
         is_owner = max_sim >= self.threshold
+        if not is_owner:
+            logger.info("imposter_rejected similarity=%.3f", max_sim)
         return is_owner, max_sim
 
 
 class WakeWordDetector:
-    """Detects 'Awaken LORA' (wake from sleep) and 'Hey LORA' (chat from idle).
+    """Detect addressed Hey Lora/Laura phrases while awake, using local STT.
 
-    Features:
-    - Dual activation states:
-      1. From SLEEP: 'Awaken LORA' (or 'Wake up LORA') wakes the system into IDLE.
-      2. From IDLE: 'Hey LORA' activates listening to chat.
-    - Real-time keyword transcription verification via FasterWhisperTranscriber.
-    - Phonetic tolerance for common Whisper near-homophones of 'LORA'.
-    - Integrated speaker acoustic verification.
+    Optional wake weights can gate transcription. Sleep listening is explicit.
     """
 
     def __init__(
@@ -152,106 +165,37 @@ class WakeWordDetector:
         model_path: str | None = None,
         speaker_verifier: SpeakerVerifier | None = None,
         transcriber: Any = None,
+        engine: str = "transcript",
+        listen_while_sleeping: bool = False,
     ) -> None:
         self.wake_phrase = wake_phrase
         self.chat_phrase = chat_phrase
         self.threshold = threshold
         self.speaker_verifier = speaker_verifier or SpeakerVerifier()
         self.transcriber = transcriber
+        self.engine = engine
+        self.listen_while_sleeping = listen_while_sleeping
         self._oww_model: Any = None
 
         resolved_model = model_path
-        if resolved_model is None and Path("models/voice/hey_lora.onnx").is_file():
-            resolved_model = "models/voice/hey_lora.onnx"
-        if resolved_model:
+        if resolved_model is None:
+            for candidate in ("models/voice/awaken_lora.onnx", "models/voice/hey_lora.onnx"):
+                if Path(candidate).is_file():
+                    resolved_model = candidate
+                    break
+        if resolved_model and engine == "openwakeword":
             try:
                 from openwakeword.model import Model
                 self._oww_model = Model(wakeword_models=[resolved_model])
             except Exception:
                 self._oww_model = None
 
-    SLEEP_KEYWORDS = (
-        "awaken lora", "awaken laura", "awaken lola", "awaken lara", "awaken nora", "awaken flora",
-        "awaken lauren", "awaken lyra", "awaken aura",
-        "wake up lora", "wake up laura", "wake up lola", "wake up lara", "wake lora", "wake laura",
-        "awaken", "wake up",
-    )
-    IDLE_KEYWORDS = (
-        "hey lora", "hey laura", "hey lola", "hey lara", "hey nora", "hey dora", "hey flora", "hey clara",
-        "hey lauren", "hey lyra", "hey aura", "hey lotta", "hey rory", "hey lore", "hey lord", "hey lorra",
-        "hi lora", "hi laura", "hi lola", "hi lara", "hi nora", "hello lora", "hello laura", "hello lola",
-        "awaken lora", "awaken laura", "ok lora", "okay lora", "ok laura", "okay laura",
-        "yo lora", "yo laura", "halo lora", "halo laura", "a lora", "a laura",
-        "lora", "laura", "lorra",
-    )
-    _SLEEP_PHONETIC_RE = re.compile(
-        r"^\s*(?:awaken|wake(?:\s+up)?)[,.\s]+"
-        r"(?:lora|laura|lorra|lola|lara|nora|dora|flora|clara|lauren|lyra|aura)\b"
-        r"[,.:;!?\s]*(?P<rest>.*)$",
-        re.IGNORECASE,
-    )
-    _IDLE_PHONETIC_RE = re.compile(
-        r"^\s*(?:(?:hey|hi|hello|yo|ok|okay|awaken|wake(?:\s+up)?|halo|aye)[,.\s]+)?"
-        r"(?:lora|laura|lorra|lola|lara|nora|dora|flora|clara|lauren|lyra|aura|lotta|lore)\b"
-        r"[,.:;!?\s]*(?P<rest>.*)$",
-        re.IGNORECASE,
-    )
-    _STANDALONE_SLEEP_RE = re.compile(
-        r"^\s*(?:(?:(?:hey|hi|hello|ok|okay)[,.\s]+)?(?:lora|laura|lorra|lola|lara)[,.\s]+)?(?:please\s+)?"
-        r"(?:go\s+to\s+sleep|sleep\s+mode|sleep\s+now|stand\s*by|standby)"
-        r"(?:[,.\s]+(?:lora|laura|lorra|lola|lara|please|now|for\s+now))*[\s.!?]*$",
-        re.IGNORECASE,
-    )
-
     def match_text(self, text: str, is_sleeping: bool) -> tuple[bool, str]:
-        """Check an already-transcribed utterance for the activation phrase.
-
-        Returns (matched, query_after_the_phrase). Lets callers transcribe once
-        instead of once for the wake check and again for the query.
-        """
-        raw_clean = re.sub(r"\s+", " ", (text or "").strip())
-        txt = raw_clean.lower()
-        if not txt:
+        """Match an addressed phrase, retaining an immediate prompt verbatim."""
+        if is_sleeping and not getattr(self, "listen_while_sleeping", False):
             return False, ""
-        # Normalize punctuation between prefix ("Hey,") and name ("Lora")
-        txt_norm = re.sub(r"[,.;:!?]+", " ", txt)
-        txt_norm = re.sub(r"\s+", " ", txt_norm).strip()
-        if is_sleeping:
-            ms = self._SLEEP_PHONETIC_RE.match(raw_clean)
-            if ms:
-                return True, (ms.group("rest") or "").strip(" ,.:;!?")
-            for kw in self.SLEEP_KEYWORDS:
-                if kw in txt_norm:
-                    idx = txt_norm.find(kw)
-                    before_ok = idx == 0 or not txt_norm[idx - 1].isalnum()
-                    after_idx = idx + len(kw)
-                    after_ok = after_idx >= len(txt_norm) or not txt_norm[after_idx].isalnum()
-                    if before_ok and after_ok:
-                        after = txt_norm[after_idx:].strip(" ,.:;!?")
-                        # Bare 'awaken' or 'wake up' without 'lora' only triggers if standalone or followed by <4 words
-                        if kw in ("awaken", "wake up") and after and len(after.split()) > 4:
-                            continue
-                        return True, after
-            return False, ""
-
-        if self._STANDALONE_SLEEP_RE.match(raw_clean):
-            return True, "go to sleep"
-
-        m = self._IDLE_PHONETIC_RE.match(raw_clean)
-        if m:
-            return True, (m.group("rest") or "").strip(" ,.:;!?")
-
-        for kw in self.IDLE_KEYWORDS:
-            if kw in txt_norm:
-                idx = txt_norm.find(kw)
-                # Ensure word-boundary match so "floral" doesn't match "flora"
-                before_ok = idx == 0 or not txt_norm[idx - 1].isalnum()
-                after_idx = idx + len(kw)
-                after_ok = after_idx >= len(txt_norm) or not txt_norm[after_idx].isalnum()
-                if before_ok and after_ok:
-                    after = txt_norm[after_idx:].strip(" ,.:;!?")
-                    return True, after
-        return False, ""
+        match = re.match(r"^\s*(?:hey|hi|hello|yo|ok|okay|awaken|wake\s+up)[,\s]+(?:lora|laura)\b[,.:;!?\s]*(.*)$", text or "", re.IGNORECASE | re.DOTALL)
+        return (True, match.group(1).strip()) if match else (False, "")
 
     def evaluate_text(
         self,
@@ -293,37 +237,20 @@ class WakeWordDetector:
         wake_score = 0.0
         extracted_query = ""
 
-        # 1. Live Faster-Whisper keyword transcription pass if transcriber present
-        if self.transcriber is not None:
+        if is_sleeping and not getattr(self, "listen_while_sleeping", False):
+            return WakeWordResult(detected=False, phrase=target_phrase)
+        if self._oww_model is not None:
             try:
-                res = self.transcriber.transcribe(audio, sample_rate=sample_rate)
-                matched, query = self.match_text(res.text, is_sleeping)
-                if matched:
-                    detected = True
-                    wake_score = 0.95
-                    target_phrase = self.wake_phrase if is_sleeping else self.chat_phrase
-                    extracted_query = query
-            except Exception:
-                pass
-
-        # 2. openWakeWord model if configured
-        if not detected and self._oww_model is not None:
-            try:
-                pcm_int16 = (audio * 32767).astype(np.int16)
-                prediction = self._oww_model.predict(pcm_int16)
-                for k, score in prediction.items():
-                    if score > wake_score:
-                        wake_score = float(score)
+                prediction = self._oww_model.predict((audio * 32767).astype(np.int16))
+                wake_score = max((float(score) for score in prediction.values()), default=0.0)
                 detected = wake_score >= self.threshold
-            except Exception:
-                wake_score = 0.0
-
-        # 3. Energy & Acoustic envelope check fallback (supports unit tests and energy triggers)
-        if not detected and self.transcriber is None and self._oww_model is None:
-            rms = float(np.sqrt(np.mean(audio**2)))
-            if rms > 0.03:
-                wake_score = float(min(1.0, rms * 10))
-            detected = wake_score >= self.threshold
+            except Exception as exc:
+                logger.warning("Wake model inference failed: %s", exc)
+        elif self.transcriber is not None:
+            result = self.transcriber.transcribe(audio, sample_rate=sample_rate)
+            detected, extracted_query = self.match_text(result.text, False)
+            wake_score = 0.0  # A phrase rule has no calibrated acoustic probability.
+        # Missing weights use local transcription; loudness alone never activates.
 
         if detected:
             is_verified, sim = self.speaker_verifier.verify(audio, sample_rate)

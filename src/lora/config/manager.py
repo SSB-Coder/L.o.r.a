@@ -33,7 +33,7 @@ class EcosystemPaths(BaseModel):
             agents_dir=base_dir / "agents",
             memory_dir=base_dir / "memory",
             notebooks_dir=base_dir / "notebooks",
-            outputs_dir=base_dir / "outputs",
+            outputs_dir=Path.home() / "LORA" / "outputs",
             config_file=base_dir / "config.yaml",
             mcp_file=base_dir / "mcp.json",
             user_profile_file=base_dir / "memory" / "user_profile.md",
@@ -52,7 +52,7 @@ class ModelsConfig(BaseModel):
 class VoiceConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    tts_voice: str = "vivian"
+    tts_voice: str = "af_sky"
     wake_phrase: str = "Awaken LORA"
     vad_level: int = 2
     sound_effects_enabled: bool = True
@@ -99,9 +99,9 @@ DEFAULT_USER_PROFILE_MD = """# User Profile & Preferences
 *Last Updated: 2026-10-09*
 
 ## Interaction Preferences
-- Style: Grounded, precise, highly technical.
+- Style: Clear, casual, concise; technical depth when requested.
 - Research depth: Thorough with multi-source citation verification.
-- Tone: Professional AI peer.
+- Tone: Casual friend and dependable butler.
 
 ## Memory & Context
 - Default project root: C:\\Thought\\Projects\\LORA

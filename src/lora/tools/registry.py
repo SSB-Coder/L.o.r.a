@@ -3,7 +3,6 @@
 import asyncio
 import concurrent.futures
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -18,7 +17,6 @@ from lora.tools.browser.driver import PlaywrightBrowserDriver
 from lora.tools.browser.pdf_fetcher import PdfFetcher
 from lora.tools.control.apps import AppLauncher
 from lora.tools.control.windows import WindowManager
-from lora.tools.files.known import known_folder_roots
 from lora.tools.files.list import list_dir
 from lora.tools.files.paths import open_path
 from lora.tools.files.read import read_file
@@ -43,9 +41,7 @@ class ToolRegistry:
         media_db: MediaVectorDB | None = None,
     ) -> None:
         if action_gate is None:
-            roots = list(PolicyEngine.DEFAULT_ALLOWED_ROOTS)
-            roots += [r for r in known_folder_roots() if r not in roots]
-            action_gate = ActionGate(policy_engine=PolicyEngine(allowed_roots=roots))
+            action_gate = ActionGate(policy_engine=PolicyEngine())
         self.action_gate = action_gate
         self._tools: dict[str, ToolManifest] = {}
         self.app_launcher = AppLauncher()
@@ -57,6 +53,13 @@ class ToolRegistry:
         self.media_db = media_db or MediaVectorDB()
         self.report_exporter = ReportExporter()
         self._register_built_in_tools()
+
+    async def close(self) -> None:
+        """Release asynchronous resources on the registry's owning event loop."""
+        try:
+            await self.browser_driver.close()
+        finally:
+            await self.web_search_dispatcher.close()
 
     def register(
         self,
@@ -239,21 +242,6 @@ class ToolRegistry:
             },
         )
 
-        # 14. Remove File / Media from FAISS Vector DB
-        self.register(
-            name="remove_media_file",
-            description="Remove a file or media asset and rebuild the FAISS vector database.",
-            tier=ActionRiskTier.TIER1,
-            handler=lambda path_or_id: self.media_db.remove_file(path_or_id),
-            parameters_schema={
-                "type": "object",
-                "properties": {
-                    "path_or_id": {"type": "string", "description": "File path, filename, or file_id to remove"},
-                },
-                "required": ["path_or_id"],
-            },
-        )
-
         # 15. List Indexed Files and Media
         self.register(
             name="list_media_files",
@@ -282,7 +270,7 @@ class ToolRegistry:
         # 17. Report on Files and Media
         self.register(
             name="report_on_media",
-            description="Synthesize an evidence-backed research report reading from indexed files and media in the FAISS vector database.",
+            description="Return indexed-file diagnostics and source passages. These are inputs for synthesis, not a finished summary.",
             tier=ActionRiskTier.TIER0,
             handler=lambda query="", top_k=6: self.media_db.report_on_media(query=query, top_k=top_k),
             parameters_schema={
@@ -351,6 +339,7 @@ class ToolRegistry:
         params: dict[str, Any] | None = None,
         origin: str = "desktop",
         provenance: dict[str, Any] | None = None,
+        confirmed: bool = False,
     ) -> dict[str, Any]:
         """Asynchronously verify action against ActionGate policy and execute handler."""
         tool = self._tools.get(tool_name)
@@ -360,7 +349,9 @@ class ToolRegistry:
                 "message": f"Unknown tool '{tool_name}'.",
             }
 
-        params_dict = params or {}
+        params_dict = dict(params or {})
+        if self.action_gate.dry_run:
+            return {"status": "dry_run", "tool": tool_name, "params": params_dict}
 
         gate_result = self.action_gate.verify_and_gate(
             tool=tool_name,
@@ -370,7 +361,7 @@ class ToolRegistry:
             provenance=provenance,
         )
 
-        if not gate_result.allowed:
+        if not gate_result.allowed or (str(gate_result.verdict) == "ASK" and not confirmed):
             return {
                 "status": "denied",
                 "reason": gate_result.reason,
@@ -399,6 +390,7 @@ class ToolRegistry:
         params: dict[str, Any] | None = None,
         origin: str = "desktop",
         provenance: dict[str, Any] | None = None,
+        confirmed: bool = False,
     ) -> dict[str, Any]:
         """Synchronously verify action against ActionGate policy and execute handler."""
         tool = self._tools.get(tool_name)
@@ -408,7 +400,9 @@ class ToolRegistry:
                 "message": f"Unknown tool '{tool_name}'.",
             }
 
-        params_dict = params or {}
+        params_dict = dict(params or {})
+        if self.action_gate.dry_run:
+            return {"status": "dry_run", "tool": tool_name, "params": params_dict}
 
         gate_result = self.action_gate.verify_and_gate(
             tool=tool_name,
@@ -418,7 +412,7 @@ class ToolRegistry:
             provenance=provenance,
         )
 
-        if not gate_result.allowed:
+        if not gate_result.allowed or (str(gate_result.verdict) == "ASK" and not confirmed):
             return {
                 "status": "denied",
                 "reason": gate_result.reason,

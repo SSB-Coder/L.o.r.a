@@ -1,4 +1,4 @@
-"""L.O.R.A Multi-Agent Runtime: coordinates Laya Decision Router, Supervisor, Specialist Sub-Agents, Skills, 8-Way Verification, and Artifacts.
+"""L.O.R.A Multi-Agent Runtime: coordinates routing, cited research, document synthesis, skills, and artifacts.
 
 Qt-free so it can be tested on its own. The UI and TTS hang off the callbacks:
   on_status(text)        short progress line ("Searching the web…")
@@ -12,7 +12,9 @@ import inspect
 import logging
 import os
 import re
+import time
 from collections.abc import Awaitable, Callable
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,7 @@ from lora.agent.commands import (
     capability_reply,
     is_deep,
     is_research,
+    is_smalltalk,
     looks_like_filename,
     looks_like_url,
     note_title,
@@ -31,19 +34,12 @@ from lora.agent.commands import (
     quick_reply,
     resolve_folder,
 )
-from lora.agent.deep import (
-    Opinion,
-    build_verification_dropdown_meta,
-    opinion_prompt,
-    parse_opinion,
-    pick_judge_model,
-    refine,
-    roundtable,
-)
+from lora.agent.deep import pick_judge_model
 from lora.agent.fuzzy import best_key
 from lora.agent.notes import create_artifact, generate_visual, process_attachments
 from lora.agent.prompting import ResearchPlan, make_plan
 from lora.agent.research import Source
+from lora.agent.source_check import source_metadata
 from lora.agent.toolloop import ToolLoop, looks_agentic
 from lora.agent.verification import VerifierLLM, cards_from_sources, verify_answer
 from lora.dialogue import (
@@ -51,8 +47,6 @@ from lora.dialogue import (
     build_messages,
     build_note_messages,
     build_research_messages,
-    build_revise_messages,
-    strip_footnote,
     strip_think,
 )
 from lora.models.laya_router import LayaDecision, LayaDecisionRouter
@@ -68,7 +62,7 @@ ENGINE_DOWN = (
 NO_MODELS = "My local engine is running but has no models installed yet."
 
 
-class EngineUnavailable(Exception):
+class EngineUnavailable(Exception):  # noqa: N818 - established public API
     """The local model could not be reached (details are logged, not shown)."""
 
 
@@ -122,10 +116,10 @@ SUBAGENTS: dict[str, SubAgentSpec] = {
     ),
     "critic_verifier": SubAgentSpec(
         id="critic_verifier",
-        name="8-Way Critic & Verifier Agent",
-        role="Verification & Prompt Evolution",
-        description="Executes V1-V8 claim verification, 4-persona Round-Table critique, and iterative prompt/score refinement.",
-        default_model_role="verifier",
+        name="Source Reference Reviewer",
+        role="Source References",
+        description="Reviews supplied source references without assigning factual confidence scores.",
+        default_model_role="writer",
     ),
 }
 
@@ -224,6 +218,8 @@ class AgentRuntime:
         skills_dir: Any = None,
         agents_dir: Any = None,
         notebook_db_path: Path | None = None,
+        laya_router: LayaDecisionRouter | None = None,
+        embedding_engine: Any = None,
     ) -> None:
         self.ollama_url = ollama_url
         self.user_default_model = user_default_model
@@ -236,9 +232,10 @@ class AgentRuntime:
         self._research_fn = research_fn
         self.diag_extras: Callable[[], dict[str, Any]] = lambda: {}
         self.media_db = media_db
+        self.embedding_engine = embedding_engine if embedding_engine is not None else getattr(media_db, "embedding_engine", None)
         self._should_abort: Callable[[], str | None] = lambda: None
         self.allow_actions = allow_actions  # False for phone jobs: chat and research only
-        self.allow_typing = os.environ.get("LORA_ALLOW_TYPING", "1") != "0"
+        self.allow_typing = allow_actions  # explicit desktop command plus exact confirmation only
         self.confirm: Callable[[str], Awaitable[bool]] = _deny  # user OK for sensitive actions (typing)
         self.typer: Any = None
         self.persona: str | None = None  # ~/.lora/agents/persona.md overrides the built-in personality
@@ -246,7 +243,7 @@ class AgentRuntime:
         self.mcp_hub: Any = None
         self._mcp_config_path = mcp_config_path
         self._mcp_lock = __import__("threading").Lock()
-        self.laya_router = LayaDecisionRouter()
+        self.laya_router = laya_router if laya_router is not None else LayaDecisionRouter(lazy_load=True)
         self.last_laya_decision: LayaDecision | None = None
         self._notebook_db_path = notebook_db_path
         self._load_personalization(skills_dir, agents_dir)
@@ -325,17 +322,17 @@ class AgentRuntime:
 
     # ------------------------------------------------------- personalization & MCP
     def _load_personalization(self, skills_dir: Any, agents_dir: Any) -> None:
-        from pathlib import Path as _P
+        from pathlib import Path as _Path
 
         try:
-            if agents_dir and (_P(agents_dir) / "persona.md").is_file():
-                raw_p = (_P(agents_dir) / "persona.md").read_text(encoding="utf-8")[:2000].strip()
+            if agents_dir and (_Path(agents_dir) / "persona.md").is_file():
+                raw_p = (_Path(agents_dir) / "persona.md").read_text(encoding="utf-8")[:2000].strip()
                 # Strip legacy "Think JARVIS to their Tony Stark" from any persisted persona.md
                 raw_p = re.sub(r"Think\s+JARVIS\s+to\s+their\s+Tony\s+Stark\s*:?\s*", "", raw_p, flags=re.IGNORECASE).strip()
                 self.persona = raw_p or None
             from lora.skills.loader import SkillLoader
 
-            self.skills = SkillLoader(_P(skills_dir) if skills_dir else None, include_builtin=True)
+            self.skills = SkillLoader(_Path(skills_dir) if skills_dir else None, include_builtin=True)
             self.skills.load_skills()
         except Exception as exc:
             logger.warning("Could not load skills/persona: %s", exc)
@@ -347,24 +344,25 @@ class AgentRuntime:
             return None
 
     def _persona_kwargs(self, q: str) -> dict[str, Any]:
-        skill = self._skill_for(q)
+        skill = None if is_smalltalk(q) else self._skill_for(q)
         return {"persona": self.persona, "addon": (skill.system_prompt_addon or "") if skill else ""}
 
     def start_mcp(self) -> None:
         """Connect the servers in ~/.lora/mcp.json (blocking; call from a background thread). Safe to call twice."""
+        if not self.allow_actions or os.environ.get("LORA_ENABLE_MCP", "0") != "1":
+            logger.info("MCP startup requires desktop scope and LORA_ENABLE_MCP=1")
+            return
         with self._mcp_lock:
             if self.mcp_hub is not None or not self._mcp_config_path:
                 return
             from lora.tools.mcp import McpClientManager
             from lora.tools.mcp_stdio import McpHub
 
-            try:
-                manager = McpClientManager(mcp_config_path=self._mcp_config_path, gate=self._get_registry().action_gate)
-                hub = McpHub(manager)
-                hub.connect_all()
-                self.mcp_hub = hub
-            except Exception as exc:
-                logger.warning("MCP setup failed: %s", exc)
+            manager = McpClientManager(mcp_config_path=self._mcp_config_path,
+                                       gate=self._get_registry().action_gate)
+            hub = McpHub(manager)
+            hub.connect_all()
+            self.mcp_hub = hub
 
     def mcp_tool_defs(self) -> dict[str, Any]:
         return self.mcp_hub.manager.tools if self.mcp_hub is not None else {}
@@ -391,18 +389,30 @@ class AgentRuntime:
         mode: str | None = None,
         should_abort: Callable[[], str | None] | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        answer_depth: str | None = None,
     ) -> TurnResult:
-        """mode: quick | standard | deep | deep_with_refinement (None: standard, deep if asked for)."""
+        """Route a turn; all research modes use cited synthesis and reference checks."""
         q = query.strip()
         self._should_abort = should_abort or (lambda: None)
         if self._registry is not None:
             self._registry.action_gate.reset_task()
 
+        # Clock/date and capability answers need neither a model nor web research.
+        if not attachments:
+            canned = quick_reply(q) or capability_reply(q)
+            if canned:
+                self.history.add(q, canned)
+                on_text(canned, True)
+                return TurnResult(text=canned, kind="smalltalk")
+
         images_b64, attachment_context, image_paths = process_attachments(attachments)
         skill = self._skill_for(q)
 
         # 1. Route every utterance through Laya Decision Router on CPU (0 MB GPU VRAM)
-        decision = self.laya_router.predict(q)
+        route = self.laya_router.predict
+        if os.environ.get("LORA_NEURAL_ROUTING", "0") != "1" and isinstance(self.laya_router, LayaDecisionRouter):
+            route = self.laya_router.predict_fast
+        decision = route(q)
         self.last_laya_decision = decision
 
         trace = AgentExecutionTrace(
@@ -416,13 +426,20 @@ class AgentRuntime:
         )
 
         try:
-            if not attachments:
-                canned = quick_reply(q) or capability_reply(q)
-                if canned:
-                    on_text(canned, True)
-                    return TurnResult(text=canned, kind="smalltalk")
-
             cmd = parse_command(q) if not attachments else None
+            summary_request = bool(re.search(
+                r"\b(?:summari[sz]e|summary|overview)\b.*\b(?:my|these|added|uploaded)\s+(?:sources|files|documents)\b",
+                q, re.IGNORECASE,
+            ))
+            has_local_sources = (
+                self.allow_actions and self.media_db is not None
+                and bool(getattr(self.media_db, "file_count", 0))
+            )
+            casual = is_smalltalk(q)
+            explicit_web = bool(re.search(r"\b(?:online|web|internet|latest|news)\b", q, re.IGNORECASE))
+            mine = await self._user_sources(q) if has_local_sources and cmd is None and not casual and not attachments and not summary_request and not explicit_web else []
+            local_context_request = bool(has_local_sources and cmd is None and not explicit_web
+                                         and not casual and not attachments and not looks_agentic(q))
             if cmd is None and not attachments and self.allow_actions and decision.intent == "control" and not is_research(q):
                 cmd = await parse_natural_intent_llm(
                     q,
@@ -433,19 +450,29 @@ class AgentRuntime:
                 on_text(msg, True)
                 return TurnResult(text=msg, kind="command")
 
-            result = await self._run_command(cmd, q, on_status, on_text, trace=trace) if cmd is not None else None
+            if summary_request and self.allow_actions and not attachments:
+                result = await self._summarize_sources(q, on_status, on_text)
+            else:
+                result = await self._run_command(cmd, q, on_status, on_text, trace=trace) if cmd is not None else None
             if result is not None:
                 pass
-            elif (
+            elif local_context_request and (mode in ("standard", "deep", "deep_with_refinement")
+                    or re.search(r"\b(?:fact[- ]?check|verif(?:y|ied|ication))\b", q, re.IGNORECASE)):
+                result = await self._run_research(q, on_status, on_text, mode or "standard",
+                                                  trace=trace, decision=decision, local_sources=mine, answer_depth=answer_depth)
+            elif not casual and not local_context_request and (
                 is_research(q)
                 or (is_deep(q) and len(q.split()) >= 5)
                 or (skill and skill.agent == "research")
-                or (decision.intent == "research" and decision.topic_type in ("scholarly", "biomedical", "physics_astro"))
+                or (decision.intent == "research" and not local_context_request and not (
+                    self.allow_actions and (looks_agentic(q) or (skill and skill.agent in ("workspace_code", "artifact_studio")))
+                ))
             ):
                 trace.record("research", f"Multi-source retrieval (topic={decision.topic_type})")
-                skill_mode = skill.default_depth if skill and skill.default_depth in ("quick", "deep", "deep_with_refinement") else None
-                run_mode = mode or skill_mode or ("deep" if (is_deep(q) or decision.run_mode == "deep") else "standard")
-                result = await self._run_research(q, on_status, on_text, run_mode, trace=trace, decision=decision)
+                skill_mode = skill.default_depth if self.active_skill and skill and skill.default_depth in ("quick", "deep", "deep_with_refinement") else None
+                explicit_verify = bool(re.search(r"\b(?:fact[- ]?check|verif(?:y|ied|ication)|double[- ]?check)\b", q, re.IGNORECASE))
+                run_mode = mode or skill_mode or ("deep" if is_deep(q) else "standard" if explicit_verify else "quick")
+                result = await self._run_research(q, on_status, on_text, run_mode, trace=trace, decision=decision, answer_depth=answer_depth)
             elif self.allow_actions and (
                 looks_agentic(q)
                 or self._mentions_mcp(q)
@@ -463,7 +490,8 @@ class AgentRuntime:
                 if route_id != "chat":
                     trace.record(route_id, "Contextual synthesis")
                 result = await self._run_chat(
-                    q, on_text, images=images_b64, attachment_context=attachment_context, trace=trace
+                    q, on_text, images=images_b64, attachment_context=attachment_context, trace=trace,
+                    user_sources=mine, require_sources=local_context_request,
                 )
         except EngineUnavailable as exc:
             logger.warning("Engine unavailable: %s", exc)
@@ -472,7 +500,7 @@ class AgentRuntime:
         except Exception as exc:
             if type(exc).__name__ == "JobAborted" or "JobAborted" in str(type(exc)):
                 logger.info("Turn cancelled by user stop: %s", exc)
-                return TurnResult(text="User stopped Task.", kind="command")
+                raise  # Keep cancellation/preemption distinct from a completed job.
             logger.exception("Turn failed")
             msg = "Something went wrong on my side. Try that again in a moment."
             return TurnResult(text=msg, kind="error", failure=f"{type(exc).__name__}: {exc}")
@@ -533,7 +561,8 @@ class AgentRuntime:
         if depth and depth.lower() in ("eli5", "simple", "standard", "detailed", "expert") and self.last_raw_sources and text.lower().startswith("rewrite"):
             res = await self._do_rewrite_depth(depth, lambda _s: None, _on_job_text)
         else:
-            res = await self.run_turn(text, lambda _s: None, _on_job_text, mode=effective_mode, should_abort=should_abort)
+            res = await self.run_turn(text, lambda _s: None, _on_job_text, mode=effective_mode,
+                                      should_abort=should_abort, answer_depth=depth)
         if res.failure and res.kind == "error":
             raise RuntimeError(res.failure)
         return {"answer": res.text, "sources": res.sources, "verification": res.meta, "kind": res.kind, "run_mode": effective_mode}
@@ -545,13 +574,13 @@ class AgentRuntime:
             reason = KillSwitch.get_global().halt_reason or "Emergency kill switch activated"
             exc = getattr(self, "_abort_exc", None)
             if exc is None:
-                from lora.agent.jobs import JobAborted as exc
+                from lora.agent.jobs import JobAborted as exc  # noqa: N813 - local exception type
             raise exc(reason)
         reason = self._should_abort()
         if reason:
             exc = getattr(self, "_abort_exc", None)
             if exc is None:
-                from lora.agent.jobs import JobAborted as exc
+                from lora.agent.jobs import JobAborted as exc  # noqa: N813 - local exception type
             raise exc(reason)
 
     # ----------------------------------------------------------------- model
@@ -603,11 +632,12 @@ class AgentRuntime:
         self.last_model_used = chosen
         logger.info("Model (%s): %s (options=%s think=%s)", role, chosen, opts, plan.think)
         text = ""
-        async for delta in client.stream_chat(
+        async with aclosing(client.stream_chat(
             chosen, messages, options=opts, think=plan.think, keep_alive=keep_alive or plan.keep_alive
-        ):
-            self._check_abort()
-            text += delta
+        )) as stream:
+            async for delta in stream:
+                self._check_abort()
+                text += delta
         return strip_think(text)
 
     async def _stream(
@@ -627,14 +657,15 @@ class AgentRuntime:
         answer = ""
         for attempt in range(2):
             try:
-                async for delta in client.stream_chat(
+                async with aclosing(client.stream_chat(
                     chosen_model, messages, options=plan.options, think=plan.think, keep_alive=plan.keep_alive
-                ):
-                    self._check_abort()
-                    answer += delta
-                    shown = strip_think(answer, streaming=True)
-                    if shown:
-                        on_text(shown, speak)
+                )) as stream:
+                    async for delta in stream:
+                        self._check_abort()
+                        answer += delta
+                        shown = strip_think(answer, streaming=True)
+                        if shown:
+                            on_text(shown, speak)
                 if strip_think(answer):
                     break
                 if attempt == 0 and not self.manual_model:
@@ -648,6 +679,8 @@ class AgentRuntime:
                         continue
                 break
             except Exception as exc:
+                if type(exc).__name__ == "JobAborted":
+                    raise
                 if answer or attempt == 1:
                     raise EngineUnavailable(str(exc)) from exc
                 logger.info("Stream failed before first token, retrying: %s", exc)
@@ -660,6 +693,8 @@ class AgentRuntime:
     # ------------------------------------------------------------ your own sources
     async def _user_sources(self, q: str, start_index: int = 1) -> list[Source]:
         """Passages from the files the user added under 'Add sources' that are relevant to this question."""
+        if not self.allow_actions:
+            return []  # Mobile must never consult even an already-indexed local file.
         db = self.media_db
         if db is None or not getattr(db, "file_count", 0):
             return []
@@ -673,6 +708,8 @@ class AgentRuntime:
             n = start_index + len(out)
             name = h.get("filename", "your file")
             page = f", page {h['page_number']}" if h.get("page_number") else ""
+            if h.get("section"):
+                page += f", section: {h['section']}"
             out.append(Source(f"S{n}", f"Your file: {name}{page}", "", text=str(h.get("text", ""))[:2200]))
         return out
 
@@ -684,19 +721,21 @@ class AgentRuntime:
         images: list[str] | None = None,
         attachment_context: str = "",
         trace: AgentExecutionTrace | None = None,
+        user_sources: list[Source] | None = None,
+        require_sources: bool = False,
     ) -> TurnResult:
-        from lora.models.selection import is_complex_query
-
         if images:
             role = "vision"
-        elif is_complex_query(q) or len(attachment_context) > 400:
-            role = "complex"
         else:
             role = "writer"
         if trace and role in ("vision", "complex"):
             trace.escalated = True
 
-        mine = await self._user_sources(q)
+        mine = user_sources if user_sources is not None else await self._user_sources(q)
+        if require_sources and not mine:
+            text = "I couldn't find a relevant passage in your added sources. Try naming the document or giving me a little more detail."
+            on_text(text, True)
+            return TurnResult(text=text, kind="chat", meta={"retrieval": "local", "verdict": "unchecked"})
         if mine:
             self.last_raw_sources = list(mine)
             block = "\n\n".join(f"[{s.id}] {s.title}\n{s.text}" for s in mine)
@@ -705,15 +744,13 @@ class AgentRuntime:
             msgs = build_research_messages(q, block, self.history, **self._persona_kwargs(q))
             if images:
                 msgs[-1]["images"] = images
-            text = await self._stream(msgs, on_text, role=role)
-            ver = await verify_answer(text, mine, llm=None)
-            meta: dict[str, Any] = {
-                "checked": ver.for_ui(),
-                "verification_loop": build_verification_dropdown_meta(ver=ver, baseline_score=ver.score, final_score=ver.score),
-            }
+            text = await self._stream(msgs, on_text, speak=False, role=role)
+            on_text(text, True)
+            meta = source_metadata(text, mine)
+            meta["retrieval"] = "local"
             return TurnResult(
                 text=text,
-                sources=[{"id": s.id, "title": s.title, "url": "", "domain": "your files"} for s in mine],
+                sources=[{"id": s.id, "title": s.title, "url": "", "domain": "your files", "quote": s.text[:600]} for s in mine],
                 kind="chat",
                 meta=meta,
             )
@@ -729,25 +766,6 @@ class AgentRuntime:
         return TurnResult(text=text, kind="chat")
 
     # -------------------------------------------------------------- research
-    @staticmethod
-    def _footnote(ver: Any) -> str:
-        if not ver.unverified:
-            return ""
-        shown = "; ".join(c if len(c) <= 140 else c[:137] + "…" for c in ver.unverified[:3])
-        return f"\n\n---\n*I couldn't confirm this in the sources: {shown}*"
-
-    def _rewarm(self, client: Any, plan: Any) -> None:
-        """After the second-opinion model was loaded, bring the main model back in the background."""
-        import threading
-
-        def _go() -> None:
-            try:
-                asyncio.run(client.warm_up(plan.model, options=plan.options, keep_alive=plan.keep_alive))
-            except Exception:
-                pass
-
-        threading.Thread(target=_go, daemon=True).start()
-
     def _emit_verification_preview(self, meta: dict[str, Any], trace: AgentExecutionTrace | None = None) -> None:
         if trace:
             meta.setdefault("agent_trace", trace.to_meta())
@@ -765,23 +783,25 @@ class AgentRuntime:
         run_mode: str = "standard",
         trace: AgentExecutionTrace | None = None,
         decision: LayaDecision | None = None,
+        local_sources: list[Source] | None = None,
+        answer_depth: str | None = None,
     ) -> TurnResult:
-        if run_mode == "quick":
-            return await self._run_chat(q, on_text, trace=trace)
         deep = run_mode in ("deep", "deep_with_refinement")
+        started = time.perf_counter()
         if self._research_fn is None:
             from lora.agent.research import research as _research
 
             self._research_fn = _research
-        # Always use 8k-capped writer plan with one fixed num_ctx=8192 across planner, writer, and verifier
+        # Keep the writer resident throughout research.
         plan_pair = await self._plan(role="writer")
         on_status("Planning the search…")
-        rplan: ResearchPlan = await make_plan(
+        rplan: ResearchPlan = ResearchPlan(question=q, queries=[]) if local_sources is not None else await make_plan(
             lambda msgs: self._collect(msgs, plan_pair=plan_pair, role="planner"),
             q,
             self.history.messages(),
         )
         logger.info("Prompt engineer: %r -> question=%r queries=%s", q, rplan.question, rplan.queries)
+        sig_params = {}
         try:
             sig_params = inspect.signature(self._research_fn).parameters
             takes_queries = "queries" in sig_params
@@ -794,19 +814,26 @@ class AgentRuntime:
             r_kwargs["queries"] = rplan.queries
         if takes_topic and decision is not None:
             r_kwargs["topic_type"] = decision.topic_type
-        found = await self._research_fn(rplan.question, on_status, **r_kwargs)
+        if "embedding_engine" in sig_params and self.embedding_engine is not None:
+            r_kwargs["embedding_engine"] = self.embedding_engine
+        from lora.agent.research import ResearchResult
+        planned_at = time.perf_counter()
+        found = ResearchResult(q, list(local_sources)) if local_sources is not None else await self._research_fn(rplan.question, on_status, **r_kwargs)
+        quarantine_count = getattr(found, "quarantined_sources", 0)
         self._check_abort()
-        mine = await self._user_sources(rplan.question, start_index=len(found.sources) + 1)
-        found.sources = list(found.sources) + mine
+        # Local questions already pass their own sources. Never append arbitrary
+        # local matches to a web search, including files added while it runs.
+        found.sources = list(found.sources)
+        retrieved_at = time.perf_counter()
         self.last_raw_sources = list(found.sources)
         if not found.sources:
-            on_status("No verified sources found; abstaining from ungrounded answer.")
+            on_status("No usable sources found.")
             refusal = (
-                "I could not find verified sources to substantiate this query. "
+                "I could not find usable sources to substantiate this query. "
                 "To prevent ungrounded claims or hallucinations, I am abstaining from generating an answer. "
                 "Please provide relevant reference documents or refine your search query."
             )
-            on_text(refusal)
+            on_text(refusal, False)
             return TurnResult(
                 text=refusal,
                 sources=[],
@@ -814,9 +841,8 @@ class AgentRuntime:
                 meta={"verdict": "abstain", "score": 0.0, "reason": "empty_sources", "stages": []},
             )
 
-        client, plan = plan_pair
         sources_ui = [
-            {"id": s.id, "title": s.title, "url": s.url, "domain": s.domain or "your files"} for s in found.sources
+            {"id": s.id, "title": s.title, "url": s.url, "domain": s.domain or "your files", "tier": s.tier, "is_preprint": s.is_preprint, "quote": (s.text or s.snippet)[:600]} for s in found.sources
         ]
         if hasattr(self, "on_sources") and callable(self.on_sources):
             try:
@@ -824,190 +850,102 @@ class AgentRuntime:
             except Exception:
                 pass
         on_status("Writing it up…")
-        msgs = build_research_messages(rplan.question, found.prompt_block(), self.history, **self._persona_kwargs(q))
-        draft = await self._stream(msgs, on_text, speak=not deep, plan_pair=plan_pair)
+        kwargs = self._persona_kwargs(q)
+        if answer_depth in ("eli5", "simple", "standard", "detailed", "expert"):
+            kwargs["addon"] += f"\nRequested answer style: {answer_depth}. Match the explanation to this style."
+        expanded = deep or answer_depth in ("detailed", "expert")
+        msgs = build_research_messages(rplan.question, found.prompt_block(), self.history,
+                                       concise=False if expanded else None, **kwargs)
+        draft = await self._stream(msgs, on_text, speak=False, plan_pair=plan_pair)
+        written_at = time.perf_counter()
         self._check_abort()
 
-        if trace:
-            trace.record("critic_verifier", "Running 8-stage verification (V1-V8)")
-        on_status("Checking the facts…")
-        # Use the already-loaded writer model for fast inline V4 claim probes so we do not trigger
-        # an extra VRAM model swap before the Deep Mode second-opinion judge step.
-        verifier_model = plan.model
-        ver_llm = VerifierLLM(client, verifier_model, plan.options, max_calls=2)
-        ver = await verify_answer(draft, found.sources, ver_llm)
-        baseline_score = ver.score
-        meta: dict[str, Any] = {"checked": ver.for_ui()}
-        text = draft
-        iterations_log: list[dict[str, Any]] | None = None
-        table: dict[str, Any] | None = None
-
-        # Push initial 8-Way Verification Scorecard immediately so the user sees it right after the draft finishes
-        meta["verification_loop"] = build_verification_dropdown_meta(
-            ver=ver,
-            baseline_score=baseline_score,
-            final_score=ver.score,
-            iterations=None,
-            roundtable_info=None,
-        )
+        # A research answer stays on the warm writer. Citation integrity is a
+        # structural check, never a factual confidence score or a repair loop.
+        meta = source_metadata(draft, found.sources)
+        meta["run_mode"] = run_mode
+        if quarantine_count:
+            draft += f"\n\n{quarantine_count} sources containing embedded instructions were excluded."
+        meta["timings"] = {
+            "planning": round(planned_at - started, 3),
+            "retrieval": round(retrieved_at - planned_at, 3),
+            "writing": round(written_at - retrieved_at, 3),
+            "reference_check": round(time.perf_counter() - written_at, 3),
+            "retrieval_stages": getattr(found, "timings", {}),
+        }
+        logger.info("Research timings (seconds): %s", meta["timings"])
         self._emit_verification_preview(meta, trace)
-
-        async def verify_fn(t: str):
-            return await verify_answer(t, found.sources, VerifierLLM(client, verifier_model, plan.options, max_calls=2))
-
-        async def rewrite_fn(current: str, feedback: str) -> str:
-            return await self._collect(
-                build_revise_messages(rplan.question, found.prompt_block(), current, feedback),
-                plan_pair,
-            )
-
-        if not deep and ver.total and not ver.clean:
-            on_status("Fixing what I couldn't confirm…")
-            fixed = await refine(
-                draft, rplan.question, found.sources, verify_fn, rewrite_fn, [], status=on_status,
-                max_rounds=1, budget_s=35.0,
-            )
-            iterations_log = fixed.iterations
-            if fixed.improved:
-                text, ver = fixed.text, fixed.verification
-                meta["checked"], meta["improved"], meta["rounds"] = ver.for_ui(), True, fixed.rounds
-                on_text(text, False)
-            else:
-                meta["rounds"] = fixed.rounds
-
-        if deep:
-            self._check_abort()
-            installed = await client.installed_models()
-            judge, independent = pick_judge_model(installed, plan.model)
-            on_status("Getting a second opinion…")
-            opinion_timeout = float(os.environ.get("LORA_OPINION_TIMEOUT", "180.0"))
-            judge_opts = {"num_ctx": 4096, "temperature": 0.2} if independent else {"temperature": 0.2}
-            try:
-                raw = await asyncio.wait_for(
-                    self._collect(
-                        [{"role": "user", "content": opinion_prompt(rplan.question, draft, found.prompt_block())}],
-                        plan_pair,
-                        model=judge,
-                        keep_alive="5m",
-                        role="verifier",
-                        options_override=judge_opts,
-                    ),
-                    timeout=opinion_timeout,
-                )
-                parsed = parse_opinion(raw)
-                opinion = Opinion(parsed.issues, parsed.verdict, independent, timed_out=False)
-            except Exception as exc:
-                logger.warning("Second opinion unavailable or timed out: %s", exc)
-                opinion = Opinion(
-                    issues=[f"Second-opinion model ({judge}) timed out or was unavailable."],
-                    verdict="timeout",
-                    independent=False,
-                    timed_out=True,
-                    error=str(exc) or "timeout",
-                )
-            logger.info(
-                "Second opinion from %s (independent=%s, verdict=%s, timed_out=%s): %s",
-                judge,
-                opinion.independent,
-                opinion.verdict,
-                opinion.timed_out,
-                opinion.issues,
-            )
-            table = roundtable(draft, ver, found.sources, plan.model, judge, opinion)
-            meta["roundtable"] = table
-            self._check_abort()
-            if (table["decision"] != "approve" or not ver.clean) and run_mode in ("deep", "deep_with_refinement"):
-                result = await refine(
-                    draft, rplan.question, found.sources, verify_fn, rewrite_fn, table["changes"], status=on_status,
-                    max_rounds=2, budget_s=45.0,
-                )
-                text, ver = result.text, result.verification
-                iterations_log = result.iterations
-                meta["checked"] = ver.for_ui()
-                meta["improved"] = result.improved
-                meta["rounds"] = result.rounds
-            if independent:
-                self._rewarm(client, plan)
-            on_text(text, False)
-
-        # Run Supervisor Checkpoints (PlanReviewer, EvidenceReviewer, AnswerReviewer) and record in meta
-        try:
-            from lora.supervisor.checkpoints import AnswerReviewer, EvidenceReviewer, PlanReviewer
-            from lora.supervisor.state import EvidenceSummary, SupervisorState
-
-            sup_state = SupervisorState(
-                task_id="research-turn",
-                query=rplan.question,
-                origin="desktop" if self.allow_actions else "mobile",
-                evidence=EvidenceSummary(
-                    card_count=len(found.sources),
-                    independent_domains=len({s.domain for s in found.sources if s.domain}),
-                    has_t1_or_t2=True,
-                ),
-                draft_answer=text,
-                verification_score=ver.score,
-                unverified_claims=list(ver.unverified),
-            )
-            plan_rev = PlanReviewer().review(sup_state)
-            ev_rev = EvidenceReviewer().review(sup_state)
-            ans_rev = AnswerReviewer(threshold=0.80).review(sup_state)
-            meta["supervisor_checkpoints"] = {
-                "plan_approved": plan_rev.approved,
-                "evidence_sufficient": ev_rev.sufficient,
-                "answer_approved": ans_rev.approved,
-                "action": ans_rev.action,
-            }
-            if trace:
-                trace.record("supervisor", f"Checkpoints: plan={plan_rev.approved}, ev={ev_rev.sufficient}, ans={ans_rev.action}")
-        except Exception as exc:
-            logger.debug("Supervisor checkpoint review skipped: %s", exc)
-
-        # When run_mode == "deep_with_refinement", run formal RSIEngine outer loop (PromptGenome evolution + rollback)
-        if run_mode == "deep_with_refinement":
-            try:
-                on_status("Evolving prompts via outer loop refinement…")
-                rsi_res = await self.run_rsi_outer_loop(
-                    rplan.question,
-                    found.sources,
-                    max_iters=2,
-                )
-                if rsi_res.get("best_answer") and rsi_res.get("best_score", 0.0) >= baseline_score:
-                    text = rsi_res["best_answer"]
-                    logger.info(
-                        "RSI outer loop adopted improved draft: baseline=%.2f best=%.2f net_improvement=%.2f (genome v%s)",
-                        rsi_res.get("baseline_score", 0.0),
-                        rsi_res.get("best_score", 0.0),
-                        rsi_res.get("net_improvement", 0.0),
-                        rsi_res.get("genome_version", 0),
-                    )
-                else:
-                    logger.info("RSI outer loop: candidate did not beat baseline; rolling back to initial draft.")
-                meta["rsi_outer_loop"] = rsi_res
-            except Exception as exc:
-                logger.warning("RSI outer loop refinement skipped/failed: %s", exc)
-
-        meta["verification_loop"] = build_verification_dropdown_meta(
-            ver=ver,
-            baseline_score=baseline_score,
-            final_score=ver.score,
-            iterations=iterations_log,
-            roundtable_info=table,
-        )
-        self._emit_verification_preview(meta, trace)
-
-        text += self._footnote(ver)
-        if deep:
-            on_text(text, False)
-        sources_ui = [
-            {"id": s.id, "title": s.title, "url": s.url, "domain": s.domain or "your files"} for s in found.sources
-        ]
+        on_text(draft, False)
         spoken = None
         if deep:
             from lora.voice.speech_stream import split_complete
 
-            first = split_complete(strip_footnote(text) + " ")[0][:2]
-            spoken = " ".join(first) or None
-        return TurnResult(text=text, sources=sources_ui, kind="research", meta=meta, spoken=spoken)
+            spoken = " ".join(split_complete(draft + " ")[0][:2]) or None
+        return TurnResult(text=draft, sources=sources_ui, kind="research", meta=meta, spoken=spoken)
+
+    async def _summarize_sources(self, question: str, on_status: Callable[[str], None], on_text: TextCb) -> TurnResult:
+        """Summarize document-order batches, including later sections, without browsing."""
+        if self.media_db is None or not self.media_db.file_count:
+            text = "Add a document under Sources first, then I can summarize it."
+            on_text(text, True)
+            return TurnResult(text=text, kind="chat")
+        on_status("Reading your documents.")
+        snapshot = await asyncio.to_thread(self.media_db.summary_batches)
+        batches = snapshot["batches"]
+        if not batches:
+            text = "Your sources contain no readable text to summarize."
+            on_text(text, False)
+            return TurnResult(text=text, kind="chat")
+        plan_pair = await self._plan(role="writer")
+        sources = {}
+        for batch in batches:
+            sources.setdefault(batch["id"], Source(batch["id"], batch["title"], "", text=batch["text"]))
+        self.last_raw_sources = list(sources.values())
+        instruction = (question + "\nSummarize the actual content: central ideas, arguments, examples, and conclusions. "
+                       "Distinguish the author's opinions from established facts. Keep each file identifiable and cite it. "
+                       "Do not return index statistics or a list of sample quotations.")
+        notes = []
+        for i, batch in enumerate(batches, 1):
+            self._check_abort()
+            on_status(f"Summarizing your sources: {i}/{len(batches)} sections.")
+            block = f"[{batch['id']}] {batch['title']}\n{batch['text']}"
+            messages = build_research_messages(
+                instruction if len(batches) == 1 else instruction + "\nThis is one document section. Capture its points in at most 180 words.",
+                block, ConversationHistory(), concise=False, **self._persona_kwargs(question),
+            )
+            if len(batches) == 1:
+                answer = await self._stream(messages, on_text, speak=False, plan_pair=plan_pair)
+            else:
+                note = await self._collect(messages, plan_pair=plan_pair)
+                notes.append(f"[{batch['id']}] {batch['title']}\n{note[:3000]}")
+        # Reduce bounded groups so large collections cannot overflow the fixed
+        # writer window. Every section contributes; avoid sampling just the lead.
+        while sum(map(len, notes)) > 11000:
+            reduced = []
+            for start in range(0, len(notes), 3):
+                self._check_abort()
+                messages = build_research_messages(
+                    "Combine these section notes in at most 180 words. Preserve conclusions, caveats and source IDs.",
+                    "\n\n".join(notes[start:start + 3]), ConversationHistory(), concise=False,
+                )
+                reduced.append((await self._collect(messages, plan_pair=plan_pair))[:3000])
+            notes = reduced
+        if len(batches) > 1:
+            on_status("Bringing the document summaries together.")
+            messages = build_research_messages(instruction, "\n\n".join(notes), ConversationHistory(),
+                                               concise=False, **self._persona_kwargs(question))
+            answer = await self._stream(messages, on_text, speak=False, plan_pair=plan_pair)
+        if snapshot["partial"]:
+            answer += (f"\n\nThis summary covers {snapshot['included_chunks']} of {snapshot['total_chunks']} indexed passages. "
+                       "The collection exceeded this turn's limit; ask about a specific document for more detail.")
+        meta = source_metadata(answer, sources.values())
+        meta.update({"retrieval": "local", "summary_coverage": {
+            key: snapshot[key] for key in ("included_chunks", "total_chunks", "partial")
+        }})
+        on_text(answer, False)
+        ui_sources = [{"id": source.id, "title": source.title, "url": "", "quote": source.text[:600]}
+                      for source in sources.values()]
+        return TurnResult(text=answer, sources=ui_sources, kind="research", meta=meta)
 
     async def run_rsi_outer_loop(
         self,
@@ -1017,7 +955,13 @@ class AgentRuntime:
     ) -> dict[str, Any]:
         """Run the formal Phase 10 RSIEngine (PromptGenome evolution + rollback) over retrieved sources."""
         import tempfile
-        from lora.outer_loop.genome import EditValidator, GenomeRegistry, PromptGenome, TemplateCompiler
+
+        from lora.outer_loop.genome import (
+            EditValidator,
+            GenomeRegistry,
+            PromptGenome,
+            TemplateCompiler,
+        )
         from lora.outer_loop.loop import RSIEngine
         from lora.outer_loop.optimizer import PromptOptimizerAgent
         from lora.outer_loop.scorer import OuterLoopScorer
@@ -1041,34 +985,53 @@ class AgentRuntime:
             scorer=OuterLoopScorer(),
             max_iters=max_iters,
         )
+        import threading
+
+        from lora.agent.jobs import JobAborted
+        from lora.agent.turns import TurnHandle, run_coroutine, run_owned_thread
+
         loop = asyncio.get_running_loop()
+        stopped = threading.Event()
+        child_lock = threading.Lock()
+        active_child = [None]
+        parent_abort = self._should_abort
+
+        def call_owned(factory):
+            child = TurnHandle()
+            with child_lock:
+                if stopped.is_set() or parent_abort():
+                    raise JobAborted("cancelled")
+                active_child[0] = child
+            try:
+                return run_coroutine(loop, factory(), 60.0, child)
+            finally:
+                with child_lock:
+                    if active_child[0] is child:
+                        active_child[0] = None
+
+        def stop_refinement():
+            stopped.set()
+            with child_lock:
+                child = active_child[0]
+            if child is not None:
+                child.cancel()
 
         def synth_sync(compiled_prompt: str) -> str:
-            fut = asyncio.run_coroutine_threadsafe(
-                self._collect([{"role": "user", "content": compiled_prompt}], (client, plan)),
-                loop,
-            )
-            return fut.result(timeout=60.0)
+            return call_owned(lambda: self._collect(
+                [{"role": "user", "content": compiled_prompt}], (client, plan)
+            ))
 
         def verify_sync(ans: str) -> dict[str, Any]:
-            fut = asyncio.run_coroutine_threadsafe(
-                verify_answer(ans, sources, VerifierLLM(client, verifier_model, plan.options)),
-                loop,
-            )
-            v = fut.result(timeout=60.0)
+            v = call_owned(lambda: verify_answer(ans, sources, VerifierLLM(client, verifier_model, plan.options)))
             return {
                 "composite_faithfulness_score": v.score,
                 "supported_claims_ratio": (v.supported / v.total) if v.total else 0.0,
                 "unverified_critical_claims": v.unverified,
             }
 
-        traj = await asyncio.to_thread(
-            engine.run,
-            base_genome,
-            question,
-            cards,
-            synth_sync,
-            verify_sync,
+        traj = await run_owned_thread(
+            engine.run, base_genome, question, cards, synth_sync, verify_sync,
+            on_cancel=stop_refinement,
         )
         return {
             "best_answer": traj.best_answer,
@@ -1090,10 +1053,20 @@ class AgentRuntime:
 
     async def _tool_with_provenance(self, name: str, params: dict[str, Any], prov: dict[str, Any]) -> dict[str, Any]:
         reg = self._get_registry()
-        return await reg.aexecute(name, dict(params), origin="desktop", provenance=prov)
+        from lora.gateway.gating import get_allowed_tools_for_origin
+        origin = "desktop" if self.allow_actions else "mobile"
+        if name not in get_allowed_tools_for_origin(origin):
+            return {"status": "denied", "reason": "Tool excluded from this origin's graph"}
+        if name in {"create_note", "export_report", "ask_other_ai"}:
+            import json
+            if not await self.confirm(f"Allow {name}?\n\n{json.dumps(params, ensure_ascii=False, indent=2)}"):
+                return {"status": "denied", "reason": "User confirmation required"}
+            return await reg.aexecute(name, dict(params), origin=origin, provenance=prov, confirmed=True)
+        return await reg.aexecute(name, dict(params), origin=origin, provenance=prov)
 
     async def _web_search_tool(self, query: str) -> dict[str, Any]:
         import httpx
+
         from lora.agent.research import HEADERS, search_with_report
 
         async with async_client(HEADERS, httpx.Timeout(12.0, connect=6.0)) as client:
@@ -1103,7 +1076,6 @@ class AgentRuntime:
         return {"status": "success", "text": "\n".join(f"{h.title} — {h.url}\n  {h.snippet}" for h in hits)}
 
     async def _fetch_page_tool(self, url: str) -> dict[str, Any]:
-        import httpx
         from lora.agent.research import HEADERS, fetch_text
 
         async with async_client(HEADERS, 15.0) as client:
@@ -1156,9 +1128,18 @@ class AgentRuntime:
             label, pattern = typer.validate(text, target)
         except TypingRefused as exc:
             return str(exc)
-        preview = text if len(text) <= 300 else text[:297] + "…"
+        preview = text
         if not await self.confirm(f"Type this into {label}?\n\n{preview}"):
             return "Okay, I won't type anything."
+        from lora.safety.policy import ActionRiskTier
+        gated = reg.action_gate.verify_and_gate(
+            tool="type_text", origin="desktop", tier=ActionRiskTier.TIER1,
+            params={"editor": label, "text": text},
+            provenance={"editor": DataProvenance.USER, "text": DataProvenance.USER},
+        )
+        if not gated.allowed:
+            return f"I couldn't type that: {gated.reason}"
+        self._check_abort()
         import re as _re
 
         def has_window() -> bool:
@@ -1173,7 +1154,7 @@ class AgentRuntime:
                 if has_window():
                     break
         try:
-            res = await asyncio.to_thread(typer.type_text, text, target)
+            res = await asyncio.to_thread(typer.type_text, text, target, confirmed=True)
         except TypingRefused as exc:
             return str(exc)
         except Exception as exc:
@@ -1213,13 +1194,10 @@ class AgentRuntime:
             cards = cards_from_sources(self.last_raw_sources)
             prompt = DepthPromptBuilder().build_prompt(self.last_question or "Summarize these sources", cards, depth=depth)
             msgs = [{"role": "user", "content": prompt}]
-            draft = await self._stream(msgs, on_text, speak=True)
-            ver = await verify_answer(draft, self.last_raw_sources, llm=None)
-            meta: dict[str, Any] = {
-                "checked": ver.for_ui(),
-                "verification_loop": build_verification_dropdown_meta(ver=ver, baseline_score=ver.score, final_score=ver.score),
-            }
+            draft = await self._stream(msgs, on_text, speak=False)
+            meta = source_metadata(draft, self.last_raw_sources)
             self._emit_verification_preview(meta, trace)
+            on_text(draft, False)
             return TurnResult(text=draft, sources=self.last_sources, kind="research", meta=meta)
 
         msgs = build_messages(
@@ -1266,6 +1244,14 @@ class AgentRuntime:
     ) -> TurnResult | None:
         if trace:
             trace.record("system_navigator", f"Command: {cmd.kind} ({cmd.target or cmd.args})")
+        # Exact typed/parser commands already carry explicit user intent. Voice
+        # uncertainty is confirmed before submission; tools still enforce policy.
+        # Uncalibrated Laya scores must not disable ordinary allowlisted opening.
+        if cmd.kind in {"open", "google", "site_search", "focus_window"} and parse_command(q) is None and self.last_laya_decision and self.last_laya_decision.needs_confirmation:
+            if not await self.confirm(f"Did you mean this desktop command?\n\n{q}"):
+                text = "Desktop command cancelled; confirmation is required."
+                on_text(text, True)
+                return TurnResult(text=text, kind="command")
         if cmd.kind == "open":
             text = await self._do_open(cmd.target, cmd.args.get("verb", "open"))
             if text is None:
@@ -1273,7 +1259,7 @@ class AgentRuntime:
         elif cmd.kind == "sleep":
             if callable(self.on_power_command):
                 self.on_power_command("sleep")
-            text = "Going to sleep. Say \"Awaken LORA\" or tap the droplet when you need me."
+            text = "Going to sleep. Use the hotkey or tap the droplet when you need me."
             on_text(text, True)
             return TurnResult(text=text, kind="command", meta={"power_action": "sleep"})
         elif cmd.kind == "turn_off":
@@ -1332,7 +1318,7 @@ class AgentRuntime:
             )
         elif cmd.kind == "list_dir":
             text = await self._do_list(cmd.target)
-        elif cmd.kind == "type_into":
+        elif cmd.kind in {"type_into", "deferred_typing"}:
             text = await self._do_type(cmd.args["text"], cmd.target)
         elif cmd.kind == "site_search":
             text = await self._do_site_search(cmd.target, cmd.args["query"])
@@ -1355,6 +1341,7 @@ class AgentRuntime:
             text = "I'm not sure how to do that yet."
         on_text(text, True)
         return TurnResult(text=text, kind="command")
+
 
     async def _do_open(self, target: str, verb: str = "open") -> str | None:
         reg = self._get_registry()
@@ -1474,7 +1461,6 @@ class AgentRuntime:
         from lora.agent.research import fetch_text
 
         on_status("Reading the page…")
-        import httpx
 
         async with async_client({"User-Agent": "Mozilla/5.0 LORA"}, 15.0) as client:
             text = await fetch_text(url, client)
@@ -1489,9 +1475,13 @@ class AgentRuntime:
             self.history,
             self._profile_fn(),
         )
-        summary = await self._stream(msgs, on_text)
+        msgs[-1]["content"] += "\nCite every factual sentence with [S1]."
+        summary = await self._collect(msgs, role="writer")
+        source = Source("S1", url, url, text=text)
+        meta = source_metadata(summary, [source])
+        on_text(summary, False)
         src = {"id": "S1", "title": url, "url": url, "domain": (urlparse(url).hostname or "").removeprefix("www.")}
-        return TurnResult(text=summary, sources=[src], kind="research")
+        return TurnResult(text=summary, sources=[src], kind="research", meta=meta)
 
     async def _do_list(self, target: str) -> str:
         folder = resolve_folder(target)
@@ -1625,15 +1615,13 @@ class AgentRuntime:
         service = cmd.args["service"]
         pretty = {"chatgpt": "ChatGPT", "claude": "Claude", "gemini": "Gemini", "perplexity": "Perplexity"}[service]
         raw_prompt = cmd.args["prompt"]
-        # v1.5 Plan §4.9: Tier 2 user confirmation before sending prompts to external web AIs
-        if self.confirm is not _deny:
-            preview = raw_prompt if len(raw_prompt) <= 240 else raw_prompt[:237] + "…"
-            if not await self.confirm(f"Send this prompt to {pretty}?\n\n{preview}"):
-                msg = f"Okay, I won't send anything to {pretty}."
-                on_text(msg, True)
-                return TurnResult(text=msg, kind="command")
         simple = is_simple_prompt(raw_prompt)
         on_status(f"Asking {pretty}…" if simple else f"Engineering prompt for {pretty}…")
+        from lora.agent.prompt_optimizer import PromptOptimizerAgent
+        from lora.models.ollama_client import OllamaClient
+        optimizer = PromptOptimizerAgent(ollama_client=OllamaClient(self.ollama_url))
+        optimized = await optimizer.optimize(raw_prompt, target_ai=service, style="auto", deep=not simple)
+        outgoing, _ = optimizer.scrubber.scrub(optimized.optimized_prompt)
         reg = self._get_registry()
         try:
             reg.browser_driver.headless = False
@@ -1643,10 +1631,10 @@ class AgentRuntime:
             "ask_other_ai",
             {
                 "service": service,
-                "prompt": raw_prompt,
-                "optimize_prompt": True,
+                "prompt": outgoing,
+                "optimize_prompt": False,
                 "style": "auto",
-                "deep_optimize": not simple,
+                "deep_optimize": False,
             },
         )
         if res.get("status") != "success":

@@ -23,6 +23,7 @@ import tempfile
 import wave
 from pathlib import Path
 
+
 def _patch_qwen_tts_rope() -> None:
     """Shim Qwen3TTSTalkerRotaryEmbedding so self.config always exists across all transformers versions."""
     try:

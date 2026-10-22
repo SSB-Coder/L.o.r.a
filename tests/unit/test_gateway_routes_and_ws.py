@@ -82,9 +82,10 @@ def test_root_redirects_to_app(test_setup):
         notebook_store=test_setup["notebook_store"],
     )
     client = TestClient(app)
-    res = client.get("/", follow_redirects=False)
+    assert client.get("/", follow_redirects=False).status_code == 401
+    res = client.get("/", headers={"Authorization": "Bearer desk_secret_token"}, follow_redirects=False)
     assert res.status_code in (302, 307)
-    assert res.headers["location"] in ("/app", "/hud/droplet.html")
+    assert res.headers["location"] == "/app/"
 
 
 def test_desktop_auth_enforcement(test_setup):

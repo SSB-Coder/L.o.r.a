@@ -1,6 +1,7 @@
 """Document and web page chunking for grounded research."""
 
 import hashlib
+import math
 import re
 import time
 import uuid
@@ -18,7 +19,8 @@ class DocumentChunk(BaseModel):
     title: str
     text: str
     paragraph_index: int = 0
-    page_number: int = 1
+    page_number: int | None = 1
+    section: str = ""
     token_count: int = 0
     tier: int = 2
     content_hash: str = ""
@@ -39,7 +41,32 @@ class DocumentChunker:
         return sentences
 
     def _estimate_tokens(self, text: str) -> int:
-        return max(1, len(text.split()))
+        # Conservative estimate, also bounded for formulae, code and text
+        # without spaces. This is an estimate, never a tokenizer measurement.
+        return max(1, len(text.split()), math.ceil(len(text.encode("utf-8")) / 4))
+
+    def _bounded_units(self, text: str) -> list[str]:
+        units = []
+        for block in re.split(r"\n\s*\n|(?<=[.!?])\s+(?=\S)", text.strip()):
+            rest = block.strip()
+            while rest:
+                if self._estimate_tokens(rest) <= self.target_chunk_tokens:
+                    units.append(rest)
+                    break
+                lo, hi = 1, min(len(rest), self.target_chunk_tokens * 4)
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    if self._estimate_tokens(rest[:mid]) <= self.target_chunk_tokens:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                cut = lo
+                boundary = max(rest.rfind(" ", 0, cut + 1), rest.rfind("\n", 0, cut + 1))
+                if boundary > cut // 2:
+                    cut = boundary
+                units.append(rest[:cut].strip())
+                rest = rest[cut:].strip()
+        return units
 
     def chunk_text(
         self,
@@ -47,74 +74,56 @@ class DocumentChunker:
         source_url: str,
         title: str,
         tier: int = 2,
-        page_number: int = 1,
+        page_number: int | None = 1,
     ) -> list[DocumentChunk]:
         """Split a single document or web page string into chunks."""
         if not text or not text.strip():
             return []
 
-        sentences = self._split_into_sentences(text)
-        if not sentences:
-            return []
-
         chunks: list[DocumentChunk] = []
-        current_sentences: list[str] = []
-        current_tokens = 0
-        paragraph_idx = 0
 
-        for s in sentences:
-            s_tokens = self._estimate_tokens(s)
-            if current_tokens + s_tokens > self.target_chunk_tokens and current_sentences:
-                chunk_str = " ".join(current_sentences)
-                c_hash = hashlib.sha256(chunk_str.encode("utf-8")).hexdigest()[:16]
-                chunks.append(
-                    DocumentChunk(
-                        chunk_id=f"chk-{uuid.uuid4().hex[:8]}",
-                        source_url=source_url,
-                        title=title,
-                        text=chunk_str,
-                        paragraph_index=paragraph_idx,
-                        page_number=page_number,
-                        token_count=current_tokens,
-                        tier=tier,
-                        content_hash=c_hash,
-                    )
-                )
-                paragraph_idx += 1
-
-                # Keep overlap sentences
-                overlap_sents: list[str] = []
-                overlap_toks = 0
-                for prev_s in reversed(current_sentences):
-                    prev_tok = self._estimate_tokens(prev_s)
-                    if overlap_toks + prev_tok <= self.overlap_tokens:
-                        overlap_sents.insert(0, prev_s)
-                        overlap_toks += prev_tok
-                    else:
-                        break
-                current_sentences = overlap_sents
-                current_tokens = overlap_toks
-
-            current_sentences.append(s)
-            current_tokens += s_tokens
-
-        if current_sentences:
-            chunk_str = " ".join(current_sentences)
-            c_hash = hashlib.sha256(chunk_str.encode("utf-8")).hexdigest()[:16]
+        def emit(body: str, section: str) -> None:
             chunks.append(
                 DocumentChunk(
                     chunk_id=f"chk-{uuid.uuid4().hex[:8]}",
                     source_url=source_url,
                     title=title,
-                    text=chunk_str,
-                    paragraph_index=paragraph_idx,
+                    text=body,
+                    paragraph_index=len(chunks),
                     page_number=page_number,
-                    token_count=current_tokens,
+                    section=section,
+                    token_count=self._estimate_tokens(body),
                     tier=tier,
-                    content_hash=c_hash,
+                    content_hash=hashlib.sha256(body.encode("utf-8")).hexdigest()[:16],
                 )
             )
 
+        # A heading starts a new section; never blend unrelated sections just
+        # to fill the budget. Keep headings and line breaks in the actual text.
+        sections = re.split(r"(?m)(?=^#{1,6}\s+\S)", text.strip())
+        for section_text in sections:
+            if not section_text.strip():
+                continue
+            heading = re.match(r"^#{1,6}\s+([^\n]+)", section_text)
+            section = heading.group(1).strip() if heading else ""
+            current = ""
+            for unit in self._bounded_units(section_text):
+                joined = current + "\n\n" + unit if current else unit
+                if current and self._estimate_tokens(joined) > self.target_chunk_tokens:
+                    emit(current, section)
+                    tail = current[-self.overlap_tokens * 4 :] if self.overlap_tokens else ""
+                    # Start overlap at a word boundary, and discard it when a
+                    # full-sized unit needs the entire available budget.
+                    tail = tail.partition(" ")[2] if " " in tail else ""
+                    current = (
+                        tail
+                        if tail
+                        and self._estimate_tokens(tail + "\n\n" + unit) <= self.target_chunk_tokens
+                        else ""
+                    )
+                current = current + "\n\n" + unit if current else unit
+            if current:
+                emit(current, section)
         return chunks
 
     def chunk_pages(

@@ -21,11 +21,12 @@ from lora.tools.web.search import WebSearchDispatcher
 
 
 @pytest.fixture
-def mock_env(tmp_path: Path):
+async def mock_env(tmp_path: Path):
     db_file = tmp_path / "conn_cache.db"
     cache = HttpCache(db_path=db_file)
     limiter = TokenBucketLimiter()
-    return cache, limiter
+    yield cache, limiter
+    await cache.close()
 
 
 @pytest.mark.asyncio
@@ -275,3 +276,4 @@ async def test_web_search_dispatcher():
     assert res["status"] == "success"
     assert res["count"] == 1
     assert res["hits"][0]["title"] == "Photosynthesis"
+    await dispatcher.close()

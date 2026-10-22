@@ -6,7 +6,7 @@ from lora.models.laya_router import LayaDecisionRouter
 
 
 @pytest.fixture(scope="module")
-def live_laya_router():
+def live_laya_router(model_eval_enabled):
     """Shared live model instance for eval suite."""
     return LayaDecisionRouter()
 

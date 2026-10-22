@@ -52,7 +52,7 @@ class FakeLLM:
         if "strict fact-checking supervisor" in text:
             claim = text.split("Claim to Verify:")[1]
             ok = "1962" not in claim
-            return httpx.Response(200, content=nd(json.dumps({"supported": ok, "supporting_quote": None, "reason": "checked"})))
+            return httpx.Response(200, content=nd(json.dumps({"supported": ok, "supporting_quote": PAGE.split(". ")[1] + "." if ok else None, "reason": "checked"})))
         if "strict reviewer" in text:
             return httpx.Response(200, content=nd(json.dumps(self.reviewer or {"verdict": "approve", "issues": []})))
         if "Problems found:" in text:
@@ -96,40 +96,39 @@ def mock_ollama(llm, tags=TAGS_TWO):
 # ------------------------------------------------------------------------------------ verification
 @pytest.mark.asyncio
 @respx.mock
-async def test_standard_research_checks_every_claim(tmp_path, monkeypatch):
-    mock_ollama(FakeLLM(GOOD))
+async def test_standard_research_checks_references_without_scoring_claims(tmp_path, monkeypatch):
+    llm = FakeLLM(GOOD)
+    mock_ollama(llm)
     rt = make_runtime(tmp_path, monkeypatch)
-    res, statuses = await turn(rt, "what is the latest on mamba models")
-    c = res.meta["checked"]
-    assert c["total"] >= 2 and c["supported"] == c["total"] and not c["unverified"]
-    assert "I couldn't confirm" not in res.text
-    assert "Checking the facts…" in statuses
+    res, statuses = await turn(rt, "what is the latest on mamba models", mode="standard")
+    assert res.meta["source_check"]["status"] == "references_checked"
+    assert "checked" not in res.meta and "score" not in res.meta
+    assert "Checking the facts." not in statuses
+    assert set(llm.models_used) == {SPARK}
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_unsupported_claim_is_flagged_not_silently_shown(tmp_path, monkeypatch):
-    llm = FakeLLM(BAD, revised=BAD)  # the automatic rewrite does not fix it either, so it is kept out
-    mock_ollama(llm, TAGS_ONE)
+async def test_reference_check_never_certifies_an_unsupported_claim(tmp_path, monkeypatch):
+    mock_ollama(FakeLLM(BAD), TAGS_ONE)
     rt = make_runtime(tmp_path, monkeypatch)
-    res, _ = await turn(rt, "what is the latest on mamba models")
-    assert res.meta["checked"]["unverified"] and "1962" in res.meta["checked"]["unverified"][0]
-    assert "I couldn't confirm this in the sources" in res.text and "1962" in res.text.split("---")[-1]
-    assert res.meta["checked"]["supported"] < res.meta["checked"]["total"]
+    res, _ = await turn(rt, "what is the latest on mamba models", mode="standard")
+    assert res.text == BAD
+    assert res.meta["verdict"] == "unchecked"
+    assert "not independently fact-checked" in res.meta["source_check"]["note"]
+    assert "checked" not in res.meta
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_standard_mode_corrects_itself_once_and_keeps_the_better_answer(tmp_path, monkeypatch):
-    """The RSI loop is on by default: unsupported claim -> rewrite with feedback -> re-check -> keep only if better."""
-    llm = FakeLLM(BAD, revised=GOOD)
+async def test_standard_mode_does_not_trigger_rewrite_loops(tmp_path, monkeypatch):
+    llm = FakeLLM(GOOD)
     mock_ollama(llm, TAGS_ONE)
     rt = make_runtime(tmp_path, monkeypatch)
-    res, statuses = await turn(rt, "what is the latest on mamba models")
-    assert "Fixing what I couldn't confirm…" in statuses
-    assert res.meta["improved"] is True and res.meta["checked"]["unverified"] == []
-    assert "1962" not in res.text and "I couldn't confirm" not in res.text
-    assert any("Problems found:" in p and "1962" in p for p in llm.prompts)  # the unsupported claim was the feedback
+    res, statuses = await turn(rt, "what is the latest on mamba models", mode="standard")
+    assert res.text == GOOD and "improved" not in res.meta
+    assert "Fixing what I couldn't confirm." not in statuses
+    assert not any("Problems found:" in prompt for prompt in llm.prompts)
 
 
 @pytest.mark.asyncio
@@ -158,38 +157,40 @@ async def test_prompt_engineer_cleans_the_request_before_searching(tmp_path, mon
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_quick_mode_skips_the_slow_checks(tmp_path, monkeypatch):
-    llm = FakeLLM("A quick answer.")
+async def test_quick_mode_cites_without_independent_verification(tmp_path, monkeypatch):
+    llm = FakeLLM(GOOD)
     mock_ollama(llm)
     rt = make_runtime(tmp_path, monkeypatch)
     res, _ = await turn(rt, "what is the latest on mamba models", mode="quick")
-    assert res.kind == "chat" and not res.meta and len(llm.prompts) == 1
+    assert res.kind == "research" and "checked" not in res.meta
+    assert res.meta["verdict"] == "unchecked" and res.sources
+    assert not any("strict fact-checking supervisor" in prompt for prompt in llm.prompts)
 
 
 # ------------------------------------------------------------------------------------ deep mode
 @pytest.mark.asyncio
 @respx.mock
-async def test_deep_mode_second_opinion_roundtable_and_refinement(tmp_path, monkeypatch):
-    llm = FakeLLM(BAD, reviewer={"verdict": "revise", "issues": ["The 1962 claim is not in the sources."]}, revised=GOOD)
+async def test_deep_mode_keeps_writer_and_requests_an_expanded_answer(tmp_path, monkeypatch):
+    llm = FakeLLM(GOOD)
     mock_ollama(llm)
     rt = make_runtime(tmp_path, monkeypatch)
     res, statuses = await turn(rt, "deep research on mamba models and how they compare to transformers")
-    assert "granite4.2:8b" in llm.models_used  # reviewer is a different model family than the writer
-    assert res.meta["roundtable"]["independent"] is True and res.meta["roundtable"]["decision"] != "approve"
-    assert any("1962" in c for c in res.meta["roundtable"]["changes"])
-    assert res.meta["improved"] is True and res.meta["checked"]["unverified"] == []
-    assert "1962" not in res.text and "Getting a second opinion…" in statuses
-    assert any(s.startswith("Improving the answer") for s in statuses)
-    assert res.spoken  # a short spoken summary instead of reading the whole report
+    assert set(llm.models_used) == {SPARK}
+    assert "roundtable" not in res.meta and "verification_loop" not in res.meta
+    assert "Getting a second opinion." not in statuses
+    assert res.spoken and res.text == GOOD
+    assert "1 to 4 sentences" not in llm.prompts[-1]
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_deep_mode_flags_when_no_independent_model_is_installed(tmp_path, monkeypatch):
+async def test_deep_mode_needs_only_the_writer(tmp_path, monkeypatch):
     mock_ollama(FakeLLM(GOOD), TAGS_ONE)
     rt = make_runtime(tmp_path, monkeypatch)
     res, _ = await turn(rt, "deep research on mamba models and transformers")
-    assert res.meta["roundtable"]["independent"] is False
+    assert res.text == GOOD and res.meta["source_check"]["status"] == "references_checked"
+
+
 
 
 def test_pick_judge_model_prefers_another_family():
@@ -349,14 +350,15 @@ def make_typer(titles, kb=None):
     return TypeTextTool(wm, foreground=foreground, keyboard=kb or FakeKeyboard(), sleep=lambda _s: None), wm
 
 
-def test_typing_happy_path_and_chunking():
-    from lora.tools.control.typing import TypeTextTool  # noqa: F401
+def test_typing_is_deferred_even_in_an_editor():
+    from lora.tools.control.typing import TypingRefused
 
     kb = FakeKeyboard()
     typer, wm = make_typer(["Untitled - Notepad"] * 20, kb)
-    res = typer.type_text("hello world " * 20, "notepad")
-    assert res["status"] == "success" and "".join(kb.typed) == "hello world " * 20 and len(kb.typed) > 1
-    wm.focus_window.assert_called_once()
+    with pytest.raises(TypingRefused, match="deferred"):
+        typer.type_text("hello world " * 20, "notepad")
+    assert kb.typed == []
+    wm.focus_window.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -376,13 +378,15 @@ def test_typing_refusals(titles, text, target, why):
     kb = FakeKeyboard()
     typer, _ = make_typer(titles, kb)
     with pytest.raises(TypingRefused, match=why):
-        typer.type_text(text, target)
-    if why != "sensitive" or len(text) < 100:
-        assert kb.typed == [] or why == "sensitive"
+        typer.type_text(text, target, confirmed=True)
+    if len(titles) == 1:
+        assert kb.typed == []
+    else:
+        assert len(''.join(kb.typed)) < len(text)  # stop before typing into the new sensitive window
 
 
 @pytest.mark.asyncio
-async def test_typing_needs_the_users_ok_for_the_exact_text(tmp_path, monkeypatch):
+async def test_editor_typing_requires_exact_confirmation_and_respects_disable(tmp_path, monkeypatch):
     rt = make_runtime(tmp_path, monkeypatch)
     kb = FakeKeyboard()
     rt.typer, _ = make_typer(["Untitled - Notepad"] * 5, kb)
@@ -395,17 +399,18 @@ async def test_typing_needs_the_users_ok_for_the_exact_text(tmp_path, monkeypatc
 
     rt.confirm = deny
     res, _ = await turn(rt, 'type "meeting at 5pm" into notepad')
-    assert "won't type" in res.text and kb.typed == [] and "meeting at 5pm" in asked[0]
+    assert "won't type" in res.text and kb.typed == []
+    assert asked and "meeting at 5pm" in asked[-1]
 
     async def allow(text):
         return True
 
     rt.confirm = allow
     res, _ = await turn(rt, 'type "meeting at 5pm" into notepad')
-    assert res.text == "Done. I typed it into Notepad." and kb.typed == ["meeting at 5pm"]
+    assert "Done." in res.text and kb.typed == ['meeting at 5pm']
     rt.allow_typing = False
     res, _ = await turn(rt, 'type "x" into notepad')
-    assert "switched off" in res.text
+    assert "switched off" in res.text and kb.typed == ['meeting at 5pm']
 
 
 # ------------------------------------------------------------------------------------ phone jobs
@@ -538,38 +543,10 @@ def test_foreign_websites_cannot_call_the_local_api():
     evil = client.post("/api/hud/chat", json={"text": "hi"}, headers={"Origin": "https://evil.example"})
     assert evil.status_code == 403
     ok = client.get("/api/hud/media/list", headers={"Origin": "http://127.0.0.1:8765"})
-    assert ok.status_code != 403
-    assert client.get("/api/hud/media/list").status_code != 403  # same-origin pages send no Origin header
+    assert ok.status_code == 401
+    assert client.get("/api/hud/media/list").status_code == 401  # Same-origin still requires authentication.
     pre = client.options(
         "/api/hud/chat",
         headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "POST"},
     )
     assert "access-control-allow-origin" not in {k.lower() for k in pre.headers}
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_deep_mode_second_opinion_timeout_is_reported_and_penalized(tmp_path, monkeypatch):
-    class TimeoutReviewerLLM(FakeLLM):
-        def __call__(self, request):
-            body = json.loads(request.content)
-            text = "\n".join(m["content"] for m in body["messages"])
-            if "strict reviewer" in text:
-                raise httpx.ReadTimeout("granite4.2:8b timed out")
-            return super().__call__(request)
-
-    llm = TimeoutReviewerLLM(GOOD)
-    mock_ollama(llm)
-    rt = make_runtime(tmp_path, monkeypatch)
-    res, _ = await turn(rt, "deep research on mamba models and how they compare to transformers")
-    assert res.meta["roundtable"]["timed_out"] is True
-    assert res.meta["roundtable"]["independent"] is False
-    assert res.meta["roundtable"]["opinion_verdict"] == "timeout"
-    vl = res.meta["verification_loop"]
-    assert vl["passed_checks"] < vl["total_checks"]
-    assert vl["score"] < 1.0
-    v7 = next(s for s in vl["stages"] if s["id"] == "V7")
-    assert v7["status"] == "warn"
-    assert "timed out" in v7["detail"]
-    v4 = next(s for s in vl["stages"] if s["id"] == "V4")
-    assert "1 LLM probe(s)" in v4["detail"]

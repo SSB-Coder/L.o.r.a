@@ -5,8 +5,17 @@ from unittest.mock import MagicMock
 import numpy as np
 
 from lora.voice.stt import FasterWhisperTranscriber
+from lora.voice.tts import worker as tts_worker
 from lora.voice.tts.engine import TtsEngine, split_sentences
-from lora.voice.tts.worker import Qwen3TtsWorkerProcess
+from lora.voice.tts.worker import KokoroTtsWorkerProcess
+
+
+def mock_kokoro(monkeypatch):
+    model = MagicMock()
+    model.get_voices.return_value = ["af_sky"]
+    model.create.return_value = (np.ones(240, dtype=np.float32), 24000)
+    monkeypatch.setattr(tts_worker, "get_kokoro_model", lambda _: model)
+    return KokoroTtsWorkerProcess()
 
 
 def test_split_sentences():
@@ -45,8 +54,8 @@ def test_stt_transcription_empty_and_mocked():
     assert res.duration_seconds == 1.0
 
 
-def test_tts_worker_and_engine_playback():
-    worker = Qwen3TtsWorkerProcess(models_dir="non_existent", spawn_process=False)
+def test_tts_worker_and_engine_playback(monkeypatch):
+    worker = mock_kokoro(monkeypatch)
 
     # Empty text
     chunk_empty = worker.synthesize("")
@@ -69,8 +78,8 @@ def test_tts_worker_and_engine_playback():
     assert len(played_audio_chunks) == 2
 
 
-def test_tts_engine_barge_in_interruption():
-    worker = Qwen3TtsWorkerProcess(models_dir="non_existent", spawn_process=False)
+def test_tts_engine_barge_in_interruption(monkeypatch):
+    worker = mock_kokoro(monkeypatch)
     played_count = 0
 
     engine = TtsEngine(worker=worker)

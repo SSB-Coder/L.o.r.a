@@ -58,8 +58,8 @@ class EvidenceCardExtractor:
             chosen_quote = sentences[0]
             section_ref = (
                 f"p. {chunk.page_number}"
-                if chunk.page_number > 0
-                else f"§ {chunk.paragraph_index + 1}"
+                if chunk.page_number and chunk.page_number > 0
+                else chunk.section or f"Passage {chunk.paragraph_index + 1}"
             )
 
             url_lower = (chunk.source_url or "").lower()

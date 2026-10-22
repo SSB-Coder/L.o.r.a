@@ -15,7 +15,7 @@ _FRONTMATTER_RE = re.compile(r"^---\s*\r?\n(.*?)\r?\n---\s*\r?\n(.*)$", re.DOTAL
 BUILTIN_SKILL_MDS: dict[str, str] = {
     "deep-research": """---
 name: deep-research
-description: Multi-source web & scholarly research with inline [S1] citations and 8-stage verification.
+description: Multi-source web & scholarly research with inline [S1] citations and reference integrity checks.
 triggers:
   - deep research
   - literature review
@@ -26,7 +26,7 @@ required_tools:
   - web_search
   - fetch_page
   - pdf_fetch
-default_depth: deep_with_refinement
+default_depth: deep
 agent: research
 ---
 # Deep Research Skill
@@ -127,7 +127,7 @@ When asked for an image, diagram, chart, or visual asset:
 """,
     "truth-auditor": """---
 name: truth-auditor
-description: Adversarial 8-stage claim verification, numerical precision auditing, and cross-model Round-Table critique.
+description: Evidence-based claim review with cited primary sources and explicit uncertainty.
 triggers:
   - fact check
   - verify claims
@@ -137,14 +137,15 @@ triggers:
 required_tools:
   - web_search
   - fetch_page
-default_depth: deep_with_refinement
-agent: critic_verifier
+default_depth: deep
+agent: research
 ---
 # Truth Auditor Skill
 
 When auditing or verifying claims:
-1. Decompose statements into atomic claims and verify every number, date, entity, and causal assertion against primary evidence.
-2. Separate established consensus from contested or unverified claims, and report the 8-stage verification scorecard.
+1. Look up primary evidence relevant to the requested claims and cite the passages used.
+2. Explain what the sources say, where they disagree, and what remains uncertain.
+3. Do not claim an independent verification pipeline ran or invent a truth score.
 """,
 }
 

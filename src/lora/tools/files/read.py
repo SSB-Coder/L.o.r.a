@@ -4,14 +4,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-try:
-    import pymupdf as fitz
-except ImportError:
-    try:
-        import fitz
-    except ImportError:
-        fitz = None  # type: ignore
-
 from lora.safety.policy import PolicyEngine
 
 
@@ -49,40 +41,14 @@ def read_file(
 
     suffix = target.suffix.lower()
 
-    if suffix == ".pdf":
+    if suffix in {".pdf", ".docx"}:
+        from lora.safety.parsers import parse_document
         try:
-            pages = []
-            full_text_parts = []
-            if fitz is not None:
-                with fitz.open(str(target)) as doc:
-                    for page_num in range(len(doc)):
-                        page = doc[page_num]
-                        text = page.get_text()
-                        pages.append({"page": page_num + 1, "text": text})
-                        full_text_parts.append(text)
-            else:
-                from pypdf import PdfReader
-
-                reader = PdfReader(str(target))
-                for page_num, page in enumerate(reader.pages):
-                    text = page.extract_text() or ""
-                    pages.append({"page": page_num + 1, "text": text})
-                    full_text_parts.append(text)
-
-            return {
-                "status": "success",
-                "file_type": "pdf",
-                "path": str(target),
-                "total_pages": len(pages),
-                "pages": pages,
-                "content": "\n\n".join(full_text_parts),
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to extract text from PDF: {e}",
-                "content": "",
-            }
+            result = parse_document(suffix[1:], target.read_bytes())
+            return {"status": "success", "file_type": suffix[1:], "path": str(target),
+                    "total_pages": len(result["pages"]), "pages": result["pages"], "content": result["text"]}
+        except Exception as exc:
+            return {"status": "error", "message": f"Isolated parser failed: {exc}", "content": ""}
 
     try:
         content = target.read_text(encoding="utf-8", errors="replace")

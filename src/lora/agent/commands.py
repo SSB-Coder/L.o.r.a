@@ -7,7 +7,6 @@ notebook, and power/stop intents while allowing natural/compound requests to use
 from __future__ import annotations
 
 import json
-import random
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -437,6 +436,18 @@ _ABOUT_LORA = re.compile(
 )
 
 
+def is_smalltalk(text: str) -> bool:
+    """Recognize conversational turns without inheriting a previous research task."""
+    q = normalize_speech(text).strip(" .!?,")
+    return bool(re.fullmatch(
+        r"(?:hi|hey|hello|good (?:morning|afternoon|evening|night)|goodnight|"
+        r"bye|goodbye|see you(?: later| tomorrow)?|thanks(?: a lot)?|thank you|"
+        r"okay|ok|great|nice|cool|got it|never mind|nevermind|"
+        r"how are you(?: doing)?|how(?:'s| is| was) your day)"
+        r"(?:[, ]+(?:lora|laura|friend|buddy|dear))?", q, re.IGNORECASE,
+    ))
+
+
 def is_research(text: str) -> bool:
     """True when the question needs fresh information from the web."""
     q = normalize_speech(text)
@@ -519,17 +530,17 @@ _WHAT_CAN = re.compile(
 )
 CAPABILITIES = (
     "Here's what I can do:\n"
-    "- **Laya Decision Router & Multi-Agent Research:** ask me to research anything. Laya routes your intent on CPU, fetches web & scholarly sources, runs an 8-stage verification & self-correction loop (V1–V8), and displays the Verification Scorecard.\n"
+    "- **Research with sources:** ask me to look something up. I search and read web sources, write a cited answer, and check citation references.\n"
     "- **Smart Navigation & External AI:** open apps, folders, files, specific site pages (\"open Wikipedia on Alan Turing\"), or delegate to external AIs (\"open ChatGPT and ask...\").\n"
     "- **Files & Visual Studio:** paste or attach images and files directly in chat, or ask me to generate code, notes, SVG diagrams, charts, and edited images.\n"
     "- **Depth Rewrite & Notebooks:** say \"explain like I'm 5\", \"make it more detailed\", or \"save this to my notebook\".\n"
     "- **Skills, Models & Voice (Kokoro TTS `af_sky`):** switch models manually or use Auto smart routing, activate skills from the top bar, and use voice or mobile LAN pairing."
 )
 _VERB_REPLY = {
-    "browse": "Yes. Ask me to research something and I'll search the web, read the pages, check the facts and show you my sources. I can also open a site or topic for you, like \"open Wikipedia on quantum computing\".",
+    "browse": "Yes. Ask me to research something and I'll search the web, read the pages and show you my sources. I can also open a site or topic for you, like \"open Wikipedia on quantum computing\".",
     "search": "Yes. Say \"research\" and what you want to know, and I'll search the web and read the pages. For a quick look in your browser, say \"open Wikipedia on…\" or \"search YouTube for…\".",
     "open": "Yes. I can open apps, folders, files and websites. Try \"open Chrome\", \"open Wikipedia on Alan Turing\", \"open my Downloads folder\" or \"open resume.pdf\".",
-    "type": "Yes. I can create code, Markdown, text, or visual files, and type into Notepad, Word or VS Code. I'll show you the text and ask first.",
+    "type": "I can create code, Markdown, text, or visual files for you. For supported editors, I can type the exact text after showing it and asking you first.",
     "read": "Yes. You can paste/attach images and files directly into the chat bar, or ask me to read files in Documents, Downloads, Desktop, or your indexed sources.",
     "hear": "Yes. Hold Space, press the mic, or say \"Hey LORA\".",
 }

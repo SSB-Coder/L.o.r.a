@@ -9,7 +9,7 @@ import qrcode
 
 def get_pairing_url(ip: str, port: int, token: str) -> str:
     """Generate the full mobile app pairing URL containing the mobile token."""
-    return f"http://{ip}:{port}/app?token={token}"
+    return f"http://{ip}:{port}/app/#token={token}"
 
 
 def generate_pairing_qr_terminal(ip: str, port: int, token: str) -> str:

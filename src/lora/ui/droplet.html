@@ -362,7 +362,7 @@ const HINT={
  sleep:'Sleeping · say “Awaken LORA” or tap the droplet',
  off:'Off · tap the droplet to start'
 };
-const TINT={cyan:[.25,.75,1],amber:[1,.62,.14],sapphire:[.2,.42,1],slate:[.5,.6,.66]};
+const TINT={cyan:[.25,.75,1],amber:[1,.62,.14],sapphire:[.2,.42,1],slate:[.55,.55,.55]};
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
 // ---------- WebGL orb ----------
@@ -386,7 +386,7 @@ if(!gl){$('#sub').textContent='WebGL is not available in this browser'}else{
  ['u_res','u_t','u_tw','u_amp','u_imp','u_think','u_speak','u_f','u_br','u_sq','u_dark','u_bob','u_rip','u_tn','u_tm','u_dim'].forEach(n=>U[n]=gl.getUniformLocation(pr,n));
  };
  initProgram();
- let renderScale=Math.min(devicePixelRatio||1,1.25),slowT=0,slowN=0,glLost=false;
+ let renderScale=.5,slowT=0,slowN=0,glLost=false;
  const fit=()=>{const w=Math.max(1,Math.round(cv.clientWidth*renderScale)),h=Math.max(1,Math.round(cv.clientHeight*renderScale));
   if(cv.width===w&&cv.height===h)return;cv.width=w;cv.height=h;gl.viewport(0,0,w,h)};
  new ResizeObserver(fit).observe($('#stage'));fit();
@@ -395,7 +395,8 @@ if(!gl){$('#sub').textContent='WebGL is not available in this browser'}else{
  (function frame(now){
   if(glLost){requestAnimationFrame(frame);return}
   const idleish=(mode==='idle'||mode==='sleep'||mode==='off');
-  if(idleish&&now-last<33){requestAnimationFrame(frame);return}
+  const sleepSettled=mode==='sleep'&&Math.abs(dim-tgtDim)<.002&&Math.abs(tm-tgtTm)<.002&&tn.every((v,i)=>Math.abs(v-tgtTn[i])<.002);
+  if(document.hidden||sleepSettled||mode==='off'||now-last<33){requestAnimationFrame(frame);return}
   const rawDt=(now-last)/1000;
   const dt=Math.min(rawDt,.05);last=now;t+=dt;let br=0;
   if(rawDt<.25&&!idleish){slowT+=rawDt;slowN++;if(slowN>=90){const avg=slowT/slowN;slowT=0;slowN=0;if(avg>.034&&renderScale>.55){renderScale=Math.max(.55,renderScale*.8);fit()}}}
@@ -555,7 +556,9 @@ function setLiveStatus(m,text){
  let pill=m.el.querySelector('.live-st');
  if(!text){if(pill)pill.remove();return}
  if(!pill){pill=document.createElement('div');pill.className='live-st';m.el.appendChild(pill)}
- pill.textContent='⟳ '+text;
+ pill.textContent=text;
+ const match=String(text).match(/^Embedding sources: (\d+)\/(\d+) chunks/);
+ if(match){const p=document.createElement('progress');p.max=Math.max(1,Number(match[2]));p.value=Number(match[1]);p.style.cssText='display:block;width:100%;margin-top:5px';p.setAttribute('aria-label','Embedding source chunks');pill.appendChild(p)}
 }
 function normSources(src){
  return (src||[]).map((s,i)=>Array.isArray(s)?{id:s[0],title:s[1],url:'',domain:s[2]||''}:{id:s.id||('S'+(i+1)),title:s.title||s.url||'',url:s.url||'',domain:s.domain||''});
@@ -588,41 +591,15 @@ function renderArtifacts(m,meta){
  });
  m.el.appendChild(wrap);
 }
-function renderVerificationDropdown(m,meta){
- const old=m.el.querySelector('details.ver');if(old)old.remove();
- const vl=meta&&meta.verification_loop;
- if(!vl)return;
- const pct=Math.round((vl.score||0)*100);
- const stages=vl.stages||[];
- const iters=vl.iterations||[];
- const laya=(meta&&meta.laya_decision)||(meta&&meta.agent_trace&&meta.agent_trace.laya)||null;
- const det=document.createElement('details');det.className='ver';
- let html='<summary>Verification Scorecard · '+pct+'% ('+(vl.passed_checks||stages.length)+'/'+(vl.total_checks||8)+' checks · '+iters.length+' iteration'+(iters.length===1?'':'s')+')</summary>';
- if(laya&&laya.intent){
-  const lconf=Math.round((laya.intent_confidence||0.95)*100);
-  html+='<div class="v-sec"><div class="v-title">Laya Decision Router ('+esc(laya.backend||'CPU')+')</div>';
-  html+='<div class="v-iter"><span><b>Intent: '+esc(laya.intent)+'</b> ('+lconf+'%) · Topic: '+esc(laya.topic_type||'background')+'</span><span>Depth: <b>'+esc(laya.depth_mode||'standard')+'</b> · Mode: <b>'+esc(laya.run_mode||'standard')+'</b> · Risk: <b>'+esc(laya.action_risk||'tier0')+'</b></span></div></div>';
- }
- if(iters.length){
-  html+='<div class="v-sec"><div class="v-title">Prompt &amp; Score Iterations</div>';
-  iters.forEach(it=>{
-   const sp=Math.round((it.score||0)*100);
-   const badge=it.decision==='accepted'?'✓ Accepted':(it.decision==='rolled_back'?'↺ Rolled back':'● Baseline');
-   html+='<div class="v-iter"><span><b>Iter '+esc(it.round)+'</b> · '+esc(it.prompt||'Synthesis')+'</span><span><b>'+sp+'%</b> ('+esc(it.supported||0)+'/'+esc(it.total||0)+' claims · '+badge+')</span></div>';
-  });
-  html+='</div>';
- }
- if(stages.length){
-  html+='<div class="v-sec"><div class="v-title">8-Way Verification Pipeline (V1–V8)</div><div class="v-grid">';
-  stages.forEach(st=>{
-   const sp=Math.round((st.score||0)*100);
-   const cls=st.status==='pass'?'vb-pass':(st.status==='warn'?'vb-warn':'vb-fail');
-   html+='<div class="v-card"><div class="vh"><span>'+esc(st.id)+' · '+esc(st.name)+'</span><span class="'+cls+'">'+sp+'%</span></div><div>'+esc(st.detail||'')+'</div></div>';
-  });
-  html+='</div></div>';
- }
- det.innerHTML=html;
- m.el.appendChild(det);
+function renderSourceCheck(m,meta){
+ const old=m.el.querySelector('.source-check');if(old)old.remove();
+ const check=meta&&meta.source_check;if(!check)return;
+ const note=document.createElement('details');note.className='chk source-check';
+ const summary=document.createElement('summary');
+ summary.textContent=check.status==='references_checked'?'Sources cited':'Source references need attention';
+ note.appendChild(summary);
+ const body=document.createElement('div');body.textContent=check.note||'';note.appendChild(body);
+ m.el.appendChild(note);
 }
 function renderAgentTrace(m,meta){
  const old=m.el.querySelector('.agent-trace');if(old)old.remove();
@@ -644,8 +621,9 @@ function renderAgentTrace(m,meta){
 function renderMeta(m,meta){
  const old=m.el.querySelector('.chk');if(old)old.remove();
  renderArtifacts(m,meta);
- renderVerificationDropdown(m,meta);
+ renderSourceCheck(m,meta);
  renderAgentTrace(m,meta);
+ if(meta&&meta.verification_note){const note=document.createElement('div');note.className='chk';note.textContent=meta.verification_note;m.el.appendChild(note)}
  const c=meta&&meta.checked;
  if(!c||!c.total)return;
  const rt=meta.roundtable;
@@ -819,10 +797,10 @@ window.setMicStatus=(ok,text)=>{
 window.setStatus=(t)=>{
  lastActivity=Date.now();
  if(!cur)return;
- if(!cur.hasText){setPending(cur,t)}
+   if(!cur.hasText){setPending(cur,t);setLiveStatus(cur,t)}
  else{
   setLiveStatus(cur,t);
-  if(/check|verif|opinion|improv|refin/i.test(t||''))setState('verify');
+    if(mode!=='sleep'&&mode!=='off'&&/check|verif|opinion|improv|refin/i.test(t||''))setState('verify');
  }
 };
 window.setSources=(sources)=>{lastActivity=Date.now();if(cur)renderSources(cur,sources)};
@@ -909,7 +887,7 @@ setInterval(()=>{
     cur.body.innerHTML='';
     const n=document.createElement('div');n.className='notice';n.textContent='I didn\u2019t get an answer. Please try again.';cur.body.appendChild(n);
    }else{
-    const n=document.createElement('div');n.className='notice';n.textContent='Verification timed out. Showing draft answer above.';cur.body.appendChild(n);
+    const n=document.createElement('div');n.className='notice';n.textContent='The response stopped updating. The text received so far is shown above.';cur.body.appendChild(n);
    }
    cur=null;
   }

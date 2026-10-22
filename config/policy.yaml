@@ -1,5 +1,13 @@
 # LORA Security and Capability Policy
 version: "1.2"
+allowed_roots:
+  - "~/Documents"
+  - "~/Downloads"
+  - "~/Desktop"
+  - "~/LORA/outputs"
+max_actions_per_task: 15
+unattended_seconds: 180
+dry_run_over: 3
 
 # Policy evaluation order:
 # 1. Hard-deny rules evaluated FIRST and are NON-OVERRIDABLE.
@@ -45,6 +53,12 @@ deny_rules:
     reason: "Mobile requests cannot access local filesystem or launch apps"
 
 allow_rules:
+  - origin: "desktop"
+    tiers: [1]
+    action: "allow"
+  - origin: "desktop"
+    tiers: [2]
+    action: "ask"
   - origin: "desktop"
     tiers: [0]
     action: "allow"

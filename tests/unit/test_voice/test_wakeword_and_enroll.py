@@ -53,9 +53,9 @@ def test_wake_word_detector_with_verifier(tmp_path: Path):
     res_quiet = detector.process_audio(np.ones(3200, dtype=np.float32) * 0.001)
     assert res_quiet.detected is False
 
-    # 3. Energetic audio matching owner -> detected and speaker verified
+    # Loudness alone cannot activate; sleeping capture is disabled.
     res_wake = detector.process_audio(audio1, current_state="sleep")
-    assert res_wake.detected is True
+    assert res_wake.detected is False
     assert res_wake.phrase == "Awaken LORA"
     assert res_wake.speaker_verified is True
 
@@ -90,11 +90,12 @@ def test_dual_activation_sleep_and_idle():
 
     audio_clip = np.ones(16000, dtype=np.float32) * 0.05
 
-    # 1. State SLEEP: user says "Awaken LORA"
+    # Sleep never transcribes; resume via click/hotkey.
     mock_stt.transcribe.return_value = TranscriptionResult(text="Awaken LORA please", duration_seconds=1.0)
     res_sleep = detector.process_audio(audio_clip, current_state="sleep")
-    assert res_sleep.detected is True
+    assert res_sleep.detected is False
     assert res_sleep.phrase == "Awaken LORA"
+    mock_stt.transcribe.assert_not_called()
 
     # 2. State IDLE: user says "Hey LORA, what is quantum computing?"
     mock_stt.transcribe.return_value = TranscriptionResult(text="Hey LORA what is quantum computing?", duration_seconds=1.5)

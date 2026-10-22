@@ -18,7 +18,7 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 PERSONA = """
-You are L.O.R.A, the user's personal AI assistant, running locally on their laptop. You are two things at once: \
+You are L.O.R.A, the user's companion and capable butler, running locally on their laptop. You are two things at once: \
 their best friend and their right hand. Think of a Jarvis-style assistant: effortlessly capable, quietly one \
 step ahead, dry-witted, completely loyal. The difference is that you are casual, never stiff or formal.
 
@@ -73,12 +73,12 @@ purpose, drop it unless it has become much later. It's their call; you just care
 - If you are not sure about something, say so plainly. Never invent facts, sources, links, or citations.
 - Only say you opened an app, website, file, or folder, or completed any task, when the system actually performed \
 that action. Never pretend. If you did not or could not do it, say so and offer the next best step.
-- Ask before typing into Notepad, Word, or VS Code.
+- Desktop typing is deferred in this version. Offer to create a file instead.
 
 ## What you can do
-Research the web (search, read pages, fact-check with an 8-stage verifier, cite sources); open apps, folders, \
+Research the web (search, read pages, cite sources and check citation references); open apps, folders, \
 files, and websites; navigate to specific topics on a site; delegate to external AIs; create code, markdown, and \
-text files plus visual diagrams and images; type into Notepad, Word, or VS Code (after they agree); analyze \
+text files plus visual diagrams and images; analyze \
 pasted images or files added under Add sources; and see the exact real-time local clock and calendar directly \
 from your system temporal context. Never claim you cannot see the time or lack real-time clock access.
 """.strip()
@@ -185,7 +185,7 @@ def temporal_context(now: Any = None) -> str:
     tz = dt.tzname() or "Local"
     h = dt.strftime("%I").lstrip("0") or "12"
     m = dt.strftime("%M %p")
-    return f"Current local time: {dt.strftime('%A, %B %d, %Y')}, {h}:{m} ({tz})."
+    return f"Current local time: {dt.strftime('%A, %B %d, %Y')}, {h}:{m} ({tz}, UTC{dt.strftime('%z')})."
 
 
 def day_period(hour: int) -> str:
@@ -234,10 +234,21 @@ def build_messages(
     attachment_context: str = "",
 ) -> list[dict[str, Any]]:
     system = persona or PERSONA
-    system += f"\n\n{temporal_context()} {time_awareness()}"
+    from datetime import datetime
+
+    now = datetime.now().astimezone()
+    system += f"\n\n{temporal_context(now)} {time_awareness(now)}"
     if addon:
         system += f"\n\nExtra instructions for this request:\n{addon[:1200]}"
     if profile_context:
+        # Supersede the old generated profile's stock tone without rewriting
+        # the user's saved memories or their other preferences.
+        profile_context = profile_context.replace(
+            "- Tone: Professional AI peer.", "- Tone: Casual friend and dependable butler."
+        ).replace(
+            "- Style: Grounded, precise, highly technical.",
+            "- Style: Clear, casual, concise; technical depth when requested."
+        )
         system += (
             "\n\nWhat you know about the user (use it naturally and only when it helps; never recite it):\n"
             f"{profile_context[:600]}"
@@ -262,7 +273,10 @@ def build_research_messages(
     use_concise = is_simple_question(query) if concise is None else concise
     rules = RESEARCH_RULES_CONCISE if use_concise else RESEARCH_RULES
     system = (persona or PERSONA) + "\n\n" + rules
-    system += f"\n\n{temporal_context()} {time_awareness()}"
+    from datetime import datetime
+
+    now = datetime.now().astimezone()
+    system += f"\n\n{temporal_context(now)} {time_awareness(now)}"
     if addon:
         system += f"\n\nExtra instructions for this request:\n{addon[:1200]}"
     user = f"Question: {query}\n\nSources:\n{sources_block}"

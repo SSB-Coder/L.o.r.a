@@ -1,5 +1,6 @@
 import logging
 from enum import StrEnum
+
 try:
     from typing import override
 except ImportError:  # pragma: no cover - Python <3.12 fallback
@@ -35,6 +36,7 @@ class AmbientDropletWidget(QWidget):
     sleep_toggled = Signal(bool)
     state_changed = Signal(str)
     emergency_stop_requested = Signal()
+    exit_requested = Signal()
 
     def __init__(
         self,
@@ -59,7 +61,7 @@ class AmbientDropletWidget(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.resize(56, 56)
+        self.resize(36, 36)
         self.setWindowOpacity(self._idle_opacity)
 
     @property
@@ -124,7 +126,7 @@ class AmbientDropletWidget(QWidget):
         return x, y
 
     @override
-    def paintEvent(self, event) -> None:
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt API
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
@@ -181,13 +183,13 @@ class AmbientDropletWidget(QWidget):
             painter.drawEllipse(int(center_x - rip_rad), int(center_y - rip_rad), int(rip_rad * 2), int(rip_rad * 2))
 
     @override
-    def mousePressEvent(self, event: QMouseEvent) -> None:
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt API
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             self._is_dragging = False
 
     @override
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt API
         if event.buttons() & Qt.MouseButton.LeftButton:
             self._is_dragging = True
             new_pos = event.globalPosition().toPoint() - self._drag_pos
@@ -197,7 +199,7 @@ class AmbientDropletWidget(QWidget):
         self.toggle_sleep()
 
     @override
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt API
         if event.button() == Qt.MouseButton.LeftButton:
             if not self._is_dragging:
                 # Delay single click to avoid triggering on double click
@@ -218,7 +220,7 @@ class AmbientDropletWidget(QWidget):
             self._is_dragging = False
 
     @override
-    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt API
         if event.button() == Qt.MouseButton.LeftButton:
             # Cancel single-click timer so sleep is not toggled
             self._click_timer.stop()
@@ -226,7 +228,7 @@ class AmbientDropletWidget(QWidget):
             self.hud_requested.emit()
 
     @override
-    def contextMenuEvent(self, event: QContextMenuEvent) -> None:
+    def contextMenuEvent(self, event: QContextMenuEvent) -> None:  # noqa: N802 - Qt API
         menu = QMenu(self)
         menu.setStyleSheet("""
             QMenu {
@@ -255,18 +257,15 @@ class AmbientDropletWidget(QWidget):
         elif action == stop_action:
             self.emergency_stop_requested.emit()
         elif action == exit_action:
-            if self.parent():
-                self.parent().close()
-            else:
-                self.close()
+            self.exit_requested.emit()
 
     @override
-    def enterEvent(self, event) -> None:
+    def enterEvent(self, event) -> None:  # noqa: N802 - Qt API
         # Hover reveals droplet clearly
         self.setWindowOpacity(0.95)
 
     @override
-    def leaveEvent(self, event) -> None:
+    def leaveEvent(self, event) -> None:  # noqa: N802 - Qt API
         # Revert to state opacity
         if self._state == WidgetState.SLEEPING:
             self.setWindowOpacity(0.30)

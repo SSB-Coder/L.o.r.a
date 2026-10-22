@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect, status
@@ -19,29 +20,50 @@ class ConnectionManager:
 
     def __init__(self) -> None:
         self.active_connections: set[WebSocket] = set()
-        self._lock = asyncio.Lock()
+        self._lock = threading.Lock()
+        self._loops: dict[WebSocket, asyncio.AbstractEventLoop] = {}
 
     async def connect(self, websocket: WebSocket) -> None:
         """Register an authenticated connection."""
-        async with self._lock:
+        with self._lock:
             self.active_connections.add(websocket)
+            self._loops[websocket] = asyncio.get_running_loop()
 
     async def disconnect(self, websocket: WebSocket) -> None:
         """Remove a closed or disconnected connection."""
-        async with self._lock:
+        with self._lock:
             self.active_connections.discard(websocket)
+            self._loops.pop(websocket, None)
 
     async def broadcast(self, event: dict[str, Any]) -> None:
         """Broadcast an event payload to all active connections."""
-        async with self._lock:
-            dead_connections = set()
-            for connection in self.active_connections:
-                try:
-                    await connection.send_json(event)
-                except Exception:
-                    dead_connections.add(connection)
-            for dead in dead_connections:
-                self.active_connections.discard(dead)
+        current = asyncio.get_running_loop()
+        with self._lock:
+            connections = [(connection, self._loops.get(connection, current))
+                           for connection in self.active_connections]
+
+        async def send(connection, owner):
+            try:
+                if owner is current:
+                    await asyncio.wait_for(connection.send_json(event), timeout=2)
+                else:
+                    # ASGI sockets belong to the server loop, not the job loop.
+                    if not owner.is_running():
+                        await self.disconnect(connection)
+                        return
+                    async def on_owner():
+                        await asyncio.wait_for(connection.send_json(event), timeout=2)
+                    coroutine = on_owner()
+                    try:
+                        future = asyncio.run_coroutine_threadsafe(coroutine, owner)
+                    except RuntimeError:
+                        coroutine.close()
+                        raise
+                    await asyncio.wait_for(asyncio.wrap_future(future), timeout=2.5)
+            except Exception:
+                await self.disconnect(connection)
+
+        await asyncio.gather(*(send(connection, owner) for connection, owner in connections))
 
 
 async def handle_websocket_connection(
@@ -81,15 +103,13 @@ async def handle_websocket_connection(
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="IP is temporarily banned")
         return
 
-    # 3-Second Authentication Handshake (supports auth frame, ?token= query param, or pairing cookie)
-    query_token = websocket.query_params.get("token", "").strip() if hasattr(websocket, "query_params") else ""
-    cookie_token = websocket.cookies.get("lora_mobile_token", "").strip() if hasattr(websocket, "cookies") else ""
+    # First-frame authentication; URL/cookie credentials are deliberately refused.
     try:
         raw_msg = await asyncio.wait_for(
             websocket.receive_text(), timeout=handshake_timeout
         )
         data = json.loads(raw_msg)
-        token = (data.get("token") or query_token or cookie_token or "").strip()
+        token = str(data.get("token") or "").strip()
         msg_type = data.get("type")
 
         if msg_type != "auth" or not token or not token_validator.validate_token(token, listener_origin):
@@ -102,12 +122,12 @@ async def handle_websocket_connection(
 
         ip_limiter.record_success(client_ip)
         await websocket.send_json({"type": "auth_ok", "origin": listener_origin})
-    except (TimeoutError, json.JSONDecodeError, Exception) as exc:
+    except (TimeoutError, json.JSONDecodeError, Exception):
         ip_limiter.record_failure(client_ip)
         try:
             await websocket.close(
                 code=status.WS_1008_POLICY_VIOLATION,
-                reason=f"Auth handshake failed or timed out: {exc}",
+                reason="Auth handshake failed or timed out",
             )
         except Exception:
             pass

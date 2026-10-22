@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip("PySide6")
-pytest.importorskip("faiss")
+pytest.importorskip("numpy")
 
 HERE = Path(__file__).resolve().parent
 SRC = str(HERE.parents[1] / "src")
@@ -35,7 +35,7 @@ def run_harness(script: str, mode: str, timeout: int = 120) -> dict:
 def test_reply_streams_into_hud_and_returns_to_idle():
     r = run_harness("_desktop_flow_harness.py", "ok")
     assert not r["timeout"]
-    assert r["answer"] == "Right away, boss. Anything else?"
+    assert r["answer"] == "Right away, friend. Anything else?"
     assert r["n_updates"] >= 2 and r["streamed"] is True
     assert r["ui_calls_on_gui_thread"] is True
     assert r["idle_after"] is True
@@ -63,3 +63,18 @@ def test_ollama_down_shows_actionable_error_and_recovers():
     assert "can't reach my local engine" in r["answer"]
     assert "spark" not in r["answer"].lower() and "ollama serve" not in r["answer"]
     assert r["idle_after"] is True
+
+
+def test_interrupt_has_no_ui_traceback_and_accepts_next_turn():
+    r = run_harness("_desktop_flow_harness.py", "interrupt")
+    assert not r["timeout"] and not r["ui_errors"]
+    assert len(r["answers"]) == 2
+    assert "stopped" in r["answers"][0].lower()
+    assert r["answers"][1] == "Right away, friend. Anything else?"
+    assert r["idle_after"]
+
+
+def test_sleep_during_generation_is_not_overwritten_by_completion():
+    r = run_harness("_desktop_flow_harness.py", "sleepbusy")
+    assert not r["ui_errors"]
+    assert r["states_after_sleep"] == ["sleeping"]

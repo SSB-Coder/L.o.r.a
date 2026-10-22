@@ -3,8 +3,8 @@
 import json
 import re
 import sys
-from unittest.mock import MagicMock
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -13,13 +13,25 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from lora.ui.hud import LoraDesktopHUD  # noqa: E402
 
-DROPLET_SHA256 = "6e5892a7c9047ee69d80280ff035bdf92cfaad7cb9c1842d6bd1cf0b09d5aa39"  # shader + render loop exactly as shipped before the UI redesign
+SHADER_SHA256 = "8663256161d64fe6d87ef787b0098f4e5e6d2d9448045edc312bd4e58daf01f2"  # original committed shader
 HTML = (Path(__file__).resolve().parents[2] / "src" / "lora" / "ui" / "droplet.html").read_text(encoding="utf-8")
 
 
 @pytest.fixture(scope="module")
 def qapp():
     return QApplication.instance() or QApplication(sys.argv)
+
+
+@pytest.fixture(autouse=True)
+def controller_without_chromium(monkeypatch):
+    """Exercise Qt signals/controller code without launching native Chromium.
+
+    Browser rendering is a separate desktop acceptance check; these tests only
+    inspect emitted JS, timers and worker-to-GUI delivery.
+    """
+    import lora.ui.hud as module
+
+    monkeypatch.setattr(module, "WEB_ENGINE_AVAILABLE", False)
 
 
 @pytest.fixture
@@ -45,6 +57,15 @@ def test_stream_and_present_calls_are_valid_json_escaped(hud):
 def test_mic_status_call(hud):
     hud.set_mic_status(False, "no input device")
     assert hud.js_calls == ['window.setMicStatus && window.setMicStatus(false, "no input device");']
+
+
+def test_sources_summary_button_uses_the_cancellable_runtime(hud):
+    submitted = []
+    hud.query_submitted.connect(lambda query, depth: submitted.append((query, depth)))
+    hud.media_db = MagicMock()
+    hud._handle_web_action("on_report_media", {})
+    assert submitted == [("Summarize my sources", "")]
+    hud.media_db.report_on_media.assert_not_called()
 
 
 def test_audio_level_updates_are_throttled(hud):
@@ -82,14 +103,14 @@ def test_page_has_no_remote_resources_and_one_key_handler():
     assert "const esc=" in HTML and "esc(code" in HTML  # model output is escaped before it is rendered
 
 
-def test_droplet_shader_and_render_loop_are_untouched():
-    """The droplet animation must stay byte-for-byte what it was."""
+def test_droplet_shader_preserved_with_bounded_render_cost():
+    """Keep the original shader while applying the agreed laptop frame budget."""
     import hashlib
 
     fs = re.search(r"const FS=`.*?`;", HTML, re.S).group(0)
-    orb = HTML[HTML.index("// ---------- WebGL orb ----------") : HTML.index("\nfunction setState(s){")]
-    digest = hashlib.sha256((fs + orb).encode()).hexdigest()
-    assert digest == DROPLET_SHA256, "droplet shader/render loop changed"
+    assert hashlib.sha256(fs.encode()).hexdigest() == SHADER_SHA256
+    assert "renderScale=.5" in HTML and "now-last<33" in HTML
+    assert "document.hidden||sleepSettled||mode==='off'" in HTML
 
 
 def test_adding_a_source_never_blocks_the_window(qapp, hud, tmp_path, monkeypatch):

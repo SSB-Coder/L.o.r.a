@@ -9,7 +9,6 @@ for the UI Verification Dropdown.
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -55,7 +54,7 @@ def cards_from_sources(sources: list[Source]) -> list[EvidenceCard]:
     for s in sources:
         quote = (s.text or s.snippet).strip()
         if quote:
-            cards.append(EvidenceCard(card_id=s.id, claim_fact=s.title, exact_quote=quote, source_url=s.url, title=s.title))
+            cards.append(EvidenceCard(card_id=s.id, claim_fact=s.title, exact_quote=quote, source_url=s.url, title=s.title, tier=s.tier))
     return cards
 
 
@@ -85,6 +84,7 @@ class VerifierLLM:
                 options=self.options,
                 think=False,
                 keep_alive="24h",
+                format="json",
             ):
                 text += delta
             self.succeeded += 1
@@ -92,6 +92,25 @@ class VerifierLLM:
         except Exception:
             self.timed_out += 1
             raise
+
+    async def verify_claims(self, pairs: list[tuple[str, str]]) -> list[Any]:
+        """Audit multiple claims per generation so unavailable NLI doesn't cap support at two claims."""
+        import asyncio
+
+        from lora.verify.llm_check import LlmFactChecker, LlmFactCheckResult
+
+        results = []
+        for start in range(0, len(pairs), 4):
+            batch = pairs[start:start + 4]
+            if self.calls >= self.max_calls:
+                results.extend(LlmFactCheckResult(is_supported=False, completed=False, reason="Verification budget exhausted") for _ in batch)
+                continue
+            try:
+                checked = await asyncio.wait_for(LlmFactChecker(self).verify_claims(batch), timeout=45.0)
+                results.extend(checked)
+            except TimeoutError:
+                results.extend(LlmFactCheckResult(is_supported=False, completed=False, reason="Verifier timed out") for _ in batch)
+        return results
 
 
 def _build_eight_stages(
@@ -108,6 +127,7 @@ def _build_eight_stages(
     """Build the 8-stage (V1-V8) verification breakdown for the UI Verification Dropdown."""
     total_claims = len(details)
     supported_claims = sum(1 for d in details if getattr(d, "is_supported", False))
+    nli_available = any(getattr(d, "nli_reliable", True) for d in details)
 
     # V1: Citation Existence & Per-Claim Citation Coverage
     cited_ids = set(extract_citation_ids(answer or ""))
@@ -137,20 +157,18 @@ def _build_eight_stages(
     # V4: LLM Entailment Escalation & Spot-Check Audit (honest SKIPPED labeling when 0 probes executed)
     if llm_calls == 0 and llm_succeeded == 0:
         v4_score = None
-        v4_status = "SKIPPED"
-        v4_detail = f"Skipped (0 LLM probes needed; {supported_claims}/{total_claims} claims entailed by CPU NLI)"
+        v4_status = "SKIPPED" if nli_available else "UNAVAILABLE"
+        v4_detail = (f"Skipped ({supported_claims}/{total_claims} claims supported by NLI)" if nli_available
+                     else "Independent verifier unavailable; claims remain unverified.")
     elif llm_timed_out > 0 and llm_succeeded == 0:
-        v4_score = round(min(0.65, avg_nli * 0.75), 2)
-        v4_status = "fail"
-        v4_detail = (
-            f"LLM probe timed out ({llm_timed_out}/{max(1, llm_calls)}); "
-            f"CPU NLI fallback ({supported_claims}/{total_claims} claims)"
-        )
+        v4_score = None
+        v4_status = "UNAVAILABLE"
+        v4_detail = "Verifier failed, timed out or exhausted its budget; no completed claim checks."
     elif llm_succeeded > 0:
         support_ratio = supported_claims / max(1, total_claims)
-        v4_score = round(min(1.0, 0.65 * support_ratio + 0.35 * avg_nli), 2)
+        v4_score = round(support_ratio, 2)
         v4_status = "pass" if v4_score >= 0.80 else ("warn" if v4_score >= 0.55 else "fail")
-        timeout_note = f", {llm_timed_out} timed out" if llm_timed_out > 0 else ""
+        timeout_note = f", {llm_timed_out} incomplete" if llm_timed_out > 0 else ""
         v4_detail = f"{supported_claims}/{total_claims} claims verified ({llm_succeeded} LLM probe(s){timeout_note})"
     else:
         v4_score = None
@@ -186,12 +204,8 @@ def _build_eight_stages(
     orig_ratio = max(0.0, 1.0 - copy_res.overlap_ratio)
     v7_score = round(orig_ratio if copy_res.is_clean else min(0.54, orig_ratio), 2)
 
-    # V8: Composite Faithfulness & Repair Gate (averages ONLY executed stages, never blending synthetic scores for skipped stages)
-    active_scores = [s for s in [v1_score, v2_score, v3_score, v4_score, v5_score, v6_score, v7_score] if s is not None]
-    stage_mean = (sum(active_scores) / len(active_scores)) if active_scores else float(composite_score)
-    v8_score = round(0.55 * float(composite_score) + 0.45 * stage_mean, 2)
-    if llm_timed_out > 0 and llm_succeeded == 0:
-        v8_score = round(min(v8_score, 0.78), 2)
+    # Originality, citation formatting and source breadth cannot establish truth.
+    v8_score = round(float(composite_score), 2)
 
     def _st(s: float | None) -> str:
         if s is None:
@@ -222,9 +236,9 @@ def _build_eight_stages(
         {
             "id": "V3",
             "name": "NLI Groundedness",
-            "score": v3_score,
-            "status": _st(v3_score),
-            "detail": v3_detail,
+            "score": v3_score if nli_available else None,
+            "status": _st(v3_score) if nli_available else "UNAVAILABLE",
+            "detail": v3_detail if nli_available else "NLI model unavailable; lexical similarity is diagnostic only.",
         },
         {
             "id": "V4",

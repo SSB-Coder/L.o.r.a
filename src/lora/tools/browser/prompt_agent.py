@@ -262,33 +262,8 @@ class PromptOptimizerAgent:
                 redactions=redactions,
             )
 
-        if deep and self.ollama_client is not None:
-            try:
-                from lora.dialogue import strip_think
-
-                meta_system = (
-                    f"You are an expert prompt engineer writing a clear prompt to send to {target_ai}. "
-                    "Match the complexity of the user's question: if the question is simple, keep the prompt short and direct; "
-                    "if it is complex, structure it clearly without adding unwanted bloat. "
-                    "Do NOT answer the question yourself. Output ONLY the prompt text."
-                )
-                raw_refined = await self.ollama_client.generate(
-                    prompt=f"User request to turn into a prompt ({style_enum.value} mode):\n{scrubbed_text}",
-                    system=meta_system,
-                    temperature=0.2,
-                )
-                refined = strip_think(str(raw_refined or "")).strip().strip('"')
-                if refined and len(refined) > 5:
-                    return OptimizedPrompt(
-                        original_prompt=prompt,
-                        optimized_prompt=refined,
-                        target_ai=target_ai,
-                        style=style_enum,
-                        redacted_count=len(redactions),
-                        redactions=redactions,
-                    )
-            except Exception:
-                pass
+        if deep:
+            raise ValueError("Deep prompt refinement must run in L2 before this tool")
 
         optimized = self._build_deterministic_prompt(
             clean_text=scrubbed_text,

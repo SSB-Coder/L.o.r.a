@@ -75,6 +75,7 @@ class FasterWhisperTranscriber:
                         candidate,
                         device=self.device,
                         compute_type=self.compute_type,
+                        cpu_threads=4,
                         local_files_only=True,
                     )
                     self.model_size_or_path = candidate
@@ -86,6 +87,7 @@ class FasterWhisperTranscriber:
                 self.model_size_or_path,
                 device=self.device,
                 compute_type=self.compute_type,
+                cpu_threads=4,
             )
             logger.info("Faster-Whisper STT downloaded and ready on CPU (%s).", self.model_size_or_path)
         return self._model
@@ -128,7 +130,12 @@ class FasterWhisperTranscriber:
 
         # Normalize moderate speech (including softer wake-word utterances) without amplifying floor hiss
         peak = float(np.max(np.abs(audio))) if len(audio) > 0 else 0.0
-        norm_audio = (audio / peak * 0.90) if 0.012 < peak < 0.70 else audio
+        rms = float(np.sqrt(np.mean(audio ** 2)))
+        if peak < 0.006 or rms < 0.002:
+            return TranscriptionResult(text="", duration_seconds=duration, confidence=0.0)
+        # Never turn a fan or a distant voice up by 20-70x.
+        gain = min(2.0, 0.5 / peak) if rms >= 0.006 and peak > 0.02 else 1.0
+        norm_audio = audio * gain
 
         model = self._ensure_model_loaded()
         is_mock = getattr(model, "__module__", "").startswith("unittest.mock")
@@ -140,16 +147,16 @@ class FasterWhisperTranscriber:
             if is_mock:
                 segments, info = model.transcribe(
                     norm_audio.astype(np.float32),
-                    beam_size=5,
+                    beam_size=1,
                     initial_prompt=self.initial_prompt,
-                    vad_filter=False,
+                    vad_filter=True,
                     language="en",
                 )
             else:
                 try:
                     segments, info = model.transcribe(
                         norm_audio.astype(np.float32),
-                        beam_size=3 if duration <= 2.5 else 5,
+                        beam_size=1,
                         best_of=3 if duration <= 2.5 else 5,
                         temperature=0.0,
                         condition_on_previous_text=False,
@@ -166,9 +173,9 @@ class FasterWhisperTranscriber:
                 except TypeError:
                     segments, info = model.transcribe(
                         norm_audio.astype(np.float32),
-                        beam_size=5,
+                        beam_size=1,
                         initial_prompt=self.initial_prompt,
-                        vad_filter=False,
+                        vad_filter=True,
                         language="en",
                     )
 
