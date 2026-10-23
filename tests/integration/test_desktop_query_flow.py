@@ -45,7 +45,7 @@ def test_reply_streams_into_hud_and_returns_to_idle():
 
 def test_configured_model_name_resolves_and_options_come_from_config():
     r = run_harness("_desktop_flow_harness.py", "ok")
-    assert r["model"] == "SparkLLM/Spark-X2.5-4B:latest"  # default 'spark-x25-4b-q4' matched fuzzily
+    assert r["model"] == "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M"  # installed Spark 2.6 Q4_K_M is the default
     assert r["think"] is False and r["keep_alive"] == "24h"
     assert r["options"]["num_ctx"] <= 8192
     assert r["roles"] == ["system", "user"]

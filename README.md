@@ -68,9 +68,9 @@ optional development dependencies for additional JavaScript checks.
 
 | Component | Reference configuration |
 |---|---|
-| Writer | Quantized Spark-X2.5 4B; preferred local tag `spark-x25-4b-8k:latest`. |
+| Writer | Spark-X2.6 4B Q4_K_M; tag `hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M`. |
 | Writer context | 8,192 tokens, enforced by model-selection code. |
-| Reader profile | Separate `spark-x25-4b-32k:latest` profile, 32,768 tokens; this does not enlarge ordinary chat. |
+| Reader and planner | Same Spark-X2.6 Q4_K_M tag and 8,192-token budget as the writer, avoiding context-profile changes between these roles. |
 | Control | Granite 3B where installed, with a 6,144-token profile. |
 | Specialized models | Configured complex/vision alternatives; installing every alternative is unnecessary. |
 | STT | Faster-Whisper `base.en`, CPU INT8, four CPU threads. |
@@ -127,16 +127,18 @@ ollama list
 ```
 
 The tags in [config/lora.yaml](config/lora.yaml) describe the development
-machine's choices. Custom names such as `spark-x25-4b-8k` are local tags, not
-guaranteed downloadable registry names. Install or import a compatible quantized
-writer, then match its tag in configuration or select it in the desktop UI.
+machine's choices. Writer, reader, and planner use the quantized Spark-X2.6 tag
+`hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M`. Install that tag with Ollama, or
+import a compatible quantized GGUF and match its tag in configuration.
+Spark-X2.5 is no longer required. Keep thinking disabled for the default
+interactive profile; context expansion remains separate work.
 
 For example, after obtaining a compatible, already-quantized Spark GGUF and
 placing it at `models/writer.gguf`, a local import can use:
 
 ```powershell
 Set-Content -Path .\models\Modelfile.spark -Value 'FROM ./writer.gguf' -Encoding ascii
-ollama create spark-x25-4b-8k -f .\models\Modelfile.spark
+ollama create spark-x26-4b -f .\models\Modelfile.spark
 ```
 
 Use an Ollama build that supports the model architecture and a GGUF with correct

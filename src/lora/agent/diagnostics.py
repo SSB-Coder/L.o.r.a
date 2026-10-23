@@ -35,7 +35,7 @@ class Check:
 
 
 async def _check_engine(rt) -> Check:
-    from lora.models.ollama_client import OllamaClient
+    from lora.models.ollama_client import OllamaClient, match_models
     from lora.models.selection import PREFERRED_MODEL, plan_chat
 
     client = OllamaClient(base_url=rt.ollama_url)
@@ -46,7 +46,7 @@ async def _check_engine(rt) -> Check:
     if not installed:
         return Check("Thinking", False, "the engine has no models installed.", "pull your base model with `ollama pull`", "no models")
     plan = await plan_chat(client, user_default=rt.user_default_model)
-    has_preferred = any(PREFERRED_MODEL.replace("-", "") in m.lower().replace("-", "").replace(".", "") for m in installed)
+    has_preferred = bool(match_models(PREFERRED_MODEL, installed))
     detail = f"installed={installed} chosen={plan.model if plan else None} preferred_present={has_preferred}"
     if not has_preferred:
         return Check("Thinking", True, "ready, but my preferred base model isn't installed so I'm using another one.", detail=detail)

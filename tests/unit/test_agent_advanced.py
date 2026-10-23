@@ -19,7 +19,7 @@ from lora.dialogue import ConversationHistory
 from lora.safety.policy import PolicyEngine
 
 URL = "http://127.0.0.1:11434"
-SPARK = "SparkLLM/Spark-X2.5-4B:latest"
+SPARK = "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M"
 TAGS_TWO = {"models": [{"name": SPARK}, {"name": "granite4.2:8b"}]}
 TAGS_ONE = {"models": [{"name": SPARK}]}
 

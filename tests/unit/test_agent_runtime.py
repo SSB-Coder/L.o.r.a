@@ -12,7 +12,7 @@ from lora.dialogue import ConversationHistory
 from lora.safety.policy import PolicyEngine
 
 URL = "http://127.0.0.1:11434"
-TAGS = {"models": [{"name": "ornith-1.5:9b"}, {"name": "SparkLLM/Spark-X2.5-4B:latest"}]}
+TAGS = {"models": [{"name": "ornith-1.5:9b"}, {"name": "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M"}]}
 
 
 def _nd(*tokens):
@@ -75,7 +75,7 @@ async def test_chat_uses_spark_not_the_stale_default_and_streams(runtime):
     route = respx.post(f"{URL}/api/chat").respond(200, content=_nd("Sure", ", friend."))
     res, sink = await run(runtime, "tell me a joke about cats")
     assert res.text == "Sure, friend." and res.kind == "chat"
-    assert json.loads(route.calls[0].request.content)["model"] == "SparkLLM/Spark-X2.5-4B:latest"
+    assert json.loads(route.calls[0].request.content)["model"] == "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M"
     assert [t for t, _ in sink.texts][-1] == "Sure, friend."
 
 

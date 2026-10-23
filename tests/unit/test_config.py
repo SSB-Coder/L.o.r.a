@@ -13,9 +13,10 @@ def test_load_lora_config(project_root: Path):
     cfg = load_config(config_file)
     assert isinstance(cfg, LoraConfig)
     assert cfg.models_dir in ("models", "C:\\Models")
-    assert "spark-x25-4b" in cfg.models.writer.name
+    assert cfg.models.writer.name == "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M"
+    assert cfg.models.reader.name == cfg.models.planner.name == cfg.models.writer.name
     assert cfg.models.writer.num_ctx == 8192
-    assert cfg.models.reader.num_ctx == 32768
+    assert cfg.models.reader.num_ctx == cfg.models.planner.num_ctx == 8192
     assert cfg.gateway.desktop_bind == "127.0.0.1:8765"
     assert cfg.gateway.mobile_bind == "192.168.50.10:8765"
     assert cfg.gateway.mobile.max_tier == 0

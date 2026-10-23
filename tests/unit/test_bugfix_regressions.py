@@ -187,7 +187,7 @@ async def test_diagnostics_reports_problems_with_fixes_and_no_model_names(tmp_pa
         "mic": (False, "no input device found"),
         "tts": {"ok": False, "summary": "using the Windows voice (this PyTorch has no GPU support).", "fix": "run scripts\\install_tts.ps1"},
     }
-    respx.get(f"{URL}/api/tags").respond(200, json={"models": [{"name": "SparkLLM/Spark-X2.5-4B:latest"}]})
+    respx.get(f"{URL}/api/tags").respond(200, json={"models": [{"name": "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M"}]})
     respx.post("https://html.duckduckgo.com/html/").respond(202)
     respx.get("https://lite.duckduckgo.com/lite/").respond(403)
     respx.get("https://www.bing.com/search").respond(200, text="<html></html>")

@@ -86,7 +86,7 @@ class SupervisorState(BaseModel):
     max_steps: int = 25
     loop_count: int = 0
     max_loops: int = 3
-    author_model: str = "spark-x25-4b-q4"
+    author_model: str = "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M"
     author_family: str = "spark"
     planned_actions: list[SupervisorAction] = Field(default_factory=list)
     executed_actions: list[SupervisorAction] = Field(default_factory=list)

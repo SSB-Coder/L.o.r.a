@@ -201,13 +201,11 @@ async def run_phase1_benchmark() -> None:
         return
 
     installed = await client.installed_models()
-    from lora.models.selection import is_excluded_model
+    from lora.models.selection import PREFERRED_MODEL, is_excluded_model
 
     preferred_order = [
-        "spark-x25-4b-8k:latest",
+        PREFERRED_MODEL,
         "granite4.2:3b",
-        "spark-x25-4b-32k:latest",
-        "hf.co/XHToken/Spark-X2.5-4B-GGUF:Q4_K_M",
         "granite4.2:8b",
         "gemma4:e4b",
     ]
@@ -226,7 +224,7 @@ async def run_phase1_benchmark() -> None:
     # Measure swap latency between primary writer (Spark) and primary verifier (Granite)
     console.print("\n[bold cyan]Measuring model swap latency (Spark <-> Granite 3B)...[/bold cyan]")
     try:
-        swap_time_s = await measure_model_swap(client, "spark-x25-4b-8k:latest", "granite4.2:3b")
+        swap_time_s = await measure_model_swap(client, PREFERRED_MODEL, "granite4.2:3b")
         console.print(f"Swap latency: [bold green]{swap_time_s} s[/bold green]")
     except Exception as e:
         swap_time_s = None

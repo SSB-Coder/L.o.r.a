@@ -252,10 +252,10 @@ def test_roles_from_lora_yaml_choose_the_other_model_families():
     role = load_role("verifier")
     assert role.get("name")
     assert candidate_names(None, role, "verifier")[0] == role["name"]  # that role's own model comes first
-    assert candidate_names(None, load_role("writer"))[0] == "spark-x25-4b"  # the base writer stays Spark 4B
-    installed = ["spark-x25-4b-8k:latest", role["name"], "granite4.2:8b"]
-    judge, independent = pick_judge_model(installed, "spark-x25-4b-8k:latest")
-    assert independent and judge != "spark-x25-4b-8k:latest"
+    assert candidate_names(None, load_role("writer"))[0] == "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M"  # the base writer stays Spark 4B
+    installed = ["hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M", role["name"], "granite4.2:8b"]
+    judge, independent = pick_judge_model(installed, "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M")
+    assert independent and judge != "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M"
 
 
 # ---- v5 Agentic Harness, Kokoro TTS (af_sky), Model Switching, 8-Way Verification & Artifacts -------------------------
@@ -331,7 +331,7 @@ async def test_open_wikipedia_on_page_and_open_chatgpt_and_ask(tmp_path, monkeyp
 def test_manual_and_automatic_model_selection():
     from lora.models.selection import QWYTHOS_MODEL, candidate_names, is_complex_query, pick_escalation_model
 
-    cands_manual = candidate_names("ornith-1.5:9b", {"name": "spark-x25-4b"}, role="writer", manual_model="granite4.2:8b")
+    cands_manual = candidate_names("ornith-1.5:9b", {"name": "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M"}, role="writer", manual_model="granite4.2:8b")
     assert cands_manual[0] == "granite4.2:8b"
 
     cands_complex = candidate_names(None, {}, role="complex")
@@ -341,7 +341,7 @@ def test_manual_and_automatic_model_selection():
     cands_vision = candidate_names(None, {}, role="vision")
     assert "gemma4:e4b" in cands_vision[:2] and "gemma3:4b" in cands_vision[:3]
 
-    esc = pick_escalation_model(["SparkLLM/Spark-X2.5-4B:latest", "granite4.2:8b"], "SparkLLM/Spark-X2.5-4B:latest")
+    esc = pick_escalation_model(["hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M", "granite4.2:8b"], "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M")
     assert esc == "granite4.2:8b"
     assert is_complex_query("Compare the architectural trade-offs between Mamba and Transformers in depth")
 
@@ -375,7 +375,7 @@ async def test_research_displays_reference_check_without_scorecard(tmp_path, mon
 
     rt._research_fn = _fake_res
 
-    respx.get(f"{URL}/api/tags").respond(200, json={"models": [{"name": "SparkLLM/Spark-X2.5-4B:latest"}, {"name": "granite4.2:8b"}]})
+    respx.get(f"{URL}/api/tags").respond(200, json={"models": [{"name": "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M"}, {"name": "granite4.2:8b"}]})
     respx.post(f"{URL}/api/chat").respond(200, content=nd("Mamba scales linearly with sequence length [S1]."))
 
     res = await turn(rt, "verified research on mamba state space models")

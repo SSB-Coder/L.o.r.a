@@ -53,7 +53,7 @@ def configure(mode, voice=False):
         if mode == "down":
             raise httpx.ConnectError("scripted engine unavailable", request=request)
         if request.url.path.endswith("/api/tags"):
-            return httpx.Response(200, json={"models": [{"name": "SparkLLM/Spark-X2.5-4B:latest"}]})
+            return httpx.Response(200, json={"models": [{"name": "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M"}]})
         if request.url.path.endswith("/api/generate"):
             return httpx.Response(200, json={"done": True})
         if request.url.path.endswith("/api/chat"):

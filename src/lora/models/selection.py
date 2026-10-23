@@ -3,11 +3,10 @@
 Supports:
 - Manual model selection (`manual_model` override from UI or voice/text command)
 - Automatic complexity & modality routing tailored to installed local Ollama models:
-  - `writer` (Base fast model) -> `spark-x25-4b` (`spark-x25-4b-8k:latest`, 2.6 GB, fast everyday turns)
-  - `planner` / `controller` / `verifier` -> `granite4.2:8b` (smart 8B for intent, planning, and verification)
-  - `complex` / `supervisor` / `deep` -> `hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest` (Mythos 9B thinking) -> `ornith-1.5:9b` -> `granite4.2:8b`
+  - `writer` / `reader` / `planner` -> Spark-X2.6-4B Q4_K_M, sharing an 8192-token profile
+  - `controller` / `verifier` -> Granite 3B
+  - `complex` / `supervisor` -> Granite 8B, with configured specialist fallbacks
   - `vision` / `optimizer` -> `gemma4:e4b`
-  - `reader` -> `spark-x25-4b-32k:latest` (32k long-context map-reduce)
 - Hard-excludes oversized models (`gemma4:26b`, 18 GB) from automatic selection on 16 GB RAM
 - Strict v1.5 Plan rule: ONE fixed `num_ctx` per model tag (8192 for interactive models, 32768 only for `-32k` reader)
   so Ollama never unloads/reloads the same model between steps.
@@ -28,8 +27,8 @@ from lora.models.ollama_client import OllamaClient, match_models
 
 logger = logging.getLogger(__name__)
 
-# Base fast model for quick everyday turns (2.6 GB in 6 GB VRAM); complex prompts escalate to 8B/9B
-PREFERRED_MODEL = "spark-x25-4b"
+# Use the installed quantized tag for startup, chat, planning, and document reading.
+PREFERRED_MODEL = "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M"
 QWYTHOS_MODEL = "hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest"
 
 # Oversized models (>12 GB) that must never be auto-selected on a 6 GB VRAM / 16 GB RAM laptop
@@ -42,7 +41,7 @@ EXCLUDED_MODELS: tuple[str, ...] = (
 )
 
 DEFAULT_FALLBACKS: tuple[str, ...] = (
-    "spark-x25-4b-8k:latest",
+    "spark-x26-4b",
     "granite4.2:3b",
     "gemma4:e4b",
     "granite4.2:8b",

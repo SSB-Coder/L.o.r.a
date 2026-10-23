@@ -65,7 +65,7 @@ gateway:
     allow_local_files: false
 models:
   planner:
-    name: gemma4:e4b
+    name: hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M
     think: false
     num_ctx: 8192
     fallback:
@@ -77,13 +77,13 @@ models:
     fallback:
     - granite4.2:8b
   writer:
-    name: spark-x25-4b-8k:latest
+    name: hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M
     family: spark
     think: false
     temperature: 0.3
     num_ctx: 8192
     fallback:
-    - spark-x25-4b-q4
+    - spark-x26-4b
     - granite4.2:3b
     - gemma4:e4b
   complex:
@@ -94,7 +94,7 @@ models:
     fallback:
     - hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest
     - ornith-1.5:9b
-    - spark-x25-4b-8k:latest
+    - hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M
   vision:
     name: gemma4:e4b
     think: false
@@ -104,16 +104,16 @@ models:
     - gemma3:4b
     - llava:latest
     - qwen2.5vl:latest
-    - spark-x25-4b-8k:latest
+    - hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M
   reader:
-    name: spark-x25-4b-32k:latest
+    name: hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M
     family: spark
     think: false
     temperature: 0.2
-    num_ctx: 32768
+    num_ctx: 8192  # shared with writer/planner to avoid reloading between roles
     fallback:
-    - spark-x25-4b-8k:latest
-    - spark-x25-4b-q4
+    - spark-x26-4b
+    - granite4.2:3b
   verifier:
     name: granite4.2:3b
     think: false

@@ -44,7 +44,7 @@ class ModelsConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     ollama_url: str = "http://127.0.0.1:11434"
-    default_model: str = "spark-x25-4b-q4"
+    default_model: str = "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M"
     supervisor_model: str = "granite4.2:8b"
     verifier_model: str = "ornith-1.5:9b"
 
