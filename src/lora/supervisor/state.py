@@ -10,6 +10,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from lora.models.profiles import PREFERRED_MODEL
+
 
 class GraphNode(StrEnum):
     """Execution graph nodes for L.O.R.A Supervisor workflow."""
@@ -86,7 +88,7 @@ class SupervisorState(BaseModel):
     max_steps: int = 25
     loop_count: int = 0
     max_loops: int = 3
-    author_model: str = "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M"
+    author_model: str = PREFERRED_MODEL
     author_family: str = "spark"
     planned_actions: list[SupervisorAction] = Field(default_factory=list)
     executed_actions: list[SupervisorAction] = Field(default_factory=list)

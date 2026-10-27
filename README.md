@@ -470,6 +470,14 @@ data. API data access and listener Host/Origin rules are checked separately.
 | [safety/](src/lora/safety/) | Policy, provenance, egress, parsing isolation, cancellation, shutdown IPC. |
 | [verify/](src/lora/verify/), [supervisor/](src/lora/supervisor/), [outer_loop/](src/lora/outer_loop/) | Retained verification, supervision, and optimization components outside default research. |
 
+Runtime routing and model calls stay in `agent/runtime.py`; answer/research
+workflows live in `agent/answers.py`, commands and artifacts in `agent/actions.py`,
+and shared turn data in `agent/contracts.py`. Existing runtime imports remain
+compatible. Desktop microphone setup and speech callbacks live in
+`voice/desktop_input.py` and `voice/desktop_output.py`; the desktop still owns
+their handles, GUI dispatch, cancellation, and shutdown. Python model defaults
+are shared through the lightweight `models/profiles.py` module.
+
 A desktop request is classified, resolved against commands or sources, and
 answered through the selected model or permitted tool. Research planning and
 writing reuse the writer. Qt receives UI updates through its dispatcher; speech

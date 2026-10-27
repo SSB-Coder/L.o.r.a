@@ -8,6 +8,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from lora.models.profiles import PREFERRED_MODEL
+
 
 def get_model_family(model_name: str) -> str:
     """Map model name or tag to its underlying architecture family."""
@@ -240,7 +242,7 @@ class RoundTableEvaluator:
         evidence_cards: list[dict[str, Any]],
         depth_mode: str = "standard",
         run_mode: str = "quick",
-        author_model: str = "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M",
+        author_model: str = PREFERRED_MODEL,
         judge_model: str = "granite4.2:8b",
     ) -> RoundTableReport:
         """Run sequential persona evaluations (or fast path if quick mode)."""

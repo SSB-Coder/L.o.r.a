@@ -9,6 +9,8 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from lora.models.profiles import PREFERRED_MODEL
+
 logger = logging.getLogger(__name__)
 
 
@@ -44,7 +46,7 @@ class ModelsConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     ollama_url: str = "http://127.0.0.1:11434"
-    default_model: str = "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M"
+    default_model: str = PREFERRED_MODEL
     supervisor_model: str = "granite4.2:8b"
     verifier_model: str = "ornith-1.5:9b"
 

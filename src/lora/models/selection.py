@@ -24,12 +24,22 @@ from typing import Any
 import yaml
 
 from lora.models.ollama_client import OllamaClient, match_models
+from lora.models.profiles import (
+    KEEP_ALIVE as KEEP_ALIVE,
+)
+from lora.models.profiles import (
+    MAX_INTERACTIVE_CTX as MAX_INTERACTIVE_CTX,
+)
+from lora.models.profiles import (
+    PREFERRED_MODEL as PREFERRED_MODEL,
+)
+from lora.models.profiles import (
+    QWYTHOS_MODEL as QWYTHOS_MODEL,
+)
 
 logger = logging.getLogger(__name__)
 
 # Use the installed quantized tag for startup, chat, planning, and document reading.
-PREFERRED_MODEL = "hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M"
-QWYTHOS_MODEL = "hf.co/empero-ai/Qwythos-9B-v2-GGUF:latest"
 
 # Oversized models (>12 GB) that must never be auto-selected on a 6 GB VRAM / 16 GB RAM laptop
 EXCLUDED_MODELS: tuple[str, ...] = (
@@ -67,8 +77,6 @@ VISION_PREFERENCE: tuple[str, ...] = (
     "granite4.2:8b",
     PREFERRED_MODEL,
 )
-MAX_INTERACTIVE_CTX = 8192
-KEEP_ALIVE = "24h"
 
 
 @dataclass(frozen=True)
