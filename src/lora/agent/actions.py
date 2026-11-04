@@ -27,8 +27,8 @@ from lora.agent.fuzzy import best_key
 from lora.agent.notes import create_artifact, generate_visual
 from lora.agent.research import Source
 from lora.agent.source_check import source_metadata
-from lora.agent.verification import cards_from_sources
 from lora.dialogue import build_messages, build_note_messages
+from lora.grounding.cards import cards_from_sources
 from lora.net import async_client
 from lora.safety.gate import DataProvenance
 

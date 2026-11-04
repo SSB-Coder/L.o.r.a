@@ -30,9 +30,9 @@ class SubAgentSpec:
 SUBAGENTS: dict[str, SubAgentSpec] = {
     "supervisor": SubAgentSpec(
         id="supervisor",
-        name="Supervisor & Laya Router Agent",
+        name="Coordinator & Decision Router",
         role="Orchestrator & Decision Router",
-        description="Classifies intent, depth, and risk via Laya on CPU, selects the optimal model & skill, and coordinates specialist sub-agents.",
+        description="Classifies intent, depth, and risk with fast rules by default, supports optional CPU neural routing, and coordinates specialist workflows.",
         default_model_role="planner",
     ),
     "system_navigator": SubAgentSpec(
@@ -75,7 +75,7 @@ SUBAGENTS: dict[str, SubAgentSpec] = {
 
 @dataclass
 class AgentExecutionTrace:
-    """Tracks Laya routing, specialist sub-agents, and skills that participated in a turn for UI visibility."""
+    """Tracks routing decisions, specialist workflows, and skills that participated in a turn for UI visibility."""
 
     active_skill: str | None = None
     model_used: str = ""

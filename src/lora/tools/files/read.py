@@ -1,4 +1,4 @@
-"""Safe file reading with PyMuPDF (or pypdf fallback) PDF extraction for L.O.R.A."""
+"""Safe file reading with isolated PyMuPDF PDF extraction for L.O.R.A."""
 
 import os
 from pathlib import Path

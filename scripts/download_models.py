@@ -1,6 +1,7 @@
 """Download and verify local zero-VRAM models in models/ for L.O.R.A.
 
-Downloads and installs:
+Default setup installs CPU Kokoro and EmbeddingGemma. Optional models require
+--laya-only, --reranker-only, or --all-models. Available assets:
 1. Kokoro TTS (kokoro-v1.0.onnx + voices-v1.0.bin) -> models/kokoro
 2. Laya Decision Router (AgencyL1/Laya-Lora-4B) -> models/laya-lora-ft
 3. Embedding Gemma 2 (google/embeddinggemma-2) -> models/embeddinggemma2 (or models/embeddinggemma-2)
@@ -194,10 +195,12 @@ def setup_bge_reranker(force: bool = False) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Download and setup models/ directory for L.O.R.A")
     parser.add_argument("--force", action="store_true", help="Force redownload existing models")
-    parser.add_argument("--kokoro-only", action="store_true", help="Setup Kokoro only")
-    parser.add_argument("--laya-only", action="store_true", help="Setup Laya only")
-    parser.add_argument("--embedding-only", action="store_true", help="Setup Embedding Gemma 2 only")
-    parser.add_argument("--reranker-only", action="store_true", help="Setup BGE Reranker only")
+    selectors = parser.add_mutually_exclusive_group()
+    selectors.add_argument("--all-models", action="store_true", help="Also setup optional Laya and reranker weights")
+    selectors.add_argument("--kokoro-only", action="store_true", help="Setup Kokoro only")
+    selectors.add_argument("--laya-only", action="store_true", help="Setup Laya only")
+    selectors.add_argument("--embedding-only", action="store_true", help="Setup Embedding Gemma 2 only")
+    selectors.add_argument("--reranker-only", action="store_true", help="Setup BGE Reranker only")
     args = parser.parse_args()
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -214,9 +217,10 @@ def main() -> int:
         results["bge-reranker"] = setup_bge_reranker(args.force)
     else:
         results["kokoro"] = setup_kokoro(args.force)
-        results["laya"] = setup_laya(args.force)
         results["embeddinggemma"] = setup_embeddinggemma(args.force)
-        results["bge-reranker"] = setup_bge_reranker(args.force)
+        if args.all_models:
+            results["laya"] = setup_laya(args.force)
+            results["bge-reranker"] = setup_bge_reranker(args.force)
 
     logger.info("--------------------------------------------------")
     logger.info("Model Setup Summary:")

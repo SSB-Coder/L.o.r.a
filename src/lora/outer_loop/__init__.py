@@ -1,36 +1,35 @@
-"""L.O.R.A Outer Loop / Recursive Self-Improvement Package."""
+"""Compatibility exports for lora.experimental.outer_loop.
 
-from lora.outer_loop.genome import (
-    EditValidator,
-    GenomeRegistry,
-    PromptGenome,
-    TemplateCompiler,
-)
-from lora.outer_loop.loop import IterationRecord, OptimizationTrajectory, RSIEngine
-from lora.outer_loop.offline import BenchmarkReport, BenchmarkRunner, BenchmarkTask
-from lora.outer_loop.optimizer import (
-    PromptMutationProposal,
-    PromptOptimizerAgent,
-    TraceAnalyzer,
-    TraceDiagnostic,
-)
-from lora.outer_loop.scorer import OuterLoopScorer, ScoreBreakdown
+Keep this package path intact so historical child imports resolve through their
+forwarding modules and cannot construct duplicate model classes.
+"""
 
-__all__ = [
-    "BenchmarkReport",
-    "BenchmarkRunner",
-    "BenchmarkTask",
-    "EditValidator",
-    "GenomeRegistry",
-    "IterationRecord",
-    "OptimizationTrajectory",
-    "OuterLoopScorer",
-    "PromptGenome",
-    "PromptMutationProposal",
-    "PromptOptimizerAgent",
-    "RSIEngine",
-    "ScoreBreakdown",
-    "TemplateCompiler",
-    "TraceAnalyzer",
-    "TraceDiagnostic",
-]
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from lora.experimental.outer_loop import (
+        BenchmarkReport,
+        BenchmarkRunner,
+        BenchmarkTask,
+        EditValidator,
+        GenomeRegistry,
+        IterationRecord,
+        OptimizationTrajectory,
+        OuterLoopScorer,
+        PromptGenome,
+        PromptMutationProposal,
+        PromptOptimizerAgent,
+        RSIEngine,
+        ScoreBreakdown,
+        TemplateCompiler,
+        TraceAnalyzer,
+        TraceDiagnostic,
+    )
+
+__all__ = ['BenchmarkReport', 'BenchmarkRunner', 'BenchmarkTask', 'EditValidator', 'GenomeRegistry', 'IterationRecord', 'OptimizationTrajectory', 'OuterLoopScorer', 'PromptGenome', 'PromptMutationProposal', 'PromptOptimizerAgent', 'RSIEngine', 'ScoreBreakdown', 'TemplateCompiler', 'TraceAnalyzer', 'TraceDiagnostic']
+
+
+def __getattr__(name):
+    from importlib import import_module
+
+    return getattr(import_module("lora.experimental.outer_loop"), name)

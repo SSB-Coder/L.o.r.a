@@ -25,7 +25,6 @@ if sys.platform == "win32":
 # Ensure src/ is accessible
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-import faiss
 import httpx
 import numpy as np
 from pydantic import BaseModel, Field
@@ -154,6 +153,8 @@ def benchmark_embeddings_and_faiss(
     tok_per_sec = len(test_corpus) / encode_time_s
 
     dim = embeddings.shape[1]
+
+    import faiss  # Optional: install with the faiss extra for this benchmark.
 
     # FAISS IndexFlatIP (Cosine similarity since embeddings are normalized)
     t0_faiss = time.perf_counter()

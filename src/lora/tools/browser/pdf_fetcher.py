@@ -25,7 +25,7 @@ class PdfFetcher:
         self.spotlighter = spotlighter or Spotlighter()
 
     async def fetch_pdf(self, url: str) -> dict[str, Any]:
-        """Fetch remote PDF, parse text with PyMuPDF (or pypdf fallback), and remove scratch file."""
+        """Fetch remote PDF, parse text with isolated PyMuPDF, and remove scratch file."""
         egress_res = self.egress_filter.check_egress(url)
         if not egress_res.allowed:
             return {

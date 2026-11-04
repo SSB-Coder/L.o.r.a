@@ -184,6 +184,8 @@ class OllamaEnvConfig(BaseModel):
 class ModelsConfig(BaseModel):
     planner: ModelRoleConfig
     controller: ModelRoleConfig
+    complex: ModelRoleConfig | None = None
+    vision: ModelRoleConfig | None = None
     writer: ModelRoleConfig
     reader: ModelRoleConfig
     verifier: ModelRoleConfig

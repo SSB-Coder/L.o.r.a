@@ -184,7 +184,7 @@ body.empty #hint{bottom:78px}
      <option value="bm_lewis">bm_lewis (UK Male Lewis)</option>
      <option value="bm_daniel">bm_daniel (UK Male Daniel)</option>
     </select>
-    <div class="mh">Specialist Sub-Agents (6 Active + Laya Router)</div>
+    <div class="mh">Specialist Workflow Routes</div>
     <div id="subagent-list">
      <div class="ag-pill"><b>Laya Decision Router</b><span>CPU intent, depth, risk &amp; topic classification</span></div>
      <div class="ag-pill"><b>Supervisor &amp; Planner</b><span>Intent routing, skill selection &amp; model scaling</span></div>
@@ -609,7 +609,7 @@ function renderAgentTrace(m,meta){
  const d=document.createElement('div');d.className='agent-trace';
  const chips=[];
  if(laya&&laya.intent){
-  chips.push('<span class="agent-chip laya">Laya Router: '+esc(laya.intent)+' · '+esc(laya.depth_mode||'standard')+' · '+esc(laya.action_risk||'tier0')+'</span>');
+  chips.push('<span class="agent-chip laya">Router: '+esc(laya.intent)+' · '+esc(laya.depth_mode||'standard')+' · '+esc(laya.action_risk||'tier0')+'</span>');
  }
  if(tr&&tr.active_skill&&tr.active_skill!=='auto')chips.push('<span class="agent-chip">Skill: '+esc(tr.active_skill)+'</span>');
  if(tr&&tr.agents){

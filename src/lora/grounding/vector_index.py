@@ -53,7 +53,10 @@ class NumpyFlatIndex:
 
 def make_index(dimension: int):
     if backend_name() == "faiss":
-        import faiss
+        try:
+            import faiss
+        except ImportError as exc:
+            raise RuntimeError("FAISS is optional; install it with `uv sync --extra faiss` before selecting this backend") from exc
         return faiss.IndexFlatIP(dimension)
     return NumpyFlatIndex(dimension)
 

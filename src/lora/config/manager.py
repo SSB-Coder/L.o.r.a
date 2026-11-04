@@ -98,11 +98,10 @@ DEFAULT_MCP_JSON = {
 }
 
 DEFAULT_USER_PROFILE_MD = """# User Profile & Preferences
-*Last Updated: 2026-10-09*
 
 ## Interaction Preferences
 - Style: Clear, casual, concise; technical depth when requested.
-- Research depth: Thorough with multi-source citation verification.
+- Research depth: Cited answers with lightweight source-reference checks.
 - Tone: Casual friend and dependable butler.
 
 ## Memory & Context
@@ -165,11 +164,11 @@ class ConfigManager:
                 yaml.dump(
                     {
                         "name": "deep_research_brief",
-                        "description": "Multi-source verified research briefing with executive summary",
+                        "description": "Multi-source cited research briefing with executive summary",
                         "triggers": ["research brief", "executive briefing", "deep briefing"],
                         "required_tools": ["web_search", "fetch_page"],
-                        "system_prompt_addon": "Start with a 2-sentence executive summary, then list verified findings with inline [S1] citations.",
-                        "default_depth": "deep_with_refinement",
+                        "system_prompt_addon": "Start with a 2-sentence executive summary, then list source-supported findings with inline [S1] citations. Do not claim independent fact checking.",
+                        "default_depth": "deep",
                     },
                     sort_keys=False,
                 ),

@@ -1,11 +1,17 @@
 """Evidence cards representation and extraction for grounded synthesis."""
 
+from __future__ import annotations
+
 import re
 import time
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from lora.grounding.chunk import DocumentChunk
+
+if TYPE_CHECKING:
+    from lora.agent.research import Source
 
 
 class EvidenceCard(BaseModel):
@@ -82,3 +88,12 @@ class EvidenceCardExtractor:
             card_counter += 1
 
         return cards
+
+
+def cards_from_sources(sources: list[Source]) -> list[EvidenceCard]:
+    cards = []
+    for s in sources:
+        quote = (s.text or s.snippet).strip()
+        if quote:
+            cards.append(EvidenceCard(card_id=s.id, claim_fact=s.title, exact_quote=quote, source_url=s.url, title=s.title, tier=s.tier))
+    return cards

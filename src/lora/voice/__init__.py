@@ -1,9 +1,8 @@
 """L.O.R.A Voice Pipeline package.
 
-Exports are resolved lazily. ``VoiceController`` pulls in the whole tool stack
-(planner, Laya, Playwright, FAISS...); importing it eagerly meant that a single
-missing optional dependency made ``from lora.voice.capture import AudioCapture``
-fail, and main.py swallowed that as a log warning, so mic and TTS never started.
+Exports are resolved lazily so importing capture/STT does not initialize the
+whole application. Historical controllers resolve to lora.experimental.legacy;
+the old Qwen worker name is a CPU Kokoro compatibility wrapper.
 """
 
 from __future__ import annotations

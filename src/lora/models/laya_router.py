@@ -1,6 +1,8 @@
-"""Typed decision router for L.O.R.A using Convai Laya (local `models/laya-lora-ft` on CPU).
+"""Rule-based intent routing with an optional local Convai Laya CPU backend.
 
-Provides fast, non-autoregressive, calibrated decision routing on CPU (0 MB GPU VRAM):
+The desktop uses predict_fast by default; its heuristic scores are not measured
+confidence probabilities. Explicit predict/preload can load local neural assets.
+Routing describes:
 - Intent: research | control | chat
 - Action Risk: tier0 | tier1 | tier2 | tier3
 - Depth Mode: eli5 | simple | standard | detailed | expert
@@ -28,10 +30,19 @@ from pydantic import BaseModel, Field
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-try:
-    import laya
-except ImportError:  # optional until the Laya router is actually used
-    laya = None  # type: ignore[assignment]
+laya = None
+
+
+def _optional_laya():
+    global laya
+    if laya is None:
+        from importlib import import_module
+
+        try:
+            laya = import_module("laya")
+        except ImportError:
+            logger.info("Neural routing unavailable; install the neural-routing extra to enable it")
+    return laya
 
 
 logger = logging.getLogger(__name__)
@@ -216,7 +227,8 @@ class LayaDecisionRouter:
             return
         self._backend_loaded = True
         ckpt_dir = Path(self.checkpoint_path)
-        if laya is not None:
+        backend = _optional_laya()
+        if backend is not None:
             # 1. Prefer direct local Agent load from checkpoint on disk (0 downloads, 100% offline)
             if ckpt_dir.exists() and (ckpt_dir / "model.safetensors").exists() and hasattr(laya, "Agent"):
                 try:

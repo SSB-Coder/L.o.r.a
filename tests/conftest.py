@@ -19,6 +19,7 @@ def no_private_router_weights_in_unit_tests(request, monkeypatch):
     if "unit" in request.path.parts:
         from lora.models import laya_router
         monkeypatch.setattr(laya_router, "laya", None)
+        monkeypatch.setattr(laya_router, "_optional_laya", lambda: laya_router.laya)
         # Tests of the embedding/reranker boundary install explicit fake
         # backends. Everything else exercises the unavailable-model behavior,
         # never the user's multi-GB private models or network downloads.

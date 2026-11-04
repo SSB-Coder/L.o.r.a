@@ -33,6 +33,7 @@ def configure(mode, voice=False):
     # These patches are subprocess-local and deliberately never affect startup.
     hud.WEB_ENGINE_AVAILABLE = False
     router.laya = None
+    router._optional_laya = lambda: None
     payloads = []
 
     class Tokens(httpx.AsyncByteStream):

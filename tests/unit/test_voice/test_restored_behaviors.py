@@ -47,7 +47,8 @@ def test_kokoro_failure_never_invokes_another_engine(monkeypatch):
     monkeypatch.setattr(worker, "get_kokoro_model", lambda _: None)
     forbidden = Mock(side_effect=AssertionError("Another speech engine was called"))
     for name in ("get_qwen_model", "get_external_server", "_windows_speech_synth", "_fallback_synth"):
-        monkeypatch.setattr(worker, name, forbidden)
+        assert not hasattr(worker, name)
+    monkeypatch.setitem(__import__("sys").modules, "qwen_tts", forbidden)
     engine = TtsEngine()
     assert isinstance(engine.worker, worker.KokoroTtsWorkerProcess)
     result = engine.worker.synthesize("Hello")

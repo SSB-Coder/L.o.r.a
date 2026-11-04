@@ -107,6 +107,23 @@ For tests and linting, include the development dependencies:
 uv sync --locked --python 3.12 --extra dev
 ```
 
+Optional backends are installed explicitly; the default installation does not
+require FAISS, Laya, openWakeWord, or TorchVision:
+
+| Extra | Install command | Purpose |
+|---|---|---|
+| `faiss` | `uv sync --locked --extra faiss` | Optional native vector index; NumPy remains the default. |
+| `neural-routing` | `uv sync --locked --extra neural-routing` | Laya backend for explicit CPU neural routing. |
+| `wakeword` | `uv sync --locked --extra wakeword` | openWakeWord backend when suitable custom weights and engine configuration are supplied. |
+| `experimental` | `uv sync --locked --extra experimental` | Additional neural/transformer compatibility dependencies for standalone experiments. |
+
+Extras install Python packages, not model weights, and do not activate a
+backend. Combine multiple `--extra` options when needed, including `--extra dev`
+for tests. The default still includes CPU embeddings, Kokoro, Faster-Whisper,
+the desktop UI, browser tools, and the mobile gateway. Existing optional
+packages are not uninstalled by a source update; a subsequent `uv sync` follows
+the extras selected in that command.
+
 For browser automation:
 
 ```powershell
@@ -114,8 +131,9 @@ uv run playwright install chromium
 ```
 
 The alternative [Windows installer](scripts/install.ps1) can create shortcuts
-and initialize user configuration. Its default model setup includes optional
-large models; use `-SkipModels` for a selective setup.
+and initialize user configuration. It installs the default runtime and prepares
+CPU Kokoro and embedding assets. Use `-SkipModels` to skip downloads, or
+`-Extras faiss,neural-routing` to request optional Python backends.
 [run_lora.bat](run_lora.bat) starts the installed environment from the project root.
 
 ### 2. Prepare the language model
@@ -166,9 +184,11 @@ uv run python scripts/download_models.py --embedding-only
 
 The [downloader](scripts/download_models.py) uses the repository root, reuses
 recognized assets, and provides `--laya-only` and `--reranker-only` options.
-Without a selector it attempts all asset groups. Hugging Face downloads may
-require access approval or authentication. Read the setup summary: optional
-assets can be unavailable even when the script returns success.
+Without a selector it prepares Kokoro and EmbeddingGemma only. Use
+`--all-models` to include the optional router and reranker, or an individual
+selector for a single asset group. Hugging Face downloads may require access
+approval or authentication. Read the setup summary: unavailable assets are
+reported even when the helper returns success.
 
 Whisper first tries cached models and may download its configured model when
 needed. Cache the required assets before expecting offline voice. Default fast
@@ -271,7 +291,9 @@ competing voices, device gain, and playback echo still affect recognition.
 Speech runs in recoverable child processes by default. Exit stops queued speech
 before closing the worker and waits a bounded time for speech threads. An
 unexpected worker crash can be retried on a later request. Kokoro remains the
-active desktop TTS engine.
+only desktop TTS engine. The former Qwen implementation and standalone voice
+server have been removed. Historical voice aliases and the old worker class
+name resolve to CPU Kokoro; they cannot activate another speech backend.
 
 ## Documents and research
 
@@ -324,7 +346,8 @@ No truthfulness percentage is assigned to this structural check.
 
 Normal `quick`, `standard`, `deep`, and compatibility `deep_with_refinement`
 paths do not run NLI, an independent reviewer, iterative repairs, or prompt
-mutation loops. Older implementations remain for standalone/experimental use.
+mutation loops. The older implementations live under `lora.experimental` for explicit
+standalone use; see [experimental components](src/lora/experimental/README.md).
 
 ELI5, Simple, Standard, Detailed, and Expert describe explanation style, not
 independent verification. Cached rewrites can reuse earlier evidence without
@@ -388,8 +411,8 @@ helper for an intentionally configured isolated LAN. Its defaults are port
 | `logs/native-fault-<pid>.log` | Native worker fault reports. |
 
 `models_dir: models` resolves from the project root. Launching from another
-directory does not relocate the weights. Some historical model/backend settings
-remain for experiments; their YAML presence does not make them active.
+directory does not relocate the weights. Some model/backend sections remain as explicitly labelled experimental or
+reference settings. Their YAML presence does not activate those components.
 
 | Environment variable | Purpose |
 |---|---|
@@ -404,6 +427,29 @@ remain for experiments; their YAML presence does not make them active.
 | `LORA_OUTPUTS_DIR` | Custom output location; policy must also allow the target. |
 | `OLLAMA_MAX_LOADED_MODELS` | Ollama-server setting; reference value `1`. |
 | `OLLAMA_MODELS` | Ollama model-store location, independent of LORA assets. |
+
+Configuration boundaries are explicit:
+
+- Desktop source/model paths use `models_dir` and the documented environment
+  overrides. CPU STT currently consumes `model`, `compute`, and `initial_prompt`.
+  Its backend, four-thread budget and confidence thresholds remain fixed in
+  `voice/stt.py`; ineffective YAML tuning entries have been removed. Hotkeys
+  stay in `voice/hotkey.py`; the HUD selects Kokoro voices and `models_dir`
+  determines their asset directory. The unused YAML TTS profile duplicates
+  were also removed.
+- Transcript wake detection is the default. `LORA_NEURAL_ROUTING=1` opts into
+  neural intent routing; it is separate from wake detection and needs its own
+  extra and local weights.
+- Writer selection keeps the preferred Spark-X2.6 tag first unless a manual UI
+  selection or `LORA_MODEL` overrides it. YAML/user-default entries then provide
+  fallback candidates. The fixed model context profiles still take precedence
+  over YAML `num_ctx`; this cleanup does not increase context.
+- CLI listener arguments and LAN detection determine gateway addresses.
+  `config/policy.yaml` controls action permissions and budgets. YAML reference
+  gateway/safety sections are labelled accordingly.
+- MCP activation uses `LORA_ENABLE_MCP` and `~/.lora/mcp.json`. The unused YAML
+  MCP/browser switches and unimplemented STT fallback-engine list were removed.
+  Historical configuration model fields remain accepted for compatibility.
 
 The supplied filesystem MCP server is disabled. Review executables, arguments,
 and permitted roots before enabling a server; an example root is not permission
@@ -468,14 +514,19 @@ data. API data access and listener Host/Origin rules are checked separately.
 | [ui/](src/lora/ui/) | HUD, droplet, tray, thread-safe UI delivery. |
 | [storage/](src/lora/storage/) | Notebooks, memory helpers, exports, migrations. |
 | [safety/](src/lora/safety/) | Policy, provenance, egress, parsing isolation, cancellation, shutdown IPC. |
-| [verify/](src/lora/verify/), [supervisor/](src/lora/supervisor/), [outer_loop/](src/lora/outer_loop/) | Retained verification, supervision, and optimization components outside default research. |
+| [experimental/](src/lora/experimental/) | Explicit verification, supervision, prompt evolution, and older standalone coordinators. |
+| Historical `verify/`, `supervisor/`, `outer_loop/` and controller modules | Small compatibility imports pointing to the experimental implementations. |
 
 Runtime routing and model calls stay in `agent/runtime.py`; answer/research
 workflows live in `agent/answers.py`, commands and artifacts in `agent/actions.py`,
 and shared turn data in `agent/contracts.py`. Existing runtime imports remain
 compatible. Desktop microphone setup and speech callbacks live in
 `voice/desktop_input.py` and `voice/desktop_output.py`; the desktop still owns
-their handles, GUI dispatch, cancellation, and shutdown. Python model defaults
+their handles, GUI dispatch, cancellation, and shutdown. Legacy `VoiceController`,
+`Controller`/`ControlPlanner`, and `ResearchPipeline` implementations live under
+`experimental/legacy`; their original import paths forward to the same module
+objects. This preserves existing integrations without keeping parallel
+implementations in the supported runtime packages. Python model defaults
 are shared through the lightweight `models/profiles.py` module.
 
 A desktop request is classified, resolved against commands or sources, and
@@ -512,19 +563,23 @@ Live model evaluations are explicit:
 uv run python -m pytest tests/evals --run-model-evals -q
 ```
 
-They need the intended local assets. Some evaluate the retained experimental
-verifier rather than normal research. Additional HUD JavaScript tests need Node
+They need the intended local assets. Some evaluate the explicit experimental
+verifier rather than normal research. Experimental modules are not imported
+by ordinary startup; requesting their APIs explicitly loads them. Additional HUD JavaScript tests need Node
 and jsdom. Optional type/security tools are in `requirements-conformance.txt`.
 
 The tracked [CI workflow](.github/workflows/ci.yml) defines Windows/Linux tests,
 coverage artifacts, and lint/type/security jobs. This is not a claim that every
 remote job currently passes.
 
-Recent local validation recorded **854 passing tests and 13 skips** in a full
-run before the final shutdown repair, then **57 passing targeted checks** for
-speech/shutdown work. These separate runs overlap; their counts are not additive.
+Validation for the current cleanup includes the full regression suite,
+optional-backend import isolation, legacy module/class compatibility, default
+model-download selection, configuration-schema coverage, and lockfile checks.
+The cleanup passed **886 tests with 13 skips**, including 19 added boundary
+checks; its pre-cleanup baseline was 867 passes and 13 skips. Lint, lockfile
+validation, dependency-extra exports, and installer syntax checks also passed.
 Controlled integration uses real Qt/controller wiring with scripted model/audio
-backends, rather than certifying live microphone, GPU, or phone-network behaviour.
+backends; it does not certify live microphone, GPU, or phone-network behaviour.
 
 | Development helper | Purpose and prerequisites |
 |---|---|

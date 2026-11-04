@@ -18,9 +18,7 @@ dependencies = [
     "httpx>=0.27.0",
     "aiosqlite>=0.20.0",
     "sentence-transformers>=3.0.0",
-    "faiss-cpu>=1.8.0",
     "pillow>=10.0.0",
-    "torchvision>=0.18.0",
     "pymupdf>=1.24.0",
     "trafilatura>=2.3.1",
     "playwright>=1.63.0",
@@ -33,19 +31,21 @@ dependencies = [
     "faster-whisper>=1.2.1",
     "onnxruntime>=1.30.0",
     "pynput>=1.8.2",
-    "openwakeword>=0.6.0",
     "qrcode>=8.2",
     "fastapi>=0.143.0",
     "uvicorn>=0.54.0",
     "websockets>=17.2",
     "pyside6>=6.8.0",
-    "laya>=0.4.7",
 ]
 
 [project.scripts]
 lora = "lora.main:main"
 
 [project.optional-dependencies]
+faiss = ["faiss-cpu>=1.8.0"]
+neural-routing = ["laya>=0.4.7"]
+wakeword = ["openwakeword>=0.6.0"]
+experimental = ["laya>=0.4.7", "torchvision>=0.18.0"]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",

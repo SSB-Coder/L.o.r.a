@@ -5,7 +5,9 @@
 param (
     [switch]$SkipShortcuts,
     [switch]$SkipAcl,
-    [switch]$SkipModels
+    [switch]$SkipModels,
+    [ValidateSet("faiss", "neural-routing", "wakeword", "experimental", "dev")]
+    [string[]]$Extras = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -39,18 +41,19 @@ if (-not (Test-Path $VenvPython)) {
 
 # 3. Installing Dependencies
 Write-Host "`n[3/6] Installing package and dependencies..." -ForegroundColor Yellow
+$PackageSpec = if ($Extras.Count) { ".[" + ($Extras -join ",") + "]" } else { "." }
 $UvCmd = Get-Command uv -ErrorAction SilentlyContinue
 if ($UvCmd) {
     Write-Host "Using uv for fast dependency installation..." -ForegroundColor Gray
-    & uv pip install -e .
+    & uv pip install --python "$VenvPython" -e "$PackageSpec"
 } else {
     Write-Host "Using pip for dependency installation..." -ForegroundColor Gray
-    & "$ProjectRoot\.venv\Scripts\pip.exe" install -e .
+    & "$ProjectRoot\.venv\Scripts\pip.exe" install -e "$PackageSpec"
 }
 
 # 4. Setup Models in models/
 if (-not $SkipModels) {
-    Write-Host "`n[4/6] Setting up models in models/ (Kokoro TTS, Laya Router, Embedding Gemma 2)..." -ForegroundColor Yellow
+    Write-Host "`n[4/6] Setting up models in models/ (CPU Kokoro TTS and EmbeddingGemma)..." -ForegroundColor Yellow
     & "$VenvPython" "$ProjectRoot\scripts\download_models.py"
 } else {
     Write-Host "`n[4/6] Skipping models setup (-SkipModels specified)." -ForegroundColor Gray

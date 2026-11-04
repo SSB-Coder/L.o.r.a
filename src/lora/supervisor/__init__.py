@@ -1,59 +1,43 @@
-"""L.O.R.A Supervisor & Round Table Package."""
+"""Compatibility exports for lora.experimental.supervisor.
 
-from lora.supervisor.checkpoint import SqliteCheckpointer
-from lora.supervisor.checkpoints import (
-    ActionReviewer,
-    AnomalyWatcher,
-    AnswerReviewer,
-    EvidenceReviewer,
-    PlanReviewer,
-    ReviewResult,
-)
-from lora.supervisor.graph import StateGraph
-from lora.supervisor.orchestrator import SupervisorOrchestrator
-from lora.supervisor.roundtable import (
-    ChairPersona,
-    EditorPersona,
-    FactCheckerPersona,
-    PersonaEvaluation,
-    RoundTableEvaluator,
-    RoundTableReport,
-    SafetyOfficerPersona,
-    SkepticPersona,
-    get_model_family,
-)
-from lora.supervisor.state import (
-    AnomalyReport,
-    GraphNode,
-    NodeStatus,
-    StepRecord,
-    SupervisorAction,
-    SupervisorState,
-)
+Keep this package path intact so historical child imports resolve through their
+forwarding modules and cannot construct duplicate model classes.
+"""
 
-__all__ = [
-    "ActionReviewer",
-    "AnomalyReport",
-    "AnomalyWatcher",
-    "AnswerReviewer",
-    "ChairPersona",
-    "EditorPersona",
-    "EvidenceReviewer",
-    "FactCheckerPersona",
-    "GraphNode",
-    "NodeStatus",
-    "PersonaEvaluation",
-    "PlanReviewer",
-    "ReviewResult",
-    "RoundTableEvaluator",
-    "RoundTableReport",
-    "SafetyOfficerPersona",
-    "SkepticPersona",
-    "SqliteCheckpointer",
-    "StateGraph",
-    "StepRecord",
-    "SupervisorAction",
-    "SupervisorOrchestrator",
-    "SupervisorState",
-    "get_model_family",
-]
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from lora.experimental.supervisor import (
+        ActionReviewer,
+        AnomalyReport,
+        AnomalyWatcher,
+        AnswerReviewer,
+        ChairPersona,
+        EditorPersona,
+        EvidenceReviewer,
+        FactCheckerPersona,
+        GraphNode,
+        NodeStatus,
+        PersonaEvaluation,
+        PlanReviewer,
+        ReviewResult,
+        RoundTableEvaluator,
+        RoundTableReport,
+        SafetyOfficerPersona,
+        SkepticPersona,
+        SqliteCheckpointer,
+        StateGraph,
+        StepRecord,
+        SupervisorAction,
+        SupervisorOrchestrator,
+        SupervisorState,
+        get_model_family,
+    )
+
+__all__ = ['ActionReviewer', 'AnomalyReport', 'AnomalyWatcher', 'AnswerReviewer', 'ChairPersona', 'EditorPersona', 'EvidenceReviewer', 'FactCheckerPersona', 'GraphNode', 'NodeStatus', 'PersonaEvaluation', 'PlanReviewer', 'ReviewResult', 'RoundTableEvaluator', 'RoundTableReport', 'SafetyOfficerPersona', 'SkepticPersona', 'SqliteCheckpointer', 'StateGraph', 'StepRecord', 'SupervisorAction', 'SupervisorOrchestrator', 'SupervisorState', 'get_model_family']
+
+
+def __getattr__(name):
+    from importlib import import_module
+
+    return getattr(import_module("lora.experimental.supervisor"), name)
