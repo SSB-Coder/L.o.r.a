@@ -64,3 +64,6 @@ references/
 .venv-tts/
 tmp_test/
 scratch/
+
+# JavaScript HUD test dependencies
+/node_modules/

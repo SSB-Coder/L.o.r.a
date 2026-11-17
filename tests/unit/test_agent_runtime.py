@@ -83,7 +83,8 @@ async def test_chat_uses_spark_not_the_stale_default_and_streams(runtime):
 async def test_open_desktop_app_through_the_real_registry(runtime):
     with patch("subprocess.Popen") as popen:
         res, _ = await run(runtime, "open chrome")
-    popen.assert_called_once_with(["chrome.exe"], shell=False)
+    import sys
+    popen.assert_called_once_with(["google-chrome" if sys.platform.startswith("linux") else "chrome.exe"], shell=False)
     assert res.kind == "command" and res.text == "Opening Google Chrome."
 
 

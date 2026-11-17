@@ -34,3 +34,24 @@ def test_parse_plan_preserves_legitimate_cjk_query():
 def test_plan_system_prompt_has_language_constraint():
     assert "EXACT same language" in PLAN_SYSTEM
     assert "NEVER translate into Chinese" in PLAN_SYSTEM
+
+
+@pytest.mark.asyncio
+async def test_standalone_research_does_not_inherit_old_topic():
+    from unittest.mock import AsyncMock
+    from lora.agent.prompting import make_plan
+    collect = AsyncMock(return_value='{}')
+    await make_plan(collect, "Do deep research on red shift", [
+        {"role": "assistant", "content": "The document discusses neural networks."},
+    ])
+    assert len(collect.call_args.args[0]) == 2
+
+
+@pytest.mark.asyncio
+async def test_research_followup_keeps_its_referent():
+    from unittest.mock import AsyncMock
+    from lora.agent.prompting import make_plan
+    collect = AsyncMock(return_value='{}')
+    recent = [{"role": "assistant", "content": "Redshift stretches light."}]
+    await make_plan(collect, "Research that in more detail", recent)
+    assert recent[0] in collect.call_args.args[0]

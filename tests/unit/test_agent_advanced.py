@@ -4,7 +4,7 @@ import asyncio
 import json
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -250,6 +250,7 @@ async def test_files_added_under_add_sources_are_used_and_cited(tmp_path, monkey
     llm = FakeLLM("It converges in about 40 epochs [S1].")
     mock_ollama(llm)
     rt = make_runtime(tmp_path, monkeypatch, media_db=db)
+    rt._collect = AsyncMock(return_value='{"relevant_ids": [1]}')
     res, _ = await turn(rt, "how many epochs did my model need")
     assert "converges in 40 epochs" in llm.prompts[-1]
     assert res.sources[0]["title"] == "Your file: thesis.pdf, page 12" and res.sources[0]["domain"] == "your files"

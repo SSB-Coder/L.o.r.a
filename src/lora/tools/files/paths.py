@@ -35,7 +35,7 @@ def open_path(path: str | Path, policy_engine: PolicyEngine | None = None) -> di
         else:
             # Fallback for cross-platform dev
             import subprocess
-            subprocess.run(["xdg-open", str(target)], check=False)
+            subprocess.run(["xdg-open", str(target)], check=True, timeout=15)
 
         return {
             "status": "success",

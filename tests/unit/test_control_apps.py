@@ -92,3 +92,33 @@ def test_open_url_blocked_localhost_and_ssrf(launcher: AppLauncher):
         res = launcher.open_url(bad_url)
         assert res["status"] == "error"
         assert any(term in res["message"].lower() for term in ["prohibited", "blocked", "loopback", "internal"])
+
+
+def test_zed_aliases_resolve_to_configured_app(launcher):
+    for query in ("zed", "Zed Editor", "zed ide"):
+        assert launcher.resolve_app(query)["name"] == "Zed"
+
+
+def test_configured_executable_alternative(monkeypatch, launcher):
+    monkeypatch.setattr("sys.platform", "linux")
+    with patch("subprocess.Popen", side_effect=[FileNotFoundError(), None]) as launch, patch("shutil.which", return_value=None):
+        assert launcher.open_app("zed")["status"] == "success"
+    assert [call.args[0] for call in launch.call_args_list] == [["zed"], ["zeditor"]]
+
+
+def test_configured_desktop_launcher_fallback(tmp_path, monkeypatch, launcher):
+    monkeypatch.setattr("sys.platform", "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    entry = tmp_path / "applications/dev.zed.Zed.desktop"
+    entry.parent.mkdir()
+    entry.write_text("[Desktop Entry]\nType=Application\nName=Zed\nExec=zed %U\n")
+    with patch("subprocess.Popen", side_effect=FileNotFoundError()), patch("shutil.which", return_value=None), patch("subprocess.run") as launch:
+        assert launcher.open_app("zed")["status"] == "success"
+    assert launch.call_args.args[0] == ["gio", "launch", str(entry)]
+
+
+def test_desktop_id_cannot_escape_applications_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.platform", "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    (tmp_path / "evil.desktop").write_text("[Desktop Entry]\nExec=sh\n")
+    assert AppLauncher._linux_desktop_entry({"desktop_ids": ["../evil.desktop"]}) is None

@@ -9,7 +9,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -17,7 +19,7 @@ from typing import Any
 
 TARGETS: dict[str, tuple[str, str]] = {  # key -> (label, window-title regex)
     "notepad": ("Notepad", r"notepad"),
-    "text editor": ("Notepad", r"notepad"),
+    "text editor": ("Text Editor", r"notepad|text editor|gedit"),
     "wordpad": ("WordPad", r"wordpad"),
     "word": ("Word", r"\bword\b|\.docx? -"),
     "onenote": ("OneNote", r"onenote"),
@@ -41,6 +43,9 @@ class TypingRefused(Exception):  # noqa: N818 - public API
 
 
 def foreground_title() -> str:
+    if sys.platform.startswith("linux") and os.environ.get("XDG_SESSION_TYPE") != "wayland":
+        return subprocess.run(["xdotool", "getactivewindow", "getwindowname"],
+                              capture_output=True, text=True, check=True, timeout=5).stdout.strip()
     if sys.platform != "win32":
         return ""
     import ctypes

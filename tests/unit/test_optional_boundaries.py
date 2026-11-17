@@ -87,8 +87,15 @@ def test_historical_worker_name_only_uses_cpu_kokoro(monkeypatch):
 
 def test_optional_packages_are_not_mandatory_and_lock_matches_extras():
     project = tomllib.loads((ROOT / 'pyproject.toml').read_text(encoding='utf-8'))['project']
-    base = {requirement.split('>=')[0] for requirement in project['dependencies']}
+    from packaging.requirements import Requirement
+
+    requirements = [Requirement(value) for value in project['dependencies']]
+    base = {requirement.name for requirement in requirements if requirement.marker is None}
     assert not base & {'faiss-cpu', 'laya', 'openwakeword', 'torchvision'}
+    # Current EmbeddingGemma processors need TorchVision on the Linux profile.
+    vision = next(requirement for requirement in requirements if requirement.name == 'torchvision')
+    assert vision.marker.evaluate({'sys_platform': 'linux'})
+    assert not vision.marker.evaluate({'sys_platform': 'win32'})
     locked = tomllib.loads((ROOT / 'uv.lock').read_text(encoding='utf-8'))
     package = next(p for p in locked['package'] if p['name'] == 'lora')
     for extra, dependencies in project['optional-dependencies'].items():

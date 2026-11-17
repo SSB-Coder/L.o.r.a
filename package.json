@@ -1,0 +1,8 @@
+{
+  "name": "lora-hud-tests",
+  "private": true,
+  "description": "Development dependencies for Lora's existing HUD JavaScript checks",
+  "devDependencies": {
+    "jsdom": "^27.4.0"
+  }
+}

@@ -1,7 +1,9 @@
 """Desktop Window Enumeration and Focus Management for L.O.R.A."""
 
 import ctypes
+import os
 import re
+import subprocess
 import sys
 from typing import Any
 
@@ -15,6 +17,11 @@ class WindowManager:
     def _enumerate_raw_windows(self) -> list[dict[str, Any]]:
         """Enumerate raw top-level windows using Win32 API."""
         if not self.is_windows:
+            if sys.platform.startswith("linux") and os.environ.get("XDG_SESSION_TYPE") != "wayland":
+                result = subprocess.run(["wmctrl", "-l"], capture_output=True, text=True, check=True, timeout=5)
+                return [{"handle": int(parts[0], 16), "title": parts[3]}
+                        for line in result.stdout.splitlines()
+                        if len(parts := line.split(None, 3)) == 4]
             return []
 
         windows: list[dict[str, Any]] = []
@@ -45,6 +52,8 @@ class WindowManager:
     def _bring_to_foreground(self, hwnd: int) -> bool:
         """Call Win32 SetForegroundWindow."""
         if not self.is_windows:
+            if sys.platform.startswith("linux") and os.environ.get("XDG_SESSION_TYPE") != "wayland":
+                return subprocess.run(["wmctrl", "-ia", hex(hwnd)], timeout=5, check=False).returncode == 0
             return False
         try:
             # SW_RESTORE = 9 in Win32
@@ -60,6 +69,8 @@ class WindowManager:
 
     def focus_window(self, title_regex: str) -> dict[str, Any]:
         """Search open windows by regex and bring the first matching window to the foreground."""
+        if sys.platform.startswith("linux") and os.environ.get("XDG_SESSION_TYPE") == "wayland":
+            return {"status": "error", "message": "Window focus control is unavailable on Wayland. Use the application UI directly."}
         try:
             pattern = re.compile(title_regex, re.IGNORECASE)
         except re.error:

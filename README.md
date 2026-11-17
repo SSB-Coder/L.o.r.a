@@ -1,3 +1,7 @@
+# Fedora / Linux setup
+
+See [FEDORA_SETUP.md](FEDORA_SETUP.md) for Linux setup, launch commands and Wayland limitations. The Windows instructions below describe the original setup.
+
 # L.O.R.A — Layer Oriented Research Assistant
 
 L.O.R.A is a local-first Windows companion that combines conversation, voice,
@@ -304,10 +308,13 @@ use bounded parser subprocesses. DOCX paragraphs, headings, and table cells are
 read in document order. Markdown sections and long text form bounded chunks.
 PDF page references are preserved; DOCX/Markdown do not gain invented pages.
 
-Ordinary questions consult added desktop sources first. A missing local passage
-does not silently trigger online search. Explicit web, latest, or news requests
-can use web research. Web research does not automatically append unrelated
-local-file matches, including files added while the search is running.
+Adding a document makes it available; it does not change every later question's
+topic or scope. Ask “according to my sources…” or “in this document…” to use local
+passages. Personal references such as “my model” also stay local when sources
+are indexed, so private questions are not silently sent to web search. A missing
+passage in a local request does not silently trigger online search. Standalone research requests use web research even when
+files are indexed. Web research does not append unrelated local-file matches,
+and new research topics do not inherit unrelated conversation history.
 
 “Summarize my sources” asks the writer to explain actual ideas and conclusions,
 rather than displaying index statistics or two sample excerpts. Large
@@ -340,7 +347,10 @@ text, depending on the stored ingestion version.
 ### Citation checks and depth
 
 Normal research retrieves sources and writes a cited answer with the resident
-writer. Automatic checks identify missing citations and unknown source IDs.
+writer. Local candidates first pass a bounded relevance check with the resident
+writer; off-topic or unusable relevance results are declined before answer
+speech. This check is not independent factual verification. Automatic checks
+identify missing citations and unknown source IDs.
 **A valid citation ID does not prove that the source supports the claim.**
 No truthfulness percentage is assigned to this structural check.
 

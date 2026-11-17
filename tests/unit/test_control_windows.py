@@ -8,7 +8,9 @@ from lora.tools.control.windows import WindowManager
 
 
 @pytest.fixture
-def window_manager():
+def window_manager(monkeypatch):
+    # These tests exercise matching independently of the host compositor.
+    monkeypatch.setenv("XDG_SESSION_TYPE", "x11")
     return WindowManager()
 
 

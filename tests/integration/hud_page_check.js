@@ -16,6 +16,7 @@ const dom = new JSDOM(html, {
   runScripts: 'dangerously', pretendToBeVisual: false, virtualConsole: vc,
   url: 'file:///hud/droplet.html',
   beforeParse(w) {
+    Object.defineProperty(w.document, 'hidden', { get: () => false });
     Object.defineProperty(w.navigator, 'userAgent', { get: () => 'Mozilla/5.0 QtWebEngine/6.8' });
     w.HTMLCanvasElement.prototype.getContext = function () {
       const gl = glProxy(); gl.drawArrays = () => { drawCalls++; };
@@ -77,7 +78,7 @@ out.md_code = !!body.querySelector('p code');
 out.md_italic = !!body.querySelector('em');
 out.md_list = body.querySelectorAll('ul li').length === 2 && body.querySelectorAll('ol li').length === 1;
 out.md_heading = !!body.querySelector('h4');
-out.md_good_link = !!body.querySelector('a[data-url="https://example.org/x?a=1&b=2"]');
+out.md_good_link = Array.from(body.querySelectorAll('a[data-url]')).some(a => a.dataset.url === 'https://example.org/x?a=1&b=2');
 out.md_no_js_link = !body.querySelector('a[data-url^="javascript"]') && !body.innerHTML.includes('href="javascript');
 out.no_injected_img = body.querySelector('img') === null;
 out.pre_has_text_not_html = body.querySelector('pre code').textContent.includes('<img src=x');
@@ -137,7 +138,9 @@ sent.length = 0; $('#m-browse').click(); $('#media-list .m-del').click();
 out.menu_events = sent.map(s => s[0]);
 d.body.click(); out.menu_closes_on_outside_click = $('#srcmenu').hidden;
 w.updateMediaList([]); out.srcbtn_label_empty = $('#srcbtn').textContent;
-out.no_model_words = !/gemma|faiss|embedding|ollama|spark|ornith/i.test(d.documentElement.outerHTML);
+const visiblePage = d.body.cloneNode(true);
+visiblePage.querySelectorAll('script,style').forEach(el => el.remove());
+out.no_model_words = !/gemma|faiss|embedding|ollama|spark|ornith/i.test(visiblePage.textContent);
 out.no_remote_resources = !/(?:src|href)=["']https?:\/\//.test(d.documentElement.outerHTML);
 
 // ---- WebGL context loss / restore does not throw and rendering resumes

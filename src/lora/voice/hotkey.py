@@ -126,6 +126,11 @@ class PushToTalkListener:
 
     def start(self) -> None:
         """Start listening for keyboard events in background thread."""
+        import os
+        if os.environ.get("XDG_SESSION_TYPE") == "wayland":
+            import logging
+            logging.getLogger(__name__).warning("Global hotkeys are unavailable on Wayland; use the HUD controls or addressed voice wake.")
+            return
         try:
             from pynput import keyboard
             self._listener = keyboard.Listener(

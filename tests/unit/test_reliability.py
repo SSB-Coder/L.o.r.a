@@ -499,6 +499,8 @@ def test_personal_indexed_question_stays_local_with_explicit_unchecked_status(ba
     runtime = AgentRuntime('http://unused', None, ConversationHistory(), lambda: None,
                            media_db=media, laya_router=router)
     runtime.skills = None
+    from unittest.mock import AsyncMock
+    runtime._collect = AsyncMock(return_value='{"relevant_ids": [1]}')
     events = []
 
     async def stream(messages, on_text, **kwargs):

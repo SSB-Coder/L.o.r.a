@@ -450,26 +450,38 @@ class AgentRuntime(AnswerWorkflows, ActionWorkflows):
                 and bool(getattr(self.media_db, "file_count", 0))
             )
             casual = is_smalltalk(q)
+            # Merely indexing a document must not change every future question's scope.
+            explicit_local = bool(re.search(
+                r"\b(?:my|these|added|uploaded|indexed|attached)\s+(?:sources?|files?|documents?|pdfs?)\b"
+                r"|\b(?:this|the)\s+(?:document|pdf|file)\b",
+                q, re.IGNORECASE,
+            )) or bool(has_local_sources and re.search(r"\b(?:my|our)\s+\w+", q, re.IGNORECASE))
+            if has_local_sources and not explicit_local and re.search(r"\.\w{2,5}\b", q):
+                # Naming an indexed file is also an explicit document reference.
+                list_files = getattr(self.media_db, "list_files", None)
+                if callable(list_files):
+                    explicit_local = any(
+                        bool(name := str(info.get("filename", "")))
+                        and re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", q, re.IGNORECASE) is not None
+                        for info in list_files()
+                    )
             explicit_web = bool(
                 re.search(r"\b(?:online|web|internet|latest|news)\b", q, re.IGNORECASE)
-            )
-            mine = (
-                await self._user_sources(q)
-                if has_local_sources
-                and cmd is None
-                and not casual
-                and not attachments
-                and not summary_request
-                and not explicit_web
-                else []
+                or ((is_research(q) or is_deep(q)) and not explicit_local)
             )
             local_context_request = bool(
-                has_local_sources
+                self.allow_actions
+                and explicit_local
                 and cmd is None
                 and not explicit_web
                 and not casual
                 and not attachments
                 and not looks_agentic(q)
+            )
+            mine = (
+                await self._user_sources(q)
+                if has_local_sources and local_context_request and not summary_request
+                else []
             )
             if (
                 cmd is None

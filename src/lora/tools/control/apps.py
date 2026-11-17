@@ -1,6 +1,7 @@
 """Desktop Application and Web App Launching Tools for L.O.R.A."""
 
 import ipaddress
+import ntpath
 import os
 import shutil
 import socket
@@ -101,68 +102,87 @@ class AppLauncher:
         }
 
     @staticmethod
-    def _find_windows_app_candidate(cmd: str) -> Path | None:
-        """Search typical Windows installation folders for apps not on system PATH."""
+    def _command_candidates(app_info: dict[str, Any]) -> list[str]:
+        """Platform alternatives are configuration, never user-supplied shell text."""
+        commands = app_info.get("commands", {}).get(sys.platform)
+        if commands is None:
+            commands = app_info.get("linux_command") if sys.platform.startswith("linux") else None
+        if commands is None:
+            commands = app_info.get("command", [])
+        if isinstance(commands, str):
+            commands = [commands]
+        return list(dict.fromkeys(c for c in commands if isinstance(c, str) and c.strip()))
+
+    @staticmethod
+    def _find_windows_app_candidate(cmd: str, app_info: dict[str, Any]) -> Path | None:
         if sys.platform != "win32":
             return None
-        target_name = Path(cmd).name.lower()
-        local_app_data = os.environ.get("LOCALAPPDATA", "")
-        prog_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-        prog_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
-        candidates = [
-            Path(local_app_data) / "Obsidian" / "Obsidian.exe",
-            Path(local_app_data) / "Programs" / "Obsidian" / "Obsidian.exe",
-            Path(prog_files) / "Xournal++" / "bin" / "xournalpp.exe",
-            Path(prog_files) / "Xournal++" / "xournalpp.exe",
-            Path(prog_files) / "OpenBoard" / "OpenBoard.exe",
-            Path(prog_files_x86) / "OpenBoard" / "OpenBoard.exe",
-        ]
-        for c in candidates:
-            if c.is_file() and c.name.lower() == target_name:
-                return c
+        for configured in app_info.get("windows_paths", []):
+            candidate = Path(ntpath.expandvars(configured))
+            if candidate.is_file() and candidate.name.lower() == Path(cmd).name.lower():
+                return candidate
         return None
 
-    def open_app(self, name: str) -> dict[str, Any]:
-        """Launch an allowlisted desktop application."""
-        app_info = self.resolve_app(name)
-        if not app_info:
-            return {
-                "status": "error",
-                "message": f"Application '{name}' is not on the allowed application list.",
-            }
+    @staticmethod
+    def _linux_desktop_entry(app_info: dict[str, Any]) -> Path | None:
+        """Resolve only desktop IDs explicitly authorized in the app allowlist.
 
-        command = app_info["command"]
-        try:
-            # shell=False to prevent shell injection
+        gio handles Exec field codes and D-Bus activation; never parse/execute a
+        .desktop Exec string ourselves or launch an arbitrary requested path.
+        """
+        if not sys.platform.startswith("linux"):
+            return None
+        roots = [Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share")))]
+        roots.extend(Path(p) for p in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(os.pathsep) if p)
+        roots.extend([Path.home() / ".local/share/flatpak/exports/share", Path("/var/lib/flatpak/exports/share")])
+        for desktop_id in app_info.get("desktop_ids", []):
+            if not isinstance(desktop_id, str) or Path(desktop_id).name != desktop_id or not desktop_id.endswith(".desktop"):
+                continue
+            for root in roots:
+                entry = root / "applications" / desktop_id
+                if entry.is_file():
+                    return entry
+        return None
+
+    def _start_app(self, app_info: dict[str, Any]) -> None:
+        for command in self._command_candidates(app_info):
             try:
                 subprocess.Popen([command], shell=False)
-            except (FileNotFoundError, OSError):
-                # 1) shutil.which honours PATHEXT, so the allowlisted "code" finds code.cmd.
+                return
+            except OSError:
                 resolved = shutil.which(command)
                 if resolved:
-                    subprocess.Popen([resolved], shell=False)
-                elif sys.platform == "win32":
                     try:
-                        os.startfile(command)  # noqa: S606
-                    except Exception:
-                        # 3) Check typical Windows user & program installation directories
-                        candidate = self._find_windows_app_candidate(command)
-                        if candidate:
-                            subprocess.Popen([str(candidate)], shell=False)
-                        else:
-                            raise
-                else:
-                    raise
-            return {
-                "status": "success",
-                "message": f"Successfully launched {app_info['name']}.",
-                "app": app_info["name"],
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to launch application '{name}': {e}",
-            }
+                        subprocess.Popen([resolved], shell=False)
+                        return
+                    except OSError:
+                        pass
+                if sys.platform == "win32":
+                    candidate = self._find_windows_app_candidate(command, app_info)
+                    if candidate:
+                        subprocess.Popen([str(candidate)], shell=False)
+                        return
+                    try:
+                        os.startfile(command)
+                        return
+                    except OSError:
+                        pass
+        entry = self._linux_desktop_entry(app_info)
+        if entry:
+            subprocess.run(["gio", "launch", str(entry)], check=True, capture_output=True, text=True, timeout=15)
+            return
+        raise FileNotFoundError("No configured executable or desktop launcher is installed. Check this app's entry in config/apps.yaml.")
+
+    def open_app(self, name: str) -> dict[str, Any]:
+        """Launch an allowlisted desktop application, using its configured alternatives."""
+        app_info = self.resolve_app(name)
+        if not app_info:
+            return {"status": "error", "message": f"Application '{name}' is not on the allowed application list."}
+        try:
+            self._start_app(app_info)
+            return {"status": "success", "message": f"Successfully launched {app_info['name']}.", "app": app_info["name"]}
+        except Exception as exc:
+            return {"status": "error", "message": f"Failed to launch application '{name}': {exc}"}
 
     def _check_blocked_host(self, host: str) -> tuple[bool, str]:
         # Reject numeric aliases locally even if DNS is unavailable. Windows DNS

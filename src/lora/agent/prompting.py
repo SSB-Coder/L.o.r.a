@@ -13,12 +13,15 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
+from lora.dialogue import research_history
+
 logger = logging.getLogger(__name__)
 
 PLAN_SYSTEM = (
     "You rewrite a user's request for a web research assistant. The request may be misheard speech. "
     "CRITICAL: Always output in the EXACT same language as the user's spoken request (e.g. if the user spoke in English, "
     "both the question and all search queries MUST be in English. NEVER translate into Chinese or any other language). "
+    "Preserve the current subject; only use history for an explicit follow-up. Never change a new topic to match earlier documents. "
     "Reply with ONLY JSON: {\"question\": \"the request as one clear standalone question in the user's language (resolve words like it, "
     "that, they using the recent chat)\", \"queries\": [\"2 or 3 short web search queries in the user's language, keywords only\"]}"
 )
@@ -63,7 +66,7 @@ async def make_plan(
     collect: Callable[[list[dict[str, str]]], Awaitable[str]], query: str, recent: list[dict[str, str]]
 ) -> ResearchPlan:
     """Never raises: on any problem the original request is used as is."""
-    msgs = [{"role": "system", "content": PLAN_SYSTEM}, *recent[-4:], {"role": "user", "content": query}]
+    msgs = [{"role": "system", "content": PLAN_SYSTEM}, *research_history(query, recent), {"role": "user", "content": query}]
     try:
         return parse_plan(await collect(msgs), query)
     except Exception:

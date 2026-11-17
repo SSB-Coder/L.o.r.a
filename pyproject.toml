@@ -18,6 +18,8 @@ dependencies = [
     "httpx>=0.27.0",
     "aiosqlite>=0.20.0",
     "sentence-transformers>=3.0.0",
+    "torch>=2.14.1",
+    "torchvision>=0.18.0; sys_platform == 'linux'",
     "pillow>=10.0.0",
     "pymupdf>=1.24.0",
     "trafilatura>=2.3.1",
@@ -29,6 +31,8 @@ dependencies = [
     "kokoro-onnx>=0.5.0",
     "scipy>=1.17.1",
     "faster-whisper>=1.2.1",
+    # faster-whisper 1.2.1 passes av.open(metadata_errors=...), removed in newer PyAV.
+    "av>=16.1.0,<17; sys_platform == 'linux'",
     "onnxruntime>=1.30.0",
     "pynput>=1.8.2",
     "qrcode>=8.2",
@@ -73,3 +77,14 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
 ignore = ["E501"]
+
+# Lora's embeddings and voice run on CPU; Ollama owns GPU language inference.
+# Windows retains its existing default PyPI resolution.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

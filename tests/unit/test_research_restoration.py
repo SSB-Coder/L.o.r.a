@@ -21,7 +21,7 @@ from lora.verify.llm_check import LlmFactChecker
 def runtime(media=None):
     rt = AgentRuntime("http://127.0.0.1:11434", None, ConversationHistory(), MagicMock(), media_db=media)
     rt._stream = AsyncMock(return_value="Redshift stretches light to longer wavelengths [S1].")
-    rt._collect = AsyncMock(return_value="{}")
+    rt._collect = AsyncMock(return_value='{"relevant_ids": [1, 2, 3, 4]}')
     rt._plan = AsyncMock(return_value=(SimpleNamespace(), SimpleNamespace()))
     rt._research_fn = AsyncMock(return_value=ResearchResult("redshift", [Source(
         "S1", "Redshift", "https://example.org", text="Redshift stretches light to longer wavelengths.",
@@ -48,7 +48,7 @@ async def test_added_sources_precede_web_and_keep_page_reference():
         "filename": "astronomy.pdf", "page_number": 7, "text": "Redshift stretches light to longer wavelengths.",
     }]))
     rt = runtime(db)
-    result = await rt.run_turn("What causes redshift?", lambda _: None, lambda *_: None)
+    result = await rt.run_turn("According to my sources, what causes redshift?", lambda _: None, lambda *_: None)
     rt._research_fn.assert_not_called()
     assert result.meta["retrieval"] == "local"
     assert "page 7" in result.sources[0]["title"]
@@ -58,7 +58,7 @@ async def test_added_sources_precede_web_and_keep_page_reference():
 @pytest.mark.asyncio
 async def test_source_miss_does_not_silently_search_web():
     rt = runtime(SimpleNamespace(file_count=1, search=lambda *_: []))
-    result = await rt.run_turn("What are the conclusions?", lambda _: None, lambda *_: None)
+    result = await rt.run_turn("What are the conclusions in my sources?", lambda _: None, lambda *_: None)
     assert "couldn't find a relevant passage" in result.text
     rt._research_fn.assert_not_called()
     rt._stream.assert_not_called()
@@ -71,7 +71,7 @@ async def test_standard_research_uses_local_sources_and_simple_reference_check(m
     }]))
     verify = AsyncMock(side_effect=AssertionError("Heavy verification must not run"))
     monkeypatch.setattr("lora.agent.runtime.verify_answer", verify)
-    result = await rt.run_turn("What causes redshift?", lambda _: None, lambda *_: None, mode="standard")
+    result = await rt.run_turn("According to my sources, what causes redshift?", lambda _: None, lambda *_: None, mode="standard")
     rt._research_fn.assert_not_called()
     verify.assert_not_called()
     assert result.meta["source_check"]["status"] == "references_checked"
@@ -213,3 +213,83 @@ def test_desktop_source_check_does_not_display_truth_percentage():
     end = html.index("function renderAgentTrace", start)
     assert "check.note" in html[start:end] and "references_checked" in html[start:end]
     assert "Verification Scorecard" not in html and "Composite Truthfulness" not in html
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query", ["Do deep research on red shift", "research the causes of redshift", "search the web for redshift"])
+async def test_added_off_topic_source_cannot_capture_new_research(query):
+    db = SimpleNamespace(file_count=1, search=MagicMock(return_value=[{
+        "filename": "neural-networks.pdf", "text": "LSTMs and Transformers process sequences.", "score": 0.95,
+    }]))
+    rt = runtime(db)
+    rt.history.add("Explain the neural-network document", "It discusses LSTMs and Transformers.")
+    result = await rt.run_turn(query, lambda _: None, lambda *_: None)
+    assert result.kind == "research"
+    rt._research_fn.assert_awaited_once()
+    db.search.assert_not_called()
+    messages = rt._stream.call_args.args[0]
+    assert not any("LSTMs" in message["content"] for message in messages)
+    assert result.sources[0]["domain"] != "your files"
+
+
+@pytest.mark.asyncio
+async def test_added_sources_do_not_scope_an_unrelated_ordinary_question():
+    db = SimpleNamespace(file_count=1, search=MagicMock())
+    rt = runtime(db)
+    result = await rt.run_turn("What causes redshift?", lambda _: None, lambda *_: None)
+    db.search.assert_not_called()
+    # Factual questions retain the normal research route, with or without files.
+    baseline = runtime()
+    without_files = await baseline.run_turn("What causes redshift?", lambda _: None, lambda *_: None)
+    assert result.kind == without_files.kind
+    assert result.meta.get("retrieval") != "local"
+    assert all(source["domain"] != "your files" for source in result.sources)
+
+
+@pytest.mark.asyncio
+async def test_explicit_local_research_does_not_use_the_web():
+    db = SimpleNamespace(file_count=1, search=MagicMock(return_value=[{
+        "filename": "astronomy.pdf", "text": "Redshift stretches light.", "page_number": 2,
+    }]))
+    rt = runtime(db)
+    result = await rt.run_turn("Do deep research on redshift from my sources", lambda _: None, lambda *_: None, mode="deep")
+    rt._research_fn.assert_not_called()
+    assert result.sources[0]["domain"] == "your files"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict", ['{"relevant_ids": []}', 'not JSON', '{"relevant_ids": "yes"}', '{"relevant_ids": [true, 99]}'])
+async def test_off_topic_or_unusable_local_evidence_abstains_before_answering(verdict):
+    db = SimpleNamespace(file_count=1, search=lambda *_: [{"filename": "neural.pdf", "text": "LSTMs model sequences."}])
+    rt = runtime(db)
+    rt._collect = AsyncMock(return_value=verdict)
+    result = await rt.run_turn("According to my sources, what causes redshift?", lambda _: None, lambda *_: None)
+    assert "couldn't find a relevant passage" in result.text
+    rt._stream.assert_not_called()
+    rt._research_fn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_named_indexed_file_is_an_explicit_local_reference():
+    db = SimpleNamespace(file_count=1,
+        list_files=lambda: [{"filename": "astronomy.pdf"}],
+        search=lambda *_: [{"filename": "astronomy.pdf", "text": "Redshift stretches light."}])
+    rt = runtime(db)
+    result = await rt.run_turn("Explain redshift in astronomy.pdf", lambda _: None, lambda *_: None)
+    rt._research_fn.assert_not_called()
+    assert result.meta["retrieval"] == "local"
+
+
+@pytest.mark.asyncio
+async def test_rejected_passages_do_not_leak_into_citations():
+    db = SimpleNamespace(file_count=2, search=lambda *_: [
+        {"filename": "neural.pdf", "text": "LSTMs model sequences."},
+        {"filename": "astronomy.pdf", "page_number": 9, "text": "Redshift stretches light."},
+    ])
+    rt = runtime(db)
+    rt._collect = AsyncMock(return_value='{"relevant_ids": [2]}')
+    result = await rt.run_turn("According to my sources, what causes redshift?", lambda _: None, lambda *_: None)
+    assert len(result.sources) == 1
+    assert result.sources[0]["id"] == "S1"
+    assert "astronomy.pdf, page 9" in result.sources[0]["title"]
+    assert "LSTMs" not in rt._stream.call_args.args[0][-1]["content"]
