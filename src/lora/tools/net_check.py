@@ -53,14 +53,13 @@ def validate_bind_address(bind_str: str) -> tuple[bool, str]:
     except ValueError:
         return False, f"Invalid port integer: '{port_str}'"
 
-    if host == "0.0.0.0":
-        return False, "SECURITY VIOLATION: Binding to 0.0.0.0 exposes gateway to all networks"
-
     if host in ("127.0.0.1", "localhost"):
         return False, "Mobile gateway must not bind to localhost/127.0.0.1"
 
     try:
         ip = ipaddress.ip_address(host)
+        if ip.is_unspecified:
+            return False, "SECURITY VIOLATION: Binding to 0.0.0.0 exposes gateway to all networks"
         if not ip.is_private:
             return False, f"Host IP {host} is public; mobile gateway must be on private subnet"
         return True, f"Valid private isolated bind address: {host}:{port}"

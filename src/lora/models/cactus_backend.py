@@ -24,7 +24,7 @@ class CactusCancelledError(CactusError):
     pass
 
 
-class CactusAssetsUnavailable(CactusError):
+class CactusAssetsUnavailableError(CactusError):
     pass
 
 
@@ -230,7 +230,7 @@ def worker(kind, config):
     root = project_path(config.models_dir)
     weights = root / ('mirage.cact' if kind == 'mirage' else 'needle3.cact')
     if not (root / 'manifest.json').is_file() or not weights.is_file():
-        raise CactusAssetsUnavailable('Cactus models are missing. Run scripts/download_cactus_models.py first.')
+        raise CactusAssetsUnavailableError('Cactus models are missing. Run scripts/download_cactus_models.py first.')
     key = (kind, str(root), config.threads, config.timeout_seconds)
     with _workers_lock:
         if key not in _workers:

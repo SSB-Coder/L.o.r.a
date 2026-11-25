@@ -6,8 +6,9 @@ import json
 import os
 import socket
 import sys
-import xml.etree.ElementTree as ET
 import zipfile
+
+from defusedxml.ElementTree import fromstring
 
 _WINDOWS_JOB = None
 
@@ -117,13 +118,9 @@ def main():
 
             def xml(name):
                 content = archive.read(name)
-                if (
-                    len(content) > 16_000_000
-                    or b"<!DOCTYPE" in content.upper()
-                    or b"<!ENTITY" in content.upper()
-                ):
-                    raise ValueError("DOCX XML exceeds limits or declares entities")
-                return ET.fromstring(content)
+                if len(content) > 16_000_000:
+                    raise ValueError("DOCX XML exceeds size limit")
+                return fromstring(content, forbid_dtd=True)
 
             document = xml("word/document.xml")
             ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}

@@ -244,9 +244,9 @@ def run_desktop_app(
     app.setQuitOnLastWindowClosed(False)
     ui = UiDispatcher()  # lives on the GUI thread
 
-    from lora.grounding.media_vector_db import MediaVectorDB
     from lora.gateway.queue import JobQueue
     from lora.gateway.ws import ConnectionManager
+    from lora.grounding.media_vector_db import MediaVectorDB
 
     media_db = MediaVectorDB()
     job_queue = JobQueue()
@@ -1033,10 +1033,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if getattr(args, "subcommand", None) == "net-check":
-        import json
         import socket
         import sys
-        import urllib.request
+
+        import httpx
 
         if sys.platform == "win32":
             try:
@@ -1051,18 +1051,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  * Private LAN IP:        {lan_ip}")
         ollama_url = getattr(args, "ollama_url", "http://127.0.0.1:11434")
         try:
-            req = urllib.request.Request(f"{ollama_url}/api/tags")
-            with urllib.request.urlopen(req, timeout=3.0) as resp:
-                if resp.status == 200:
-                    data = json.loads(resp.read().decode())
-                    models = [m.get("name") for m in data.get("models", [])]
-                    print(f"  * Ollama Service:        ONLINE ({len(models)} models available)")
-                    for m in models[:5]:
-                        print(f"      - {m}")
-                    if len(models) > 5:
-                        print(f"      ... and {len(models) - 5} more")
-                else:
-                    print(f"  * Ollama Service:        HTTP {resp.status}")
+            resp = httpx.get(f"{ollama_url}/api/tags", timeout=3.0, follow_redirects=True)
+            if resp.status_code == 200:
+                models = [m.get("name") for m in resp.json().get("models", [])]
+                print(f"  * Ollama Service:        ONLINE ({len(models)} models available)")
+                for m in models[:5]:
+                    print(f"      - {m}")
+                if len(models) > 5:
+                    print(f"      ... and {len(models) - 5} more")
+            else:
+                print(f"  * Ollama Service:        HTTP {resp.status_code}")
         except Exception as exc:
             print(f"  * Ollama Service:        OFFLINE ({exc})")
 

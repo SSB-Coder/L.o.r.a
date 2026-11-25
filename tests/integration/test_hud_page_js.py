@@ -19,7 +19,7 @@ def result():
     if probe.returncode != 0:
         pytest.skip("jsdom is not installed (npm i jsdom)")
     res = subprocess.run(
-        ["node", str(HERE / "hud_page_check.js"), str(PAGE)], capture_output=True, text=True, timeout=90
+        ["node", str(HERE / "hud_page_check.js"), str(PAGE)], capture_output=True, encoding="utf-8", timeout=90
     )
     assert res.returncode == 0, res.stderr
     return json.loads(res.stdout)

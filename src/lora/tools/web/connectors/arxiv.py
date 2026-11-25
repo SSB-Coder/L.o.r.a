@@ -1,6 +1,6 @@
 """arXiv Preprint Knowledge Connector for L.O.R.A."""
 
-import xml.etree.ElementTree as ET
+from defusedxml.ElementTree import fromstring
 
 from lora.tools.web.cache import HttpCache
 from lora.tools.web.connectors.base import BaseConnector, Document, ReliabilityTier, SourceHit
@@ -36,7 +36,7 @@ class ArxivConnector(BaseConnector):
 
         try:
             xml_text = await self.get_text(self.QUERY_API, params=params)
-            root = ET.fromstring(xml_text)
+            root = fromstring(xml_text, forbid_dtd=True)
             hits = []
 
             for entry in root.findall("atom:entry", self.ATOM_NS):

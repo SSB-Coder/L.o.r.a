@@ -419,14 +419,14 @@ class AgentRuntime(AnswerWorkflows, ActionWorkflows, CactusWorkflows):
         images_b64, attachment_context, image_paths = process_attachments(attachments)
         mirage_used = False
         if images_b64 and self._cactus_enabled("mirage") and not re.search(r"\b(edit|modify|grayscale|invert|caption|annotate)\b", q, re.IGNORECASE):
-            from lora.models.cactus_backend import CactusAssetsUnavailable
+            from lora.models.cactus_backend import CactusAssetsUnavailableError
 
             try:
                 observations = await self._mirage_context(images_b64, on_status)
                 attachment_context = (attachment_context[:6000] + "\n\n" + observations).strip()
                 images_b64 = []  # Spark receives perception as text, never unsupported image tokens.
                 mirage_used = True
-            except CactusAssetsUnavailable:
+            except CactusAssetsUnavailableError:
                 logger.info("Mirage assets unavailable; using configured vision models")
             except Exception as exc:
                 self._check_abort()

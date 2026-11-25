@@ -39,7 +39,7 @@ class EgressFilter:
         "tplinkwifi.net",
         "localhost",
         "127.0.0.1",
-        "0.0.0.0",
+        "0.0.0.0",  # nosec B104  # Blocked destination
         "::1",
     }
 

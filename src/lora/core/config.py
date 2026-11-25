@@ -63,10 +63,10 @@ class PolicyConfig(BaseModel):
         action = "deny"
         reason = f"No matching allow rule for origin '{origin}', tier {tier}, tool '{tool}'"
 
-        for rule in self.allow_rules:
-            if rule.origin.lower() == origin.lower() and tier in rule.tiers:
-                if rule.tools is None or tool.lower() in [t.lower() for t in rule.tools]:
-                    action = rule.action
+        for allow_rule in self.allow_rules:
+            if allow_rule.origin.lower() == origin.lower() and tier in allow_rule.tiers:
+                if allow_rule.tools is None or tool.lower() in [t.lower() for t in allow_rule.tools]:
+                    action = allow_rule.action
                     allowed = action in {"allow", "ask"}
                     reason = f"Allowed by rule for origin '{origin}' tier {tier}"
 

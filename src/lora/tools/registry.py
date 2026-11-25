@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from lora.agent.notes import create_note
 from lora.grounding.media_vector_db import MediaVectorDB
+from lora.safety.egress import EgressFilter
 from lora.safety.gate import ActionGate, DataProvenance, has_untrusted_taint
 from lora.safety.policy import ActionRiskTier, PolicyEngine
 from lora.storage.export import ReportExporter
@@ -18,7 +19,6 @@ from lora.tools.browser.pdf_fetcher import PdfFetcher
 from lora.tools.control.apps import AppLauncher
 from lora.tools.control.windows import WindowManager
 from lora.tools.files.list import list_dir
-from lora.safety.egress import EgressFilter
 from lora.tools.files.paths import open_path
 from lora.tools.files.read import read_file
 from lora.tools.files.search import search_files
