@@ -161,19 +161,16 @@ _EXT = {
     "csv": "csv", "json": "json", "svg": "svg",
 }
 
-_RESEARCH_STRONG = re.compile(
-    r"\b(research|look\s?up|look into|search(?: the web| online| for| up)|search\b|find (?:out|information|info|sources)|"
-    r"browse|on the web|online|sources? (?:on|for)|cite|citations?|with sources|fact[- ]?check|verify|8[- ]?way|outer[- ]?loop)\b",
+_RESEARCH_REQUEST = re.compile(
+    _POLITE
+    + r"(?:(?:do|conduct|perform)\s+(?:some\s+)?(?:a\s+)?(?:quick\s+|deep\s+|in[- ]depth\s+|thorough\s+)?research|"
+    r"(?:(?:quick|deep|in[- ]depth|thorough|verified)\s+)?research|look\s?up|"
+    r"search\s+(?:the web|the internet|online|for|up)\b|"
+    r"browse\s+(?:the web|the internet|online)\b|"
+    r"fact[- ]?check|find\s+(?:web\s+|online\s+)?sources|"
+    r"verify\s+(?:online|on the web|using (?:web )?sources))\s+\S",
     re.IGNORECASE,
 )
-_RESEARCH_WEAK = re.compile(
-    r"\b(latest|newest|recent(?:ly)?|news|current(?:ly)?|today'?s|this (?:week|month|year)|who (?:is|was|won|are)|"
-    r"what (?:happened|is happening)|how much (?:is|does|do)|price of|release date|compare|versus|statistics|"
-    r"reviews? of)\b",
-    re.IGNORECASE,
-)
-_PERSONAL = re.compile(r"\b(you|your|yours|yourself|lora)\b", re.IGNORECASE)
-_RESEARCH_EXPLICIT = re.compile(r"\b(research|look\s?up|look into|search for|search up|find out|find (?:information|info|sources) (?:on|about))\b", re.IGNORECASE)
 
 
 _GREETING = re.compile(
@@ -429,13 +426,6 @@ def _parse(text: str) -> Command | None:
     return None
 
 
-_ABOUT_LORA = re.compile(
-    r"\b(?:you (?:mean|said|say|told|can'?t|cannot|couldn'?t|won'?t|aren'?t|are not|didn'?t|did not|just)|"
-    r"your (?:answer|reply|response|abilities|capabilities|model|sources|mistake|last))\b",
-    re.IGNORECASE,
-)
-
-
 def is_smalltalk(text: str) -> bool:
     """Recognize conversational turns without inheriting a previous research task."""
     q = normalize_speech(text).strip(" .!?,")
@@ -449,16 +439,8 @@ def is_smalltalk(text: str) -> bool:
 
 
 def is_research(text: str) -> bool:
-    """True when the question needs fresh information from the web."""
-    q = normalize_speech(text)
-    if len(q) < 8:
-        return False
-    ability = _CAN_YOU.match(q)
-    if (ability and _GENERIC_OBJECT.match(ability.group("rest"))) or _ABOUT_LORA.search(q):
-        return False  # "can you browse the internet", "you can't browse": about LORA, not a request to search
-    if _RESEARCH_STRONG.search(q):
-        return True
-    return bool(_RESEARCH_WEAK.search(q)) and len(q.split()) >= 4
+    """Recognize an explicit request to research or look up a topic."""
+    return bool(_RESEARCH_REQUEST.match(normalize_speech(text)))
 
 
 def quick_reply(text: str, now: datetime | None = None) -> str | None:

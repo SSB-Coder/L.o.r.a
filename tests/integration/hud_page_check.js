@@ -42,6 +42,9 @@ const out = {};
 step(5);
 out.render_loop_ran = drawCalls > 0;
 out.starts_empty = d.body.classList.contains('empty');
+w.addMessage('System', 'No valid owner voice profile was found.');
+out.notice_keeps_droplet = d.body.classList.contains('empty');
+out.startup_notice_visible = !!$('#msgs .notice') && w.getComputedStyle($('#chat')).display !== 'none';
 
 // ---- hold Space with OS key-repeat: exactly ONE press and ONE release
 key('keydown', 'Space'); for (let i = 0; i < 25; i++) key('keydown', 'Space', { repeat: true }); key('keyup', 'Space');
@@ -60,6 +63,7 @@ out.user_bubbles_after_submit = $$('.msg.user').length;
 out.pending_shown = !!$('.msg.bot .dots');
 out.state_after_submit = d.body.dataset.state;
 out.chat_mode_on = !d.body.classList.contains('empty');
+out.startup_notice_preserved = $('#msgs .notice').textContent === 'No valid owner voice profile was found.';
 out.send_disabled_while_thinking = $('#send').disabled && $('#mic').disabled;
 out.input_value_cleared = $('#q').value === '';
 

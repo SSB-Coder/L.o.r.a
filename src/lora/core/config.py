@@ -226,10 +226,20 @@ class SafetyConfig(BaseModel):
     blocked_extensions: list[str] = Field(default_factory=list)
 
 
+class CactusConfig(BaseModel):
+    needle_enabled: bool = False
+    mirage_enabled: bool = False
+    models_dir: str = "models/cactus"
+    threads: int = Field(default=2, ge=1, le=8)
+    timeout_seconds: float = Field(default=60, ge=1, le=180)
+    min_confidence: float = Field(default=0.7, ge=0, le=1)
+
+
 class LoraConfig(BaseModel):
     models_dir: str = "models"
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
     decision: DecisionConfig = Field(default_factory=DecisionConfig)
+    cactus: CactusConfig = Field(default_factory=CactusConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     models: ModelsConfig
     grounding: GroundingConfig = Field(default_factory=GroundingConfig)

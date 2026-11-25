@@ -100,7 +100,7 @@ async def test_standard_research_checks_references_without_scoring_claims(tmp_pa
     llm = FakeLLM(GOOD)
     mock_ollama(llm)
     rt = make_runtime(tmp_path, monkeypatch)
-    res, statuses = await turn(rt, "what is the latest on mamba models", mode="standard")
+    res, statuses = await turn(rt, "research the latest on mamba models", mode="standard")
     assert res.meta["source_check"]["status"] == "references_checked"
     assert "checked" not in res.meta and "score" not in res.meta
     assert "Checking the facts." not in statuses
@@ -112,7 +112,7 @@ async def test_standard_research_checks_references_without_scoring_claims(tmp_pa
 async def test_reference_check_never_certifies_an_unsupported_claim(tmp_path, monkeypatch):
     mock_ollama(FakeLLM(BAD), TAGS_ONE)
     rt = make_runtime(tmp_path, monkeypatch)
-    res, _ = await turn(rt, "what is the latest on mamba models", mode="standard")
+    res, _ = await turn(rt, "research the latest on mamba models", mode="standard")
     assert res.text == BAD
     assert res.meta["verdict"] == "unchecked"
     assert "not independently fact-checked" in res.meta["source_check"]["note"]
@@ -125,7 +125,7 @@ async def test_standard_mode_does_not_trigger_rewrite_loops(tmp_path, monkeypatc
     llm = FakeLLM(GOOD)
     mock_ollama(llm, TAGS_ONE)
     rt = make_runtime(tmp_path, monkeypatch)
-    res, statuses = await turn(rt, "what is the latest on mamba models", mode="standard")
+    res, statuses = await turn(rt, "research the latest on mamba models", mode="standard")
     assert res.text == GOOD and "improved" not in res.meta
     assert "Fixing what I couldn't confirm." not in statuses
     assert not any("Problems found:" in prompt for prompt in llm.prompts)
@@ -150,7 +150,7 @@ async def test_prompt_engineer_cleans_the_request_before_searching(tmp_path, mon
     mock_ollama(Planner(GOOD), TAGS_ONE)
     rt = make_runtime(tmp_path, monkeypatch)
     rt._research_fn = spy_research
-    await turn(rt, "uh can you tell me what's the latest news about that mamba thing versus the transformer")
+    await turn(rt, "can you look up the latest news about that mamba thing versus the transformer")
     assert seen["question"] == "How does Mamba compare to transformers?"
     assert seen["queries"] == ["mamba vs transformer", "mamba state space model"]
 
@@ -161,7 +161,7 @@ async def test_quick_mode_cites_without_independent_verification(tmp_path, monke
     llm = FakeLLM(GOOD)
     mock_ollama(llm)
     rt = make_runtime(tmp_path, monkeypatch)
-    res, _ = await turn(rt, "what is the latest on mamba models", mode="quick")
+    res, _ = await turn(rt, "research the latest on mamba models", mode="quick")
     assert res.kind == "research" and "checked" not in res.meta
     assert res.meta["verdict"] == "unchecked" and res.sources
     assert not any("strict fact-checking supervisor" in prompt for prompt in llm.prompts)
@@ -512,7 +512,7 @@ async def test_run_job_aborts_between_stages_when_cancelled(tmp_path, monkeypatc
     mock_ollama(FakeLLM(GOOD))
     rt = make_runtime(tmp_path, monkeypatch, allow_actions=False)
     with pytest.raises(JobAborted):
-        await rt.run_job("what is the latest on mamba models", "deep", lambda: "cancelled")
+        await rt.run_job("research the latest on mamba models", "deep", lambda: "cancelled")
 
 
 def test_job_queue_lock_works_across_threads_and_loops():

@@ -28,6 +28,8 @@ class SubAgentSpec:
 
 
 SUBAGENTS: dict[str, SubAgentSpec] = {
+    "needle": SubAgentSpec("needle", "Needle Tool Planner", "Tool proposals", "CPU tool proposals validated and executed through Lora's policy gate."),
+    "mirage": SubAgentSpec("mirage", "Mirage Vision", "Image perception", "CPU image observations and OCR for the writer."),
     "supervisor": SubAgentSpec(
         id="supervisor",
         name="Coordinator & Decision Router",

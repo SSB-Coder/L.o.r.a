@@ -1,6 +1,13 @@
 # LORA v1.5: RTX 3050 6 GB VRAM / 16 GB RAM.
 # Path access and budgets are enforced by config/policy.yaml.
 models_dir: models
+cactus:
+  needle_enabled: true
+  mirage_enabled: true
+  models_dir: models/cactus
+  threads: 2
+  timeout_seconds: 60
+  min_confidence: 0.7
 voice:
   headset_mode: false
   close_mic_on_sleep: false  # continuous addressed wake listening, as requested

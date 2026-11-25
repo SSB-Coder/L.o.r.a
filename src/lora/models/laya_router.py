@@ -373,10 +373,9 @@ class LayaDecisionRouter:
             depth = "detailed"
         else:
             depth = "standard"
-        from lora.agent.commands import is_research, is_smalltalk
+        from lora.agent.commands import is_research
 
-        factual = bool(re.match(r"^(?:what|why|how|who|where|when|explain|compare|describe|tell me about)\b", low))
-        intent = "research" if not is_smalltalk(low) and (is_research(low) or factual) else "chat"
+        intent = "research" if is_research(utterance) else "chat"
         return {
             "answers": {
                 "intent": {"choice": intent, "answer_confidence": 0.0},

@@ -60,7 +60,8 @@ body:not(.empty) #top{background:var(--bg);border-bottom:1px solid var(--line)}
 
 /* chat */
 #chat{position:fixed;top:52px;left:0;right:0;bottom:calc(74px + var(--stageh));overflow-y:auto;padding:6px 0 14px;scrollbar-width:thin;scrollbar-color:var(--line) transparent;z-index:3}
-body.empty #chat{display:none}
+/* Before the first turn, show notices above the full-size droplet. */
+body.empty #chat{bottom:auto;max-height:15vh}
 .col{width:min(780px,92vw);margin:0 auto}
 .msg{margin:16px 0}
 .msg.user{display:flex;flex-direction:column;align-items:flex-end;gap:6px}
@@ -857,7 +858,6 @@ window.finishTurn=async(q,text,sources,conf,label,streamed,meta)=>{
 window.addMessage=(sender,text)=>{
  const s=String(sender).toLowerCase();
  if(s==='you'||s==='user')return;
- reveal();
  const n=document.createElement('div');n.className='notice';n.textContent=text;
  if(cur&&cur.pending&&!cur.hasText){cur.el.before(n)}else $msgs.appendChild(n);
  toBottom();

@@ -40,7 +40,7 @@ def test_ordinary_chat_is_not_a_command_or_research(text):
 
 
 @pytest.mark.parametrize(
-    "text", ["what is the latest news on spacex", "research mamba state space models", "search the web for rtx 5060 price"]
+    "text", ["look up the latest news on spacex", "research mamba state space models", "search the web for rtx 5060 price"]
 )
 def test_research_detection(text):
     assert is_research(text)

@@ -30,6 +30,11 @@ def test_page_loads_without_errors_and_renders(result):
     assert result["render_loop_ran"] is True and result["starts_empty"] is True
 
 
+def test_startup_notice_keeps_full_droplet_until_first_turn(result):
+    assert result["notice_keeps_droplet"] and result["startup_notice_visible"]
+    assert result["chat_mode_on"] and result["startup_notice_preserved"]
+
+
 def test_holding_space_sends_one_press_and_one_release(result):
     assert result["ptt_events"] == ["on_ptt_down", "on_ptt_up"]  # the old page sent ~27 presses
     assert result["space_while_typing_events"] == 0

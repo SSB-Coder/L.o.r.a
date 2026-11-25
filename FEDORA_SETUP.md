@@ -49,7 +49,11 @@ application launching, voice, browser tools and gateway. Wayland does not expose
 general window enumeration/focus or foreground-checked typing through the
 existing APIs. Those actions stay unavailable; use the target application
 manually. Global pynput shortcuts are disabled on Wayland; use the HUD controls
-and addressed voice wake. An X11 session supports `wmctrl`/`xdotool` window tools
+and addressed voice wake. The small floating droplet is hidden on Wayland because
+the compositor can place it over the HUD instead of in the screen corner. The
+large animated droplet in the HUD is unaffected.
+
+An X11 session supports `wmctrl`/`xdotool` window tools
 and the existing pynput shortcuts. No compositor security setting is relaxed.
 
 `config/apps.yaml` contains Linux executable mappings alongside the Windows
@@ -130,3 +134,10 @@ After the Zed/source-scope changes, the full suite passed: 916 passed, 5 skipped
 The actual installed writer was also exercised with synthetic retrieval fixtures:
 it answered the new astronomy question and declined an unrelated neural-network
 passage. The record is `logs/fedora-setup/source-topic-writer-check.json`.
+
+## Cactus vision and tool proposals
+
+Needle and Mirage are now enabled for CPU tool proposals and image perception.
+See [CACTUS_SETUP.md](CACTUS_SETUP.md) for installation, verification, limits and
+rollback. Whisper, Kokoro and the Ollama writer remain in place. Cactus Whistle
+was not installed.

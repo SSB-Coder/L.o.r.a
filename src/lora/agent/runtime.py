@@ -22,6 +22,7 @@ from urllib.parse import quote_plus, urlparse
 
 from lora.agent.actions import ActionWorkflows
 from lora.agent.answers import AnswerWorkflows
+from lora.agent.cactus_workflows import CactusWorkflows
 from lora.agent.commands import (
     Command,
     capability_reply,
@@ -174,7 +175,7 @@ async def _deny(_text: str) -> bool:
     return False
 
 
-class AgentRuntime(AnswerWorkflows, ActionWorkflows):
+class AgentRuntime(AnswerWorkflows, ActionWorkflows, CactusWorkflows):
     def __init__(
         self,
         ollama_url: str,
@@ -191,7 +192,9 @@ class AgentRuntime(AnswerWorkflows, ActionWorkflows):
         notebook_db_path: Path | None = None,
         laya_router: LayaDecisionRouter | None = None,
         embedding_engine: Any = None,
+        cactus_config: Any = None,
     ) -> None:
+        self.cactus_config = cactus_config
         self.ollama_url = ollama_url
         self.user_default_model = user_default_model
         self.manual_model: str | None = (
@@ -414,6 +417,19 @@ class AgentRuntime(AnswerWorkflows, ActionWorkflows):
                 return TurnResult(text=canned, kind="smalltalk")
 
         images_b64, attachment_context, image_paths = process_attachments(attachments)
+        mirage_used = False
+        if images_b64 and self._cactus_enabled("mirage") and not re.search(r"\b(edit|modify|grayscale|invert|caption|annotate)\b", q, re.IGNORECASE):
+            try:
+                observations = await self._mirage_context(images_b64, on_status)
+                attachment_context = (attachment_context[:6000] + "\n\n" + observations).strip()
+                images_b64 = []  # Spark receives perception as text, never unsupported image tokens.
+                mirage_used = True
+            except Exception as exc:
+                self._check_abort()
+                logger.exception("Mirage analysis failed")
+                text = f"Mirage could not analyze that image: {exc}"
+                on_text(text, False)
+                return TurnResult(text=text, kind="error", failure=str(exc), meta={"vision_backend": "mirage"})
         skill = self._skill_for(q)
 
         # 1. Use the rule router by default; neural CPU routing is an explicit opt-in.
@@ -450,6 +466,7 @@ class AgentRuntime(AnswerWorkflows, ActionWorkflows):
                 and bool(getattr(self.media_db, "file_count", 0))
             )
             casual = is_smalltalk(q)
+            agentic_request = looks_agentic(q)
             # Merely indexing a document must not change every future question's scope.
             explicit_local = bool(re.search(
                 r"\b(?:my|these|added|uploaded|indexed|attached)\s+(?:sources?|files?|documents?|pdfs?)\b"
@@ -465,9 +482,10 @@ class AgentRuntime(AnswerWorkflows, ActionWorkflows):
                         and re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", q, re.IGNORECASE) is not None
                         for info in list_files()
                     )
-            explicit_web = bool(
-                re.search(r"\b(?:online|web|internet|latest|news)\b", q, re.IGNORECASE)
-                or ((is_research(q) or is_deep(q)) and not explicit_local)
+            research_requested = is_research(q)
+            explicit_web = research_requested and bool(
+                re.search(r"\b(?:search|browse)\s+(?:the web|the internet|online)\b|"
+                          r"\b(?:on the web|on the internet|using (?:web|online) sources)\b", q, re.IGNORECASE)
             )
             local_context_request = bool(
                 self.allow_actions
@@ -476,7 +494,7 @@ class AgentRuntime(AnswerWorkflows, ActionWorkflows):
                 and not explicit_web
                 and not casual
                 and not attachments
-                and not looks_agentic(q)
+                and not agentic_request
             )
             mine = (
                 await self._user_sources(q)
@@ -488,7 +506,8 @@ class AgentRuntime(AnswerWorkflows, ActionWorkflows):
                 and not attachments
                 and self.allow_actions
                 and decision.intent == "control"
-                and not is_research(q)
+                and not self._cactus_enabled("needle")
+                and not research_requested
             ):
                 cmd = await parse_natural_intent_llm(
                     q,
@@ -503,7 +522,21 @@ class AgentRuntime(AnswerWorkflows, ActionWorkflows):
                 on_text(msg, True)
                 return TurnResult(text=msg, kind="command")
 
-            if summary_request and self.allow_actions and not attachments:
+            if mirage_used:
+                trace.record("mirage", "CPU image perception; writer receives observations")
+                result = await self._run_chat(q, on_text, attachment_context=attachment_context,
+                                              trace=trace, user_sources=[])
+                result.meta["vision_backend"] = "mirage"
+            elif self._cactus_enabled("needle") and self.allow_actions and not attachments and not local_context_request and (
+                (cmd is not None and cmd.kind == "open")
+                or (cmd is None and decision.intent == "control" and not research_requested)
+            ):
+                result = await self._run_needle_tools(q, on_status, on_text, trace)
+                if result is None:
+                    text = "Needle did not propose a validated action. Please name the application, website, or action explicitly."
+                    on_text(text, True)
+                    result = TurnResult(text=text, kind="command", meta={"tool_backend": "needle", "status": "needs_clarification"})
+            elif summary_request and self.allow_actions and not attachments:
                 result = await self._summarize_sources(q, on_status, on_text)
             else:
                 result = (
@@ -513,10 +546,7 @@ class AgentRuntime(AnswerWorkflows, ActionWorkflows):
                 )
             if result is not None:
                 pass
-            elif local_context_request and (
-                mode in ("standard", "deep", "deep_with_refinement")
-                or re.search(r"\b(?:fact[- ]?check|verif(?:y|ied|ication))\b", q, re.IGNORECASE)
-            ):
+            elif local_context_request and research_requested:
                 result = await self._run_research(
                     q,
                     on_status,
@@ -527,26 +557,7 @@ class AgentRuntime(AnswerWorkflows, ActionWorkflows):
                     local_sources=mine,
                     answer_depth=answer_depth,
                 )
-            elif (
-                not casual
-                and not local_context_request
-                and (
-                    is_research(q)
-                    or (is_deep(q) and len(q.split()) >= 5)
-                    or (skill and skill.agent == "research")
-                    or (
-                        decision.intent == "research"
-                        and not local_context_request
-                        and not (
-                            self.allow_actions
-                            and (
-                                looks_agentic(q)
-                                or (skill and skill.agent in ("workspace_code", "artifact_studio"))
-                            )
-                        )
-                    )
-                )
-            ):
+            elif research_requested and (explicit_web or not (explicit_local or agentic_request)):
                 trace.record("research", f"Multi-source retrieval (topic={decision.topic_type})")
                 skill_mode = (
                     skill.default_depth
@@ -577,7 +588,7 @@ class AgentRuntime(AnswerWorkflows, ActionWorkflows):
                     answer_depth=answer_depth,
                 )
             elif self.allow_actions and (
-                looks_agentic(q)
+                agentic_request
                 or self._mentions_mcp(q)
                 or (skill and skill.agent in ("workspace_code", "artifact_studio"))
                 or (
@@ -948,6 +959,11 @@ class AgentRuntime(AnswerWorkflows, ActionWorkflows):
                 on_text(msg, True)
                 return TurnResult(text=msg, kind="agent", meta={"artifacts": [art]})
 
+        if self._cactus_enabled("needle"):
+            result = await self._run_needle_tools(q, on_status, on_text, trace, extra_context=extra_context)
+            if result is not None:
+                return result
+            return await self._run_chat(q, on_text, attachment_context=extra_context, user_sources=[])
         loop = ToolLoop(self)
         final = await loop.run(
             q, on_status, on_text, self.history.messages(), extra_context=extra_context

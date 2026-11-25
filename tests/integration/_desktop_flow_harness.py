@@ -23,6 +23,7 @@ app = QApplication(sys.argv)
 
 import lora.main as lm
 from lora.ui.hud import LoraDesktopHUD
+from lora.ui.widget import AmbientDropletWidget
 
 log = []; hud_ref = []
 ui_errors = []
@@ -49,6 +50,7 @@ args = argparse.Namespace(no_audio=True, headless=False, port=0, host="127.0.0.1
 
 t0 = [time.monotonic()]
 done = {"v": False}
+startup_visibility = {}
 def finish_check():
     if mode == "sleepbusy" and time.monotonic() - t0[0] > 5:
         app.quit()
@@ -65,6 +67,10 @@ def finish_check():
         log.append(("TIMEOUT",)); app.quit()
 
 def submit():
+    startup_visibility.update(
+        hud=hud_ref[0].isVisible(),
+        ambient=any(isinstance(window, AmbientDropletWidget) and window.isVisible() for window in app.topLevelWidgets()),
+    )
     t0[0] = time.monotonic()
     hud_ref[0].query_submitted.emit("tell me a joke about cats", "")
     if mode == "interrupt":
@@ -77,7 +83,8 @@ def submit():
     t = QTimer(); t.setInterval(100); t.timeout.connect(finish_check); t.start(); done["t"] = t
 QTimer.singleShot(500, submit)
 
-with patch("lora.main.LoraDesktopHUD", RecHUD), \
+with patch.object(app, "platformName", return_value=sys.argv[2] if len(sys.argv) > 2 else app.platformName()), \
+     patch("lora.main.LoraDesktopHUD", RecHUD), \
      patch("lora.main.start_gateway_thread", return_value=None), \
      patch("lora.grounding.media_vector_db.MediaVectorDB", MagicMock(return_value=MagicMock(file_count=0))):
     rc = lm.run_desktop_app(cfg_mgr, user_cfg, args)
@@ -87,6 +94,7 @@ present = [e for e in log if e[0] == "present"]
 updates = [e for e in log if e[0] == "update"]
 payload = seen_payloads[-1] if seen_payloads else {}
 print("RESULT:" + json.dumps({
+    "startup_visibility": startup_visibility,
     "timeout": any(e[0] == "TIMEOUT" for e in log),
     "ui_calls_on_gui_thread": all(e[1] == main_thread for e in log if e[0] in ("begin", "update", "present")),
     "n_updates": len(updates),

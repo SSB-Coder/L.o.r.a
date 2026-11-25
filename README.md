@@ -1,6 +1,6 @@
 # Fedora / Linux setup
 
-See [FEDORA_SETUP.md](FEDORA_SETUP.md) for Linux setup, launch commands and Wayland limitations. The Windows instructions below describe the original setup.
+See [FEDORA_SETUP.md](FEDORA_SETUP.md) for Linux setup, launch commands and Wayland limitations. CPU Needle tool proposals and Mirage image perception are documented in [CACTUS_SETUP.md](CACTUS_SETUP.md). The Windows instructions below describe the original setup.
 
 # L.O.R.A — Layer Oriented Research Assistant
 

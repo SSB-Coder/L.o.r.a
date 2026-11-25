@@ -43,6 +43,37 @@ async def test_research_then_casual_reply_does_not_search(reply):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("query", ["How?", "What is this?", "Explain redshift in depth", "What's the latest news?"])
+async def test_current_turn_must_request_research_even_if_router_and_skill_suggest_it(query):
+    rt = runtime()
+    rt.history.add("What can you do?", "I can research topics with sources.")
+    rt.active_skill = "deep-research"
+    decision = rt.laya_router.predict_fast(query).model_copy(update={"intent": "research"})
+    rt.laya_router.predict_fast = MagicMock(return_value=decision)
+    result = await rt.run_turn(query, lambda _: None, lambda *_: None, mode="deep")
+    assert result.kind == "chat"
+    rt._research_fn.assert_not_awaited()
+    rt._stream.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query", ["Read my astronomy file", "Search for redshift in my documents"])
+async def test_workspace_agent_cannot_search_on_an_unrequested_tool_proposal(query):
+    from lora.agent.toolloop import ToolLoop
+
+    rt = runtime()
+    rt._web_search_tool = AsyncMock()
+    rt._collect = AsyncMock(side_effect=[
+        '{"tool": "web_search", "args": {"query": "redshift"}}',
+        '{"final": "Here is what I found in your file."}',
+    ])
+    loop = ToolLoop(rt)
+    await loop.run(query, lambda _: None, lambda *_: None, [])
+    assert loop.steps_taken[0]["status"] == "denied"
+    rt._web_search_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_added_sources_precede_web_and_keep_page_reference():
     db = SimpleNamespace(file_count=1, search=MagicMock(return_value=[{
         "filename": "astronomy.pdf", "page_number": 7, "text": "Redshift stretches light to longer wavelengths.",
@@ -238,10 +269,9 @@ async def test_added_sources_do_not_scope_an_unrelated_ordinary_question():
     rt = runtime(db)
     result = await rt.run_turn("What causes redshift?", lambda _: None, lambda *_: None)
     db.search.assert_not_called()
-    # Factual questions retain the normal research route, with or without files.
     baseline = runtime()
     without_files = await baseline.run_turn("What causes redshift?", lambda _: None, lambda *_: None)
-    assert result.kind == without_files.kind
+    assert result.kind == without_files.kind == "chat"
     assert result.meta.get("retrieval") != "local"
     assert all(source["domain"] != "your files" for source in result.sources)
 

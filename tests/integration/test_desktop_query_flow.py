@@ -20,13 +20,14 @@ HERE = Path(__file__).resolve().parent
 SRC = str(HERE.parents[1] / "src")
 
 
-def run_harness(script: str, mode: str, timeout: int = 120) -> dict:
+def run_harness(script: str, mode: str, timeout: int = 120, *, qt_platform: str | None = None) -> dict:
     env = {**os.environ, "LORA_SRC": SRC, "QT_QPA_PLATFORM": "offscreen", "PYTHONPATH": SRC}
     if hasattr(os, "geteuid") and os.geteuid() == 0:  # Chromium refuses to run as root without this (CI/containers)
         env["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox --disable-gpu"
-    res = subprocess.run(
-        [sys.executable, str(HERE / script), mode], env=env, capture_output=True, text=True, timeout=timeout
-    )
+    command = [sys.executable, str(HERE / script), mode]
+    if qt_platform is not None:
+        command.append(qt_platform)
+    res = subprocess.run(command, env=env, capture_output=True, text=True, timeout=timeout)
     lines = [ln for ln in res.stdout.splitlines() if ln.startswith("RESULT:")]
     assert lines, f"harness produced no result\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr[-2000:]}"
     return json.loads(lines[-1][len("RESULT:"):])
@@ -34,6 +35,7 @@ def run_harness(script: str, mode: str, timeout: int = 120) -> dict:
 
 def test_reply_streams_into_hud_and_returns_to_idle():
     r = run_harness("_desktop_flow_harness.py", "ok")
+    assert r["startup_visibility"] == {"hud": True, "ambient": True}
     assert not r["timeout"]
     assert r["answer"] == "Right away, friend. Anything else?"
     assert r["n_updates"] >= 2 and r["streamed"] is True
@@ -41,6 +43,11 @@ def test_reply_streams_into_hud_and_returns_to_idle():
     assert r["idle_after"] is True
     assert r["sources"] == []  # no fabricated citations
     assert r["label"] == ""  # the UI never shows which model answered
+
+
+def test_wayland_shows_hud_without_floating_droplet():
+    r = run_harness("_desktop_flow_harness.py", "ok", qt_platform="wayland")
+    assert r["startup_visibility"] == {"hud": True, "ambient": False}
 
 
 def test_configured_model_name_resolves_and_options_come_from_config():

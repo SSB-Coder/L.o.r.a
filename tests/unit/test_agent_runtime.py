@@ -166,7 +166,7 @@ async def test_research_prompt_carries_sources_and_rules(runtime):
         return ResearchResult(q, [Source("S1", "T", "https://example.org/x", text="Evidence text.")])
 
     runtime._research_fn = fake_research
-    await run(runtime, "what is the latest on spacex starship")
+    await run(runtime, "look up the latest on spacex starship")
     bodies = [json.loads(c.request.content)["messages"] for c in route.calls]
     msgs = next(m for m in bodies if "ONLY the numbered sources" in m[0]["content"])  # the writer call, after the planning call
     assert "[S1] T (example.org)" in msgs[-1]["content"]

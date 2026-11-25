@@ -40,6 +40,8 @@ dependencies = [
     "uvicorn>=0.54.0",
     "websockets>=17.2",
     "pyside6>=6.8.0",
+    "cactus-compute==4.2.3",
+    "jsonschema>=4.23",
 ]
 
 [project.scripts]

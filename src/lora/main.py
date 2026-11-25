@@ -255,6 +255,8 @@ def run_desktop_app(
             return
         is_exiting.set()
         turns.cancel()
+        from lora.models.cactus_backend import close_workers
+        close_workers()
         # Speech can outlive the model turn. Stop its producer before closing
         # the native worker, otherwise queued sentences hit a closed pipe.
         streamer = current_streamer[0]
@@ -372,6 +374,7 @@ def run_desktop_app(
         user_default_model=user_cfg.models.default_model,
         history=history,
         registry_factory=_make_registry,
+        cactus_config=getattr(master_config, "cactus", None),
         profile_fn=_profile_text,
         media_db=media_db,
         mcp_config_path=cfg_mgr.paths.mcp_file,
@@ -793,6 +796,7 @@ def run_desktop_app(
             user_default_model=user_cfg.models.default_model,
             history=ConversationHistory(max_turns=4),
             registry_factory=_make_registry,
+            cactus_config=getattr(master_config, "cactus", None),
             profile_fn=_profile_text if origin == "desktop" else (lambda: ""),
             media_db=media_db if origin == "desktop" else None,
             embedding_engine=media_db.embedding_engine,
@@ -889,23 +893,25 @@ def run_desktop_app(
 
     hud.mobile_qr_requested.connect(_on_show_mobile_qr)
 
-    # Show holographic HUD centered and Ambient Droplet Widget snapped to bottom-right corner
     screen_geo = app.primaryScreen().geometry()
     hud.move(
         max(0, (screen_geo.width() - hud.width()) // 2),
         max(0, (screen_geo.height() - hud.height()) // 2),
     )
-    snap_x, snap_y = widget.calculate_snap_position(
-        screen_geo.width() - widget.width() - 24,
-        screen_geo.height() - widget.height() - 24,
-        screen_geo.width(),
-        screen_geo.height(),
-        screen_geo.left(),
-        screen_geo.top(),
-    )
-    widget.move(snap_x, snap_y)
     hud.show()
-    widget.show()
+    if app.platformName().startswith("wayland"):
+        tray.action_widget.setVisible(False)
+    else:
+        snap_x, snap_y = widget.calculate_snap_position(
+            screen_geo.width() - widget.width() - 24,
+            screen_geo.height() - widget.height() - 24,
+            screen_geo.width(),
+            screen_geo.height(),
+            screen_geo.left(),
+            screen_geo.top(),
+        )
+        widget.move(snap_x, snap_y)
+        widget.show()
     tray.show()
     speech_cooldown_until[0] = time.monotonic() + 0.8
     audio.play_cue(SoundCue.WAKE)
@@ -1071,6 +1077,8 @@ def main(argv: list[str] | None = None) -> int:
         h_media = MediaVectorDB()
         from lora.models.laya_router import LayaDecisionRouter
         h_router = LayaDecisionRouter(lazy_load=True)
+        from lora.core.config import load_config as load_headless_config
+        headless_config = load_headless_config(Path(__file__).resolve().parents[2] / "config/lora.yaml")
         h_worker = JobWorker(
             h_queue,
             lambda origin: AgentRuntime(
@@ -1078,6 +1086,7 @@ def main(argv: list[str] | None = None) -> int:
                 user_default_model=user_cfg.models.default_model,
                 history=ConversationHistory(max_turns=4),
                 registry_factory=lambda: ToolRegistry(media_db=h_media),
+                cactus_config=headless_config.cactus,
                 media_db=h_media if origin == "desktop" else None,
                 embedding_engine=h_media.embedding_engine,
                 allow_actions=(origin == "desktop"),
@@ -1104,6 +1113,8 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             logger.info("Shutting down L.O.R.A headless daemon...")
         finally:
+            from lora.models.cactus_backend import close_workers
+            close_workers()
             h_worker.stop()
             if server is not None:
                 server.should_exit = True

@@ -68,7 +68,7 @@ def test_normalize_keeps_urls_and_filenames():
         ("Can You, Browse the internet?", False),
         ("I have checked for sources, but you see you can't browse the internet. What do you mean by that?", False),
         ("Can you tell me more about thermonuclear physics?", False),
-        ("Can you tell me the latest news about SpaceX?", True),
+        ("Can you tell me the latest news about SpaceX?", False),
         ("Can you search for rtx 5060 prices?", True),
     ],
 )
@@ -393,7 +393,7 @@ def test_builtin_skills_and_subagents_loaded():
     expected = {"deep-research", "web-navigator", "code-architect", "artifact-studio", "visual-creator", "truth-auditor"}
     assert expected.issubset(set(skills.keys()))
     assert set(SUBAGENTS.keys()) == {
-        "supervisor", "system_navigator", "research", "workspace_code", "artifact_studio", "critic_verifier"
+        "supervisor", "system_navigator", "research", "workspace_code", "artifact_studio", "critic_verifier", "needle", "mirage"
     }
 
 

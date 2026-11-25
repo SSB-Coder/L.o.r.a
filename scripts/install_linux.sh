@@ -11,5 +11,6 @@ npm ci --no-audit --no-fund
 .venv/bin/python -m playwright install chromium
 if [[ "${1:-}" != --skip-models ]]; then
   .venv/bin/python scripts/download_models.py
+  .venv/bin/python scripts/download_cactus_models.py
   .venv/bin/python -c 'from faster_whisper import WhisperModel; WhisperModel("base.en", device="cpu", compute_type="int8")'
 fi
