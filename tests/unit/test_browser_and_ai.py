@@ -158,11 +158,25 @@ async def test_ask_other_ai_unsupported_service():
 
 
 @pytest.mark.asyncio
+async def test_external_ai_checks_destination_before_sending():
+    tool = AskOtherAiTool()
+    page = AsyncMock(url="https://example.org/landing")
+    context = AsyncMock()
+    context.new_page.return_value = page
+    with patch.object(tool.driver, "_ensure_context", return_value=context), \
+         patch.object(tool.adapters["claude"], "submit_prompt") as submit:
+        result = await tool.ask("claude", "sample", optimize_prompt=False)
+    assert result["status"] == "error" and "destination blocked" in result["message"]
+    submit.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_ask_other_ai_typing_execution():
     tool = AskOtherAiTool()
 
     # Mock Playwright driver page interaction
     mock_page = AsyncMock()
+    mock_page.url = "https://claude.ai/new"
     mock_context = AsyncMock()
     mock_context.new_page.return_value = mock_page
 
@@ -191,6 +205,7 @@ async def test_ask_other_ai_gemini_and_perplexity():
     mock_context.new_page.return_value = mock_page
 
     # Test Gemini
+    mock_page.url = "https://gemini.google.com/app"
     with patch.object(tool.driver, "_ensure_context", return_value=mock_context), \
          patch.object(tool.adapters["gemini"], "submit_prompt", return_value="Gemini response on neural nets."):
         res_gemini = await tool.ask(
@@ -204,6 +219,7 @@ async def test_ask_other_ai_gemini_and_perplexity():
         assert "gemini.google.com" in res_gemini["url"]
 
     # Test Perplexity
+    mock_page.url = "https://www.perplexity.ai/"
     with patch.object(tool.driver, "_ensure_context", return_value=mock_context), \
          patch.object(tool.adapters["perplexity"], "submit_prompt", return_value="Perplexity response with sources."):
         res_perp = await tool.ask(
@@ -222,6 +238,7 @@ async def test_ask_other_ai_privacy_scrubbing_integration():
     tool = AskOtherAiTool()
 
     mock_page = AsyncMock()
+    mock_page.url = "https://claude.ai/new"
     mock_context = AsyncMock()
     mock_context.new_page.return_value = mock_page
 

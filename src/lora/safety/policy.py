@@ -112,6 +112,8 @@ class PolicyEngine:
         ".htm",
     ]
 
+    LAUNCHABLE_PACKAGES = {".action", ".app", ".appimage", ".bundle", ".command", ".desktop", ".mpkg", ".pkg", ".plugin", ".prefpane", ".scpt", ".workflow"}
+
     PROTECTED_SYSTEM_DIRECTORIES = [
         "c:\\windows",
         "c:\\program files",
@@ -176,11 +178,12 @@ class PolicyEngine:
         repo_policy = repo_root / "config" / "policy.yaml"
         user_policy = Path.home() / ".lora" / "policy.yaml"
         cwd_policy = Path("config/policy.yaml")
+        from lora.core.paths import default_config_path
+        bundled_policy = default_config_path("policy.yaml")
 
         default_policy_path = (
             repo_policy if repo_policy.is_file()
-            else (user_policy if user_policy.is_file()
-            else (cwd_policy if cwd_policy.is_file() else None))
+            else next((path for path in (user_policy, cwd_policy, bundled_policy) if path.is_file()), None)
         )
         resolved_cfg_path = config_path or default_policy_path
         if config_path is not None and not Path(config_path).is_file():
@@ -228,7 +231,7 @@ class PolicyEngine:
         # Typing domain allowlist
         if typing_domain_allowlist is not None:
             self.typing_domain_allowlist = typing_domain_allowlist
-        elif self.config and self.config.typing_domain_allowlist:
+        elif self.config and "typing_domain_allowlist" in self.config.model_fields_set:
             self.typing_domain_allowlist = self.config.typing_domain_allowlist
         else:
             self.typing_domain_allowlist = [
@@ -482,6 +485,9 @@ class PolicyEngine:
         if resolved.suffix.lower() in self.blocked_extensions:
             return PolicyResult(allowed=False, verdict=PolicyVerdict.HARD_DENY,
                                 reason="Resolved target has a blocked extension", rule_matched="blocked_extension")
+        if mode == "open" and (suffix in self.LAUNCHABLE_PACKAGES or resolved.suffix.lower() in self.LAUNCHABLE_PACKAGES):
+            return PolicyResult(allowed=False, verdict=PolicyVerdict.HARD_DENY,
+                                reason="Executable packages must be opened through the app allowlist", rule_matched="launchable_package")
         if mode == "open" and not resolved.is_dir() and resolved.suffix.lower() not in self.open_extensions:
             return PolicyResult(allowed=False, verdict=PolicyVerdict.HARD_DENY,
                                 reason="File type has no approved safe viewer", rule_matched="unsafe_open_extension")

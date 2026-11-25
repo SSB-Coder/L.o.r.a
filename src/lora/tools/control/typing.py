@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -40,6 +41,16 @@ _BAD_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 class TypingRefused(Exception):  # noqa: N818 - public API
     pass
+
+
+def typing_unavailable_reason() -> str | None:
+    if sys.platform == "win32":
+        return None
+    if not sys.platform.startswith("linux") or os.environ.get("XDG_SESSION_TYPE") == "wayland" or not os.environ.get("DISPLAY"):
+        return "Typing into other apps requires Windows or a supported X11 session. Please paste the text manually."
+    if not all(shutil.which(tool) for tool in ("wmctrl", "xdotool")):
+        return "Install wmctrl and xdotool to enable typing into supported editors on X11."
+    return None
 
 
 def foreground_title() -> str:

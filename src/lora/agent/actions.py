@@ -37,10 +37,12 @@ logger = logging.getLogger("lora.agent.runtime")
 
 class ActionWorkflows:
     async def _do_type(self, text: str, target: str) -> str:
-        from lora.tools.control.typing import TypeTextTool, TypingRefused
+        from lora.tools.control.typing import TypeTextTool, TypingRefused, typing_unavailable_reason
 
         if not self.allow_typing:
             return "Typing into other apps is switched off (LORA_ALLOW_TYPING=0)."
+        if self.typer is None and (reason := typing_unavailable_reason()):
+            return reason
         reg = self._get_registry()
         typer = self.typer or TypeTextTool(reg.window_manager)
         try:
@@ -70,17 +72,17 @@ class ActionWorkflows:
                 for w in reg.window_manager.list_windows()
             )
 
-        if not has_window():
-            res = await self._tool(
-                "open_app", {"name": target if target != "text editor" else "notepad"}
-            )
-            if res.get("status") != "success":
-                return self._failure_text(res, f"open {label}")
-            for _ in range(20):
-                await asyncio.sleep(0.4)
-                if has_window():
-                    break
         try:
+            if not has_window():
+                res = await self._tool(
+                    "open_app", {"name": target if target != "text editor" else "notepad"}
+                )
+                if res.get("status") != "success":
+                    return self._failure_text(res, f"open {label}")
+                for _ in range(20):
+                    await asyncio.sleep(0.4)
+                    if has_window():
+                        break
             res = await asyncio.to_thread(typer.type_text, text, target, confirmed=True)
         except TypingRefused as exc:
             return str(exc)

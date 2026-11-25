@@ -92,14 +92,15 @@ def test_optional_packages_are_not_mandatory_and_lock_matches_extras():
     requirements = [Requirement(value) for value in project['dependencies']]
     base = {requirement.name for requirement in requirements if requirement.marker is None}
     assert not base & {'faiss-cpu', 'laya', 'openwakeword', 'torchvision'}
-    # Current EmbeddingGemma processors need TorchVision on the Linux profile.
     vision = next(requirement for requirement in requirements if requirement.name == 'torchvision')
-    assert vision.marker.evaluate({'sys_platform': 'linux'})
-    assert not vision.marker.evaluate({'sys_platform': 'win32'})
+    assert vision.marker.evaluate({'sys_platform': 'linux', 'platform_machine': 'x86_64'})
+    assert vision.marker.evaluate({'sys_platform': 'win32', 'platform_machine': 'AMD64'})
+    assert vision.marker.evaluate({'sys_platform': 'darwin', 'platform_machine': 'arm64'})
+    assert not vision.marker.evaluate({'sys_platform': 'darwin', 'platform_machine': 'x86_64'})
     locked = tomllib.loads((ROOT / 'uv.lock').read_text(encoding='utf-8'))
     package = next(p for p in locked['package'] if p['name'] == 'lora')
     for extra, dependencies in project['optional-dependencies'].items():
-        expected = {requirement.split('>=')[0] for requirement in dependencies}
+        expected = {Requirement(requirement).name for requirement in dependencies}
         assert {d['name'] for d in package['optional-dependencies'][extra]} == expected
 
 

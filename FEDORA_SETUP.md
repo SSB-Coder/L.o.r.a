@@ -9,17 +9,17 @@ also run on CPU. Ollama owns GPU language-model inference. SimedWorld's environm
 Install `uv` in your user account, then install Fedora runtime libraries:
 
 ```bash
-sudo dnf install portaudio espeak-ng libxcb xcb-util-cursor xcb-util-image \
+sudo dnf install gcc kernel-headers portaudio espeak-ng libxcb xcb-util-cursor xcb-util-image \
   xcb-util-keysyms xcb-util-renderutil xcb-util-wm libXcomposite libXdamage \
   libXfixes libXtst nss nspr atk at-spi2-atk cups-libs libdrm pango gtk3 \
   libXScrnSaver wmctrl xdotool gnome-text-editor gnome-calculator nodejs npm
-./scripts/install_linux.sh
 ```
 
-The installer uses the committed uv lock and downloads Chromium, Kokoro,
-EmbeddingGemma, and Whisper `base.en`. `--skip-models` skips speech/embedding
-weights. Some Hugging Face assets can require account access; check downloader
-output rather than assuming every download succeeded.
+Start Ollama before running `./scripts/install_linux.sh`. The installer uses the
+committed uv lock, checks the configured Ollama model, and prepares Chromium
+and optional local model assets. `--skip-models` skips all model provisioning;
+`--skip-browser` skips Chromium. Some Hugging Face assets require account
+access; check the setup output for optional features that were not provisioned.
 
 Ollama 0.40.16 is available as `/usr/local/bin/ollama` and runs through the
 system `ollama.service` on loopback port 11434. Models use the system service's
@@ -28,8 +28,9 @@ model store (normally `/usr/share/ollama/.ollama/models`).
 ```bash
 systemctl status ollama.service
 ollama list
-# On a fresh installation, prepare these default models:
-ollama pull hf.co/XHToken/Spark-X2.6-4B-GGUF:Q4_K_M
+# Install Lora and prepare the default chat model:
+./scripts/install_linux.sh
+# Optional controller model:
 ollama pull granite4.2:3b
 ./run_lora.sh
 ./run_lora.sh start --no-audio

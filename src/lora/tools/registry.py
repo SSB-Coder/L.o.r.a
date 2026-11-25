@@ -18,6 +18,7 @@ from lora.tools.browser.pdf_fetcher import PdfFetcher
 from lora.tools.control.apps import AppLauncher
 from lora.tools.control.windows import WindowManager
 from lora.tools.files.list import list_dir
+from lora.safety.egress import EgressFilter
 from lora.tools.files.paths import open_path
 from lora.tools.files.read import read_file
 from lora.tools.files.search import search_files
@@ -49,7 +50,10 @@ class ToolRegistry:
         self.web_search_dispatcher = WebSearchDispatcher()
         self.browser_driver = PlaywrightBrowserDriver()
         self.pdf_fetcher = PdfFetcher()
-        self.ask_other_ai_tool = AskOtherAiTool(driver=self.browser_driver)
+        self.ask_other_ai_tool = AskOtherAiTool(
+            driver=self.browser_driver,
+            egress_filter=EgressFilter(self.action_gate.policy_engine.typing_domain_allowlist),
+        )
         self.media_db = media_db or MediaVectorDB()
         self.report_exporter = ReportExporter()
         self._register_built_in_tools()

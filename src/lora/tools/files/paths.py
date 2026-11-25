@@ -1,13 +1,15 @@
 """Open path in default system handler for L.O.R.A."""
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 from lora.safety.policy import PolicyEngine
 
 
-def open_path(path: str | Path, policy_engine: PolicyEngine | None = None) -> dict[str, Any]:
+def open_path(path: str | Path, policy_engine: PolicyEngine | None = None, *, wait: bool = True) -> dict[str, Any]:
     """Validate path safety and launch the file or folder in Windows Explorer or default viewer."""
     engine = policy_engine or PolicyEngine()
     policy_res = engine.check_path(path, origin="desktop", mode="open")
@@ -29,13 +31,14 @@ def open_path(path: str | Path, policy_engine: PolicyEngine | None = None) -> di
         final = engine.check_path(path, origin="desktop", mode="open")
         if not final.allowed or final.canonical_path != target:
             return {"status": "error", "message": "Path changed or was denied before opening"}
-        # os.startfile opens the file or directory in the default Windows application
         if hasattr(os, "startfile"):
             os.startfile(str(target))
         else:
-            # Fallback for cross-platform dev
-            import subprocess
-            subprocess.run(["xdg-open", str(target)], check=True, timeout=15)
+            opener = "/usr/bin/open" if sys.platform == "darwin" else "xdg-open"
+            if wait:
+                subprocess.run([opener, str(target)], check=True, timeout=15)
+            else:
+                subprocess.Popen([opener, str(target)])
 
         return {
             "status": "success",

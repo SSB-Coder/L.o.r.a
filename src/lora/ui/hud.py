@@ -2,9 +2,6 @@
 
 import json
 import logging
-import os
-import subprocess
-import sys
 import threading
 import time
 import urllib.parse
@@ -24,7 +21,9 @@ except Exception:
     WEB_ENGINE_AVAILABLE = False
 
 from lora.grounding.media_vector_db import MediaVectorDB
+from lora.safety.policy import PolicyEngine
 from lora.tools.files.known import known_folder
+from lora.tools.files.paths import open_path
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +88,7 @@ class LoraDesktopHUD(QMainWindow):
     ptt_pressed = Signal()
     ptt_released = Signal()
     stop_audio_requested = Signal()
+    cancel_requested = Signal()
     sleep_toggled = Signal(bool)
     voice_toggled = Signal(bool)  # spoken replies on/off
     mobile_qr_requested = Signal()
@@ -119,6 +119,7 @@ class LoraDesktopHUD(QMainWindow):
         self._pending_js: list[str] = []
         self._last_ipc_action: tuple[str, str, float] = ("", "", 0.0)
         self.pending_attachments: list[dict[str, Any]] = []
+        self._artifact_paths: dict[str, Path] = {}
 
         self._init_ui()
         self._init_shortcuts()
@@ -230,6 +231,8 @@ class LoraDesktopHUD(QMainWindow):
             self._open_external_url(str(payload.get("url", "")))
         elif action == "on_open_path":
             self._open_local_artifact(str(payload.get("path", "")))
+        elif action == "on_cancel_turn":
+            self.cancel_requested.emit()
         elif action == "on_voice_toggle":
             self.voice_toggled.emit(bool(payload.get("enabled", True)))
         elif action == "on_turn_off":
@@ -255,22 +258,34 @@ class LoraDesktopHUD(QMainWindow):
             q = str(payload.get("query", "")).strip()
             self.query_submitted.emit(q or "Summarize my sources", "")
 
-    @staticmethod
-    def _open_local_artifact(path_str: str) -> None:
-        if not path_str:
+    def _prepare_artifacts(self, meta: dict[str, Any] | None) -> dict[str, Any]:
+        details = dict(meta or {})
+        if details.get("artifacts"):
+            policy = PolicyEngine()
+            artifacts = []
+            for artifact in details["artifacts"]:
+                item = dict(artifact)
+                path = item.get("path")
+                item["openable"] = False
+                if isinstance(path, str) and path:
+                    verdict = policy.check_path(path, origin="desktop", mode="open")
+                    if verdict.allowed and verdict.canonical_path and verdict.canonical_path.is_file():
+                        self._artifact_paths[path] = verdict.canonical_path
+                        item["openable"] = True
+                artifacts.append(item)
+            details["artifacts"] = artifacts
+        return details
+
+    def _open_local_artifact(self, path_str: str) -> None:
+        approved = self._artifact_paths.get(path_str)
+        policy = PolicyEngine()
+        verdict = policy.check_path(path_str, origin="desktop", mode="open") if approved else None
+        if not verdict or not verdict.allowed or verdict.canonical_path != approved or not approved.is_file():
+            self.append_message("System", "That artifact is not approved for opening in another application.")
             return
-        p = Path(path_str)
-        if not p.exists():
-            return
-        try:
-            if sys.platform == "win32":
-                os.startfile(str(p))  # noqa: S606
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(p)])
-            else:
-                subprocess.Popen(["xdg-open", str(p)])
-        except Exception as exc:
-            logger.warning("Could not open artifact path %s: %s", p, exc)
+        result = open_path(approved, policy_engine=policy, wait=False)
+        if result["status"] != "success":
+            self.append_message("System", result["message"])
 
     # ------------------------------------------------------------------ media (background work)
     def _browse_media(self) -> None:
@@ -345,7 +360,7 @@ class LoraDesktopHUD(QMainWindow):
 
     def set_verification(self, meta: dict[str, Any]) -> None:
         """Attach source-reference checks and the execution trace."""
-        self._run_js(f"window.setVerification && window.setVerification({json.dumps(meta or {})});")
+        self._run_js(f"window.setVerification && window.setVerification({json.dumps(self._prepare_artifacts(meta))});")
 
     def update_model_list(self, models: list[str], active_model: str = "auto") -> None:
         """Populate the top-bar Model Selector dropdown with installed Ollama models."""
@@ -382,7 +397,7 @@ class LoraDesktopHUD(QMainWindow):
         js_label = json.dumps(label)
         self._run_js(
             "window.finishTurn && window.finishTurn("
-            f"{js_q}, {js_ans}, {js_src}, {confidence}, {js_label}, {str(streamed).lower()}, {json.dumps(meta or {})});"
+            f"{js_q}, {js_ans}, {js_src}, {confidence}, {js_label}, {str(streamed).lower()}, {json.dumps(self._prepare_artifacts(meta))});"
         )
 
     @staticmethod

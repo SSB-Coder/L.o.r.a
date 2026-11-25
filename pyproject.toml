@@ -17,9 +17,9 @@ dependencies = [
     "pyyaml>=6.0.1",
     "httpx>=0.27.0",
     "aiosqlite>=0.20.0",
-    "sentence-transformers>=3.0.0",
-    "torch>=2.14.1",
-    "torchvision>=0.18.0; sys_platform == 'linux'",
+    "sentence-transformers>=3.0.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "torch>=2.14.1; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "torchvision>=0.18.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "pillow>=10.0.0",
     "pymupdf>=1.24.0",
     "trafilatura>=2.3.1",
@@ -31,9 +31,9 @@ dependencies = [
     "kokoro-onnx>=0.5.0",
     "scipy>=1.17.1",
     "faster-whisper>=1.2.1",
-    # faster-whisper 1.2.1 passes av.open(metadata_errors=...), removed in newer PyAV.
-    "av>=16.1.0,<17; sys_platform == 'linux'",
-    "onnxruntime>=1.30.0",
+    "av>=16.1.0,<17",
+    "onnxruntime>=1.30.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "onnxruntime==1.23.2; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "pynput>=1.8.2",
     "qrcode>=8.2",
     "fastapi>=0.143.0",
@@ -51,7 +51,7 @@ lora = "lora.main:main"
 faiss = ["faiss-cpu>=1.8.0"]
 neural-routing = ["laya>=0.4.7"]
 wakeword = ["openwakeword>=0.6.0"]
-experimental = ["laya>=0.4.7", "torchvision>=0.18.0"]
+experimental = ["laya>=0.4.7", "torchvision>=0.18.0; sys_platform != 'darwin' or platform_machine != 'x86_64'"]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
@@ -62,6 +62,11 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/lora"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"config/lora.yaml" = "lora/_defaults/lora.yaml"
+"config/apps.yaml" = "lora/_defaults/apps.yaml"
+"config/policy.yaml" = "lora/_defaults/policy.yaml"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -33,11 +33,14 @@ class AppLauncher:
 
     @staticmethod
     def _find_default_config() -> Path:
+        from lora.core.paths import default_config_path
+
         for p in Path(__file__).resolve().parents:
             cand = p / "config" / "apps.yaml"
             if cand.exists():
                 return cand
-        return Path("config/apps.yaml")
+        local = Path("config/apps.yaml")
+        return local if local.is_file() else default_config_path("apps.yaml")
 
     def __init__(self, config_path: Path | str | None = None) -> None:
         self.config_path = Path(config_path) if config_path else self._find_default_config()
@@ -145,6 +148,13 @@ class AppLauncher:
         return None
 
     def _start_app(self, app_info: dict[str, Any]) -> None:
+        bundle_id = app_info.get("macos_bundle")
+        if sys.platform == "darwin" and bundle_id and "darwin" not in app_info.get("commands", {}):
+            try:
+                subprocess.run(["/usr/bin/open", "-b", bundle_id], check=True, capture_output=True, text=True, timeout=15)
+                return
+            except (OSError, subprocess.SubprocessError):
+                pass
         for command in self._command_candidates(app_info):
             try:
                 subprocess.Popen([command], shell=False)
@@ -230,7 +240,8 @@ class AppLauncher:
             }
 
         try:
-            webbrowser.open(url_clean)
+            if not webbrowser.open(url_clean):
+                return {"status": "error", "message": "No default browser accepted the URL."}
             return {
                 "status": "success",
                 "message": f"Opened {url_clean} in default browser.",

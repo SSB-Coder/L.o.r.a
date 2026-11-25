@@ -6,6 +6,7 @@ param (
     [switch]$SkipShortcuts,
     [switch]$SkipAcl,
     [switch]$SkipModels,
+    [switch]$SkipBrowser,
     [ValidateSet("faiss", "neural-routing", "wakeword", "experimental", "dev")]
     [string[]]$Extras = @()
 )
@@ -14,60 +15,54 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = (Resolve-Path "$PSScriptRoot\..").Path
 Set-Location -Path $ProjectRoot
 
+function Invoke-Checked {
+    param ([string]$Program, [string[]]$Arguments)
+    & $Program @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Program failed with exit code $LASTEXITCODE. See the output above."
+    }
+}
+
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host "  L.O.R.A - Native Windows Desktop Platform Installer       " -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host "Project Root: $ProjectRoot" -ForegroundColor Gray
 
-# 1. Check Python
-Write-Host "`n[1/6] Checking Python runtime..." -ForegroundColor Yellow
-$PythonCmd = Get-Command python -ErrorAction SilentlyContinue
-if (-not $PythonCmd) {
-    Write-Error "Python is not installed or not in system PATH. Please install Python 3.11 or higher."
-    exit 1
-}
-$PythonVersion = & python --version 2>&1
-Write-Host "Found: $PythonVersion" -ForegroundColor Green
-
-# 2. Virtual Environment Setup
-Write-Host "`n[2/6] Setting up virtual environment (.venv)..." -ForegroundColor Yellow
-$VenvPython = "$ProjectRoot\.venv\Scripts\python.exe"
-if (-not (Test-Path $VenvPython)) {
-    Write-Host "Creating virtual environment at .venv..." -ForegroundColor Gray
-    & python -m venv "$ProjectRoot\.venv"
-} else {
-    Write-Host "Virtual environment already present." -ForegroundColor Green
-}
-
-# 3. Installing Dependencies
-Write-Host "`n[3/6] Installing package and dependencies..." -ForegroundColor Yellow
-$PackageSpec = if ($Extras.Count) { ".[" + ($Extras -join ",") + "]" } else { "." }
+Write-Host "`n[1/4] Installing Python packages into .venv..." -ForegroundColor Yellow
+$VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 $UvCmd = Get-Command uv -ErrorAction SilentlyContinue
 if ($UvCmd) {
-    Write-Host "Using uv for fast dependency installation..." -ForegroundColor Gray
-    & uv pip install --python "$VenvPython" -e "$PackageSpec"
+    $SyncArgs = @("sync", "--locked", "--inexact", "--python", "3.12")
+    foreach ($Extra in $Extras) { $SyncArgs += @("--extra", $Extra) }
+    Invoke-Checked -Program "uv" -Arguments $SyncArgs
 } else {
-    Write-Host "Using pip for dependency installation..." -ForegroundColor Gray
-    & "$ProjectRoot\.venv\Scripts\pip.exe" install -e "$PackageSpec"
+    if (-not (Test-Path $VenvPython)) {
+        if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+            throw "Install uv (https://docs.astral.sh/uv/) or Python 3.12 before running setup."
+        }
+        Invoke-Checked -Program "python" -Arguments @("-c", "import platform, sys; sys.exit(0 if sys.version_info >= (3,11) and platform.machine().lower() in ('amd64','x86_64') else 'Install uv or an x64 Python 3.12 interpreter first.')")
+        Invoke-Checked -Program "python" -Arguments @("-m", "venv", "$ProjectRoot\.venv")
+    }
+    $PackageSpec = if ($Extras.Count) { ".[" + ($Extras -join ",") + "]" } else { "." }
+    Invoke-Checked -Program $VenvPython -Arguments @("-m", "pip", "install", "-e", $PackageSpec)
 }
 
-# 4. Setup Models in models/
-if (-not $SkipModels) {
-    Write-Host "`n[4/6] Setting up models in models/ (CPU Kokoro TTS and EmbeddingGemma)..." -ForegroundColor Yellow
-    & "$VenvPython" "$ProjectRoot\scripts\download_models.py"
-} else {
-    Write-Host "`n[4/6] Skipping models setup (-SkipModels specified)." -ForegroundColor Gray
-}
+Write-Host "`n[2/4] Preparing browser and model assets..." -ForegroundColor Yellow
+$RuntimeArgs = @("scripts/setup_runtime.py")
+if ($SkipModels) { $RuntimeArgs += "--skip-models" }
+if ($SkipBrowser) { $RuntimeArgs += "--skip-browser" }
+Invoke-Checked -Program $VenvPython -Arguments $RuntimeArgs
 
 # 5. Initialize ~/.lora/ and lock NTFS ACLs
-Write-Host "`n[5/6] Initializing ~/.lora/ ecosystem & securing NTFS permissions..." -ForegroundColor Yellow
-$InitCmd = "from lora.config.manager import ConfigManager; mgr = ConfigManager(); mgr.ensure_ecosystem(apply_acls=$(-not $SkipAcl))"
-& "$VenvPython" -c "$InitCmd"
+Write-Host "`n[3/4] Initializing ~/.lora/ ecosystem & securing NTFS permissions..." -ForegroundColor Yellow
+$ApplyAcls = if ($SkipAcl) { "False" } else { "True" }
+$InitCmd = "from lora.config.manager import ConfigManager; ConfigManager().ensure_ecosystem(apply_acls=$ApplyAcls)"
+Invoke-Checked -Program $VenvPython -Arguments @("-c", $InitCmd)
 Write-Host "User ecosystem initialized at: $env:USERPROFILE\.lora" -ForegroundColor Green
 
 # 6. Create Windows Desktop & Start Menu Shortcuts
 if (-not $SkipShortcuts) {
-    Write-Host "`n[6/6] Creating Windows Desktop and Start Menu shortcuts..." -ForegroundColor Yellow
+    Write-Host "`n[4/4] Creating Windows Desktop and Start Menu shortcuts..." -ForegroundColor Yellow
     $WshShell = New-Object -ComObject WScript.Shell
     
     $RunnerBat = "$ProjectRoot\run_lora.bat"
@@ -92,7 +87,7 @@ if (-not $SkipShortcuts) {
     $StartShortcut.Save()
     Write-Host "Created Start Menu shortcut: $StartMenuShortcutPath" -ForegroundColor Green
 } else {
-    Write-Host "`n[5/5] Skipping shortcut creation (-SkipShortcuts specified)." -ForegroundColor Gray
+    Write-Host "`n[4/4] Skipping shortcut creation (-SkipShortcuts specified)." -ForegroundColor Gray
 }
 
 # Create lora CLI command wrapper in ~/.lora/bin
@@ -101,9 +96,13 @@ if (-not (Test-Path $LoraBin)) {
     New-Item -ItemType Directory -Path $LoraBin -Force | Out-Null
 }
 $LoraCmdPath = Join-Path $LoraBin "lora.cmd"
-$LoraCmdContent = "@echo off`r`n`"$VenvPython`" -m lora.main %*`r`n"
-Set-Content -Path $LoraCmdPath -Value $LoraCmdContent -Encoding ASCII
-Write-Host "Created CLI wrapper at: $LoraCmdPath" -ForegroundColor Green
+if ($VenvPython -cmatch '[^ -~]') {
+    Write-Warning "The checkout path needs Unicode support. Use run_lora.bat or an installed shortcut instead of the ASCII CLI wrapper."
+} else {
+    $LoraCmdContent = "@echo off`r`n`"$VenvPython`" -m lora.main %*`r`n"
+    Set-Content -Path $LoraCmdPath -Value $LoraCmdContent -Encoding ASCII
+    Write-Host "Created CLI wrapper at: $LoraCmdPath" -ForegroundColor Green
+}
 
 Write-Host "`n============================================================" -ForegroundColor Green
 Write-Host "  Installation Complete!                                    " -ForegroundColor Green

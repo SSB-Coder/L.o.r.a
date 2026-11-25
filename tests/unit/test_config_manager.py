@@ -42,6 +42,7 @@ def test_ensure_ecosystem_creates_directories_and_defaults(tmp_path: Path):
     assert (tmp_path / "config.yaml").is_file()
     assert (tmp_path / "mcp.json").is_file()
     assert (tmp_path / "memory" / "user_profile.md").is_file()
+    assert "Windows 11" not in manager.paths.user_profile_file.read_text(encoding="utf-8")
 
     # Verify config loads cleanly
     cfg = manager.load_config()

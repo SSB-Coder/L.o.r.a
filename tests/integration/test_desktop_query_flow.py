@@ -36,6 +36,7 @@ def run_harness(script: str, mode: str, timeout: int = 120, *, qt_platform: str 
 def test_reply_streams_into_hud_and_returns_to_idle():
     r = run_harness("_desktop_flow_harness.py", "ok")
     assert r["startup_visibility"] == {"hud": True, "ambient": True}
+    assert r["gateway_starts"] == 1
     assert not r["timeout"]
     assert r["answer"] == "Right away, friend. Anything else?"
     assert r["n_updates"] >= 2 and r["streamed"] is True

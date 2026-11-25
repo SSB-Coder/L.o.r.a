@@ -11,4 +11,4 @@ if not exist ".venv\Scripts\python.exe" (
 
 echo Starting L.O.R.A Desktop Platform...
 ".venv\Scripts\python.exe" -m lora.main %*
-endlocal
+endlocal & exit /b %ERRORLEVEL%

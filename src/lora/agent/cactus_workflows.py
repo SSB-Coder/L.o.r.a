@@ -15,7 +15,7 @@ from lora.agent.commands import is_research, parse_command
 from lora.agent.contracts import TurnResult
 from lora.agent.toolloop import WEB_TOOLS, looks_agentic
 from lora.dialogue import build_messages
-from lora.models.cactus_backend import CactusError, tool_schemas, validate_calls, worker
+from lora.models.cactus_backend import CactusAssetsUnavailable, CactusError, tool_schemas, validate_calls, worker
 from lora.safety.gate import DataProvenance
 
 logger = logging.getLogger(__name__)
@@ -193,6 +193,11 @@ class CactusWorkflows:
                 text = '\n'.join(str(o['result'].get('message') or f"Completed {o['tool']}.") for o in observations)
             on_text(text, True)
             return TurnResult(text=text, kind='agent', meta={'tool_backend': 'needle', 'tool_results': observations, 'device': last_info.get('device', 'cpu')})
+        except CactusAssetsUnavailable as exc:
+            if direct is not None and direct.kind == 'open' and not observations and not tainted:
+                return await self._run_command(direct, q, on_status, on_text, trace=trace)
+            on_text(str(exc), False)
+            return TurnResult(text=str(exc), kind='error', failure=str(exc), meta={'tool_backend': 'needle'})
         except CactusError as exc:
             logger.warning('Needle did not execute a complete request: %s', exc)
             text = ('I could not identify a valid action. Try “Open Zed” or “Open Wikipedia”.'

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -82,7 +83,15 @@ class SpeakerVerifier:
             "embeddings": embeddings,
             "threshold": self.threshold,
         }
-        self.profile_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        staging_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.profile_path.parent, delete=False) as staging:
+                staging_path = Path(staging.name)
+                json.dump(data, staging, indent=2)
+            staging_path.replace(self.profile_path)
+        finally:
+            if staging_path is not None:
+                staging_path.unlink(missing_ok=True)
         self.reference_embeddings = embeddings
 
     @staticmethod

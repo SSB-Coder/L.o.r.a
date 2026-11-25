@@ -74,7 +74,7 @@ def submit():
     t0[0] = time.monotonic()
     hud_ref[0].query_submitted.emit("tell me a joke about cats", "")
     if mode == "interrupt":
-        QTimer.singleShot(250, lambda: hud_ref[0].query_submitted.emit("stop", ""))
+        QTimer.singleShot(250, lambda: hud_ref[0]._handle_web_action("on_cancel_turn", {}))
     if mode == "sleepbusy":
         def sleep_now():
             log.append(("sleep-requested",))
@@ -85,7 +85,7 @@ QTimer.singleShot(500, submit)
 
 with patch.object(app, "platformName", return_value=sys.argv[2] if len(sys.argv) > 2 else app.platformName()), \
      patch("lora.main.LoraDesktopHUD", RecHUD), \
-     patch("lora.main.start_gateway_thread", return_value=None), \
+     patch("lora.main.start_gateway_thread", return_value=None) as start_gateway, \
      patch("lora.grounding.media_vector_db.MediaVectorDB", MagicMock(return_value=MagicMock(file_count=0))):
     rc = lm.run_desktop_app(cfg_mgr, user_cfg, args)
 
@@ -94,6 +94,7 @@ present = [e for e in log if e[0] == "present"]
 updates = [e for e in log if e[0] == "update"]
 payload = seen_payloads[-1] if seen_payloads else {}
 print("RESULT:" + json.dumps({
+    "gateway_starts": start_gateway.call_count,
     "startup_visibility": startup_visibility,
     "timeout": any(e[0] == "TIMEOUT" for e in log),
     "ui_calls_on_gui_thread": all(e[1] == main_thread for e in log if e[0] in ("begin", "update", "present")),

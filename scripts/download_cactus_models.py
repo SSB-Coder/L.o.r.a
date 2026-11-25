@@ -3,9 +3,36 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import shutil
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def link_asset(source: Path, target: Path) -> None:
+    if target.is_symlink() and target.resolve() != source:
+        target.unlink()
+    if target.exists():
+        if target.samefile(source):
+            return
+        if target.stat().st_size == source.stat().st_size:
+            with target.open('rb') as current, source.open('rb') as cached:
+                if hashlib.file_digest(current, 'sha256').digest() == hashlib.file_digest(cached, 'sha256').digest():
+                    return
+    try:
+        target.symlink_to(source)
+    except OSError:
+        try:
+            os.link(source, target)
+        except OSError:
+            with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as staging:
+                staging_path = Path(staging.name)
+            try:
+                shutil.copy2(source, staging_path)
+                staging_path.replace(target)
+            finally:
+                staging_path.unlink(missing_ok=True)
 
 
 def main():
@@ -22,15 +49,20 @@ def main():
     for name, source in assets.items():
         source = source.resolve()
         link = target / source.name
-        if link.is_symlink():
-            link.unlink()
-        if not link.exists():
-            link.symlink_to(source)
-        with source.open('rb') as handle:
+        link_asset(source, link)
+        with link.open('rb') as handle:
             digest = hashlib.file_digest(handle, 'sha256').hexdigest()
         report['assets'][name] = {'path': str(link), 'cache_path': str(source),
-                                 'bytes': source.stat().st_size, 'sha256': digest}
-    (target / 'manifest.json').write_text(json.dumps(report, indent=2) + '\n')
+                                 'bytes': link.stat().st_size, 'sha256': digest}
+    staging_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=target, delete=False) as staging:
+            staging_path = Path(staging.name)
+            staging.write(json.dumps(report, indent=2) + '\n')
+        staging_path.replace(target / 'manifest.json')
+    finally:
+        if staging_path is not None:
+            staging_path.unlink(missing_ok=True)
     print(json.dumps(report, indent=2))
 
 

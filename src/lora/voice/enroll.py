@@ -29,9 +29,13 @@ class EnrollmentSession:
         speaker_name: str = "owner",
     ) -> Path:
         """Enroll from a pre-recorded list of audio arrays (programmatic / test mode)."""
+        if not clips:
+            raise ValueError("At least one voice sample is required.")
         embeddings: list[list[float]] = []
         for clip in clips:
             feat = self.verifier.extract_features(clip)
+            if not np.all(np.isfinite(feat)) or not np.any(feat):
+                raise ValueError("No usable voice sample was recorded. Check the microphone and try again.")
             embeddings.append(feat.tolist())
 
         self.verifier.save_profile(embeddings, speaker_name=speaker_name)
@@ -40,7 +44,9 @@ class EnrollmentSession:
     def run_interactive(self, speaker_name: str = "owner") -> Path:
         """Run interactive CLI enrollment with microphone."""
         capture = AudioCapture()
-        embeddings: list[list[float]] = []
+        if self.samples_needed < 1:
+            raise ValueError("At least one voice sample is required.")
+        clips: list[np.ndarray] = []
 
         print("\n" + "=" * 60)
         print("🎙️  L.O.R.A Voice Calibration: Personalized Voice Enrollment")
@@ -53,22 +59,22 @@ class EnrollmentSession:
             print("  Recording 2.5s...", end="", flush=True)
 
             capture.buffer.clear()
-            capture.start()
-            time.sleep(self.clip_duration_seconds)
-            capture.stop()
+            if not capture.start():
+                raise ValueError(f"Could not start the microphone: {capture.status_text()}")
+            try:
+                time.sleep(self.clip_duration_seconds)
+            finally:
+                capture.stop()
 
             clip = capture.buffer.read_all()
             print(" Captured.")
 
-            # Validate clip energy
             rms = float(np.sqrt(np.mean(clip**2))) if len(clip) > 0 else 0.0
-            if rms < 0.01:
-                print("  ⚠️ Warning: Audio level was very quiet. Make sure your microphone is unmuted.")
+            if len(clip) < 512 or not np.isfinite(rms) or rms < 0.01:
+                raise ValueError("The voice sample was empty or too quiet. Check the microphone and try again.")
+            clips.append(clip)
 
-            feat = self.verifier.extract_features(clip)
-            embeddings.append(feat.tolist())
-
-        self.verifier.save_profile(embeddings, speaker_name=speaker_name)
+        self.enroll_from_audio_clips(clips, speaker_name=speaker_name)
         print("\n✅ Calibration complete!")
         print(f"Voice profile saved to: {self.verifier.profile_path}\n")
         return self.verifier.profile_path

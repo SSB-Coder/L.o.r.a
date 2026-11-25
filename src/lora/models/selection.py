@@ -97,11 +97,14 @@ def is_excluded_model(model_name: str) -> bool:
 
 
 def find_config_file(name: str = "lora.yaml") -> Path | None:
+    from lora.core.paths import default_config_path
+
     for base in (*Path(__file__).resolve().parents, Path.cwd()):
         cand = base / "config" / name
         if cand.is_file():
             return cand
-    return None
+    packaged = default_config_path(name)
+    return packaged if packaged.is_file() else None
 
 
 def load_role(role: str = "writer", config_path: Path | None = None) -> dict[str, Any]:

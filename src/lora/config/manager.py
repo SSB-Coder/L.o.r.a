@@ -87,15 +87,18 @@ class LoraUserConfig(BaseModel):
     security: SecurityConfig = Field(default_factory=SecurityConfig)
 
 
-DEFAULT_MCP_JSON = {
-    "mcpServers": {
-        "filesystem": {
-            "command": "npx",
-            "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:\\Users"],
-            "disabled": True,
+def _default_mcp_config() -> dict[str, Any]:
+    from lora.tools.files.known import known_folder
+
+    return {
+        "mcpServers": {
+            "filesystem": {
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-filesystem", str(known_folder("documents"))],
+                "disabled": True,
+            }
         }
     }
-}
 
 DEFAULT_USER_PROFILE_MD = """# User Profile & Preferences
 
@@ -104,9 +107,6 @@ DEFAULT_USER_PROFILE_MD = """# User Profile & Preferences
 - Research depth: Cited answers with lightweight source-reference checks.
 - Tone: Casual friend and dependable butler.
 
-## Memory & Context
-- Default project root: C:\\Thought\\Projects\\LORA
-- Operating system: Windows 11
 """
 
 
@@ -146,7 +146,7 @@ class ConfigManager:
         # Create mcp.json if missing
         if not self._paths.mcp_file.is_file():
             self._paths.mcp_file.write_text(
-                json.dumps(DEFAULT_MCP_JSON, indent=2), encoding="utf-8"
+                json.dumps(_default_mcp_config(), indent=2), encoding="utf-8"
             )
 
         # Create user_profile.md if missing

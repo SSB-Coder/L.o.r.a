@@ -66,6 +66,8 @@ out.chat_mode_on = !d.body.classList.contains('empty');
 out.startup_notice_preserved = $('#msgs .notice').textContent === 'No valid owner voice profile was found.';
 out.send_disabled_while_thinking = $('#send').disabled && $('#mic').disabled;
 out.input_value_cleared = $('#q').value === '';
+$('#cancel').click(); key('keydown', 'Escape', { key: 'Escape' });
+out.cancel_events = sent.filter(s => s[0] === 'on_cancel_turn').length;
 
 // ---- Python's beginStream for the same question reuses the bubble (no duplicate)
 w.beginStream('what is **up**?', '');

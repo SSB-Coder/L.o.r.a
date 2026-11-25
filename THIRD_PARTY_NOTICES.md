@@ -32,6 +32,7 @@ No GPL/AGPL source code is copied into `src/lora/`. The following open-source pr
 | `sentence-transformers`, `transformers`, `onnxruntime` | Apache-2.0 / MIT | CPU embeddings (`EmbeddingGemma-2`), reranking (`bge-reranker-base`), NLI |
 | `faster-whisper`, `ctranslate2` | MIT | CPU Speech-to-Text |
 | `kokoro-onnx` | Apache-2.0 | CPU Text-to-Speech |
+| [`cactus-compute`](https://pypi.org/project/cactus-compute/4.2.3/) and its prebuilt runtime | Apache-2.0 | Optional Needle tool proposals and Mirage image analysis |
 | `PySide6` (Qt for Python) | LGPL-3.0 (dynamic linking) | Desktop holographic HUD, Ambient Droplet Widget, and System Tray |
 | `playwright` | Apache-2.0 | Headless web extraction and user-confirmed chatbot DOM automation |
 | `trafilatura`, `beautifulsoup4` | Apache-2.0 / MIT | Boilerplate removal and article text extraction |

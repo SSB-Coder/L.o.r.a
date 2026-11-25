@@ -12,35 +12,42 @@ applications:
     commands:
       linux: ["zed", "zeditor"]
     desktop_ids: ["dev.zed.Zed.desktop"]
+    macos_bundle: "dev.zed.Zed"
     aliases: ["zed editor", "zed ide", "zed code editor"]
   vscode:
     name: "Visual Studio Code"
     command: "code"
+    macos_bundle: "com.microsoft.VSCode"
     aliases: ["code", "vs code", "visual studio code"]
   notepad:
     name: "Notepad"
     command: "notepad.exe"
     linux_command: "gnome-text-editor"
+    macos_bundle: "com.apple.TextEdit"
     aliases: ["text editor", "notes"]
   calculator:
     name: "Calculator"
     command: "calc.exe"
     linux_command: "gnome-calculator"
+    macos_bundle: "com.apple.calculator"
     aliases: ["calc"]
   edge:
     name: "Microsoft Edge"
     command: "msedge.exe"
     linux_command: "firefox"
+    macos_bundle: "com.microsoft.edgemac"
     aliases: ["msedge", "browser"]
   chrome:
     name: "Google Chrome"
     command: "chrome.exe"
     linux_command: "google-chrome"
+    macos_bundle: "com.google.Chrome"
     aliases: ["google chrome"]
   spotify:
     name: "Spotify"
     command: "spotify.exe"
     linux_command: "spotify"
+    macos_bundle: "com.spotify.client"
     aliases: ["music"]
   paint:
     name: "Paint"
@@ -51,12 +58,14 @@ applications:
     name: "File Explorer"
     command: "explorer.exe"
     linux_command: "nautilus"
-    aliases: ["files", "file manager"]
+    macos_bundle: "com.apple.finder"
+    aliases: ["files", "file manager", "finder"]
   obsidian:
     name: "Obsidian"
     command: "Obsidian.exe"
     windows_paths: ['%LOCALAPPDATA%/Obsidian/Obsidian.exe', '%LOCALAPPDATA%/Programs/Obsidian/Obsidian.exe']
     linux_command: "obsidian"
+    macos_bundle: "md.obsidian"
     aliases: ["obsidian", "graph book", "vault", "notes vault", "obsidian vault"]
   xournal:
     name: "Xournal++"

@@ -19,7 +19,9 @@ MAX_ARTIFACT_CHARS = 300_000
 
 def default_notes_dir() -> Path:
     env = os.environ.get("LORA_NOTES_DIR")
-    return Path(env).expanduser() if env else Path.home() / "Documents" / "LORA"
+    from lora.tools.files.known import known_folder
+
+    return Path(env).expanduser() if env else known_folder("documents") / "LORA"
 
 
 def _safe_stem(title: str) -> str:

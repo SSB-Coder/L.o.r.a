@@ -13,8 +13,8 @@ downloaded; Cactus Whistle was not downloaded.
 The verified assets are about 59 MB total (56.2 MiB): native library 1,935,944
 bytes, Needle 35,335,380 bytes, and Mirage 21,611,043 bytes. The local
 `models/cactus/manifest.json` records versions, sizes, cache paths and SHA-256
-checksums. Files under `models/cactus/` link to the SDK's verified user cache;
-rerun the downloader if that cache is cleaned.
+checksums. Files under `models/cactus/` use the SDK's verified user cache, with
+a local copy when links are unavailable; rerun the downloader if that cache is cleaned.
 
 The machine had approximately 358 GB of free disk and 4.9 GB available RAM at
 setup. In native smoke checks, Needle's worker peaked near 126 MiB and Mirage's
@@ -33,8 +33,9 @@ uv sync --locked --python 3.12 --extra dev
 ./run_lora.sh
 ```
 
-The normal Linux installer also prepares Cactus assets, unless `--skip-models`
-is supplied. Restart an already-running Lora to load the new configuration.
+Both installers attempt to prepare Cactus assets when model provisioning is
+enabled. Native availability depends on the SDK's platform builds. Restart an
+already-running Lora to load the new configuration.
 
 Try “Open Zed” or “Open Wikipedia”. Exact app aliases and website shortcuts
 are resolved from `config/apps.yaml` before Needle proposes a schema-constrained

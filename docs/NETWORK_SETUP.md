@@ -9,7 +9,7 @@ This document describes the network setup for running L.O.R.A (Layer-Oriented Re
 To provide remote access from a mobile phone to L.O.R.A on your PC without exposing your desktop environment to the general home network or internet, L.O.R.A implements an **isolated dual-listener architecture**:
 
 - **Desktop Listener**: Bound strictly to `127.0.0.1:8765` (`origin="desktop"`). Has full access to desktop controls, local files, and deep research modes.
-- **Mobile Listener**: Bound strictly to a dedicated router-side interface IP (default: `192.168.50.10:8765`, `origin="mobile"`). Access is restricted exclusively to Tier 0 read-only research. Local file access and OS controls are strictly stripped and denied.
+- **Mobile Listener**: Off by default. For this isolated setup, run `lora start --mobile-bind 192.168.50.10:8766` and open **Pair Mobile** in the desktop HUD. Local file access and OS controls are denied to mobile clients.
 
 > **CRITICAL SECURITY INVARIANT:** The mobile gateway must **NEVER** bind to `0.0.0.0` and must **NEVER** be reachable from the primary home Wi-Fi subnet.
 
@@ -68,7 +68,7 @@ If a second router is unavailable, both PC and phone connect to the primary home
 Run the provided PowerShell script as Administrator:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\net_setup.ps1 -InterfaceAlias "Ethernet 2" -Subnet "192.168.50.0/24"
+.\scripts\net_setup.ps1 -InterfaceAlias "Ethernet 2" -LocalAddress "192.168.50.10" -LocalPort 8766 -RemoteSubnet "192.168.50.0/24"
 ```
 
 The script:

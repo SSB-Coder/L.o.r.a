@@ -96,11 +96,14 @@ def _check_apps(rt) -> list[Check]:
     launcher = reg.app_launcher
     if not launcher.applications:
         out.append(Check("Opening apps", False, "my app list is empty.", "make sure config/apps.yaml exists next to the app", str(launcher.config_path)))
+    elif sys.platform == "darwin":
+        out.append(Check("Opening apps", True, "the app allowlist is loaded; macOS checks installed apps when you open them."))
     else:
         missing = []
         for key in ("chrome", "notepad", "calculator"):
             info = launcher.resolve_app(key)
-            if info and not _exe_found(info["command"]):
+            if info and not (any(_exe_found(command) or launcher._find_windows_app_candidate(command, info)
+                                 for command in launcher._command_candidates(info)) or launcher._linux_desktop_entry(info)):
                 missing.append(info["name"])
         if missing:
             out.append(Check("Opening apps", False, f"I can't find {', '.join(missing)} on this PC.", "put the full path to the app in config/apps.yaml", f"missing={missing}"))

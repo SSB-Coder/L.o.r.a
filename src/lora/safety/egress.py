@@ -73,7 +73,7 @@ class EgressFilter:
 
     def __init__(self, allowed_typing_domains: list[str] | None = None) -> None:
         self.allowed_typing_domains = [
-            d.lower() for d in (allowed_typing_domains or self.DEFAULT_ALLOWED_TYPING_DOMAINS)
+            d.lower() for d in (self.DEFAULT_ALLOWED_TYPING_DOMAINS if allowed_typing_domains is None else allowed_typing_domains)
         ]
 
     def _is_ip_or_loopback_blocked(self, host: str) -> tuple[bool, str]:

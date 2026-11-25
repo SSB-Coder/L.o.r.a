@@ -1,10 +1,6 @@
-# Fedora / Linux setup
-
-See [FEDORA_SETUP.md](FEDORA_SETUP.md) for Linux setup, launch commands and Wayland limitations. CPU Needle tool proposals and Mirage image perception are documented in [CACTUS_SETUP.md](CACTUS_SETUP.md). The Windows instructions below describe the original setup.
-
 # L.O.R.A — Layer Oriented Research Assistant
 
-L.O.R.A is a local-first Windows companion that combines conversation, voice,
+L.O.R.A is a local-first desktop companion that combines conversation, voice,
 document retrieval, web research, and bounded desktop actions. It is designed
 to behave like a casual friend and dependable butler: answer naturally, notice
 the local time, handle practical requests, and keep the user in control.
@@ -14,10 +10,9 @@ Ollama runs the language models; Kokoro speech synthesis, Whisper speech
 recognition, and embeddings run on CPU. Everyday replies use a resident writer,
 while specialized models are available for tasks that need them.
 
-Windows is the primary desktop target. The project also includes a paired
-mobile web companion, a headless gateway, automated tests, and experimental
-research components. This README describes the current runtime, rather than
-treating every retained experiment as an active product feature.
+The desktop setup targets recent Linux distributions, Windows x64, and macOS.
+The project also includes a paired mobile web companion, a headless gateway,
+automated tests, and experimental research components.
 
 ## Contents
 
@@ -58,10 +53,10 @@ speech facility, separately from desktop Kokoro.
 
 ## Requirements and hardware profile
 
-Use **Python 3.12** for the documented setup. Package metadata permits Python
-3.11+, but recorded development and regression runs used 3.12.
+Use **Python 3.12** for the documented setup. Other Python versions are not
+covered by these installer checks and may lack compatible dependency builds.
 
-You need Windows, `uv`, Git, a running Ollama installation, and compatible local
+You need `uv`, Git, a running Ollama installation, and compatible local
 models. Voice requires microphone permission and working audio devices. Allow
 space for Python dependencies, weights, and caches; model weights are not
 included in the repository. Installation, uncached model downloads, and web
@@ -97,7 +92,32 @@ separate work.
 
 ## Installation and models
 
-Run PowerShell commands from the repository root.
+### Quick start on a clean machine
+
+Install [uv](https://docs.astral.sh/uv/) and [Ollama](https://ollama.com/download),
+start Ollama, and run the following from the checkout:
+
+| Platform | Install | Launch |
+|---|---|---|
+| Fedora | Install the libraries in [FEDORA_SETUP.md](FEDORA_SETUP.md), then `./scripts/install_linux.sh` | `./run_lora.sh` |
+| Ubuntu 24.04 | `sudo apt install build-essential linux-libc-dev python3.12-dev libegl1 libgl1 libglib2.0-0t64 libportaudio2 libxcb-cursor0 libxcb-dri3-0 libxkbcommon-x11-0 libxkbfile1 libxtst6`, then `bash scripts/install_unix.sh` and `uv run --no-sync playwright install-deps chromium` | `./run_lora.sh` |
+| Windows x64 | `powershell -ExecutionPolicy RemoteSigned -File scripts/install.ps1` | `run_lora.bat` or the Start Menu shortcut |
+| macOS 14.4+ (Apple silicon or Intel; [Qt requirement](https://doc.qt.io/qt-6.12/macos.html#supported-configurations)) | `bash scripts/install_unix.sh` using native Python | `./run_lora.sh` |
+
+The installers reuse existing `.venv` dependencies, download Chromium, and
+check the default model in your Lora configuration. They pull it if missing on
+a local Ollama server, but leave remote servers unchanged. They then attempt
+to prepare Kokoro, Whisper, [Needle and Mirage](CACTUS_SETUP.md), and, on
+platforms with supported PyTorch wheels, EmbeddingGemma. Optional downloads
+can fail without preventing text chat. Intel Macs use the built-in fallback
+index instead of EmbeddingGemma. The installers do not overwrite existing
+user settings or bundle Ollama itself.
+
+For an environment-only install, pass `--skip-models --skip-browser` on Unix
+or `-SkipModels -SkipBrowser` on Windows. Install or select an Ollama model
+before chatting. Native microphone and keyboard permissions may still need
+granting explicitly. Use the HUD microphone button or in-window push-to-talk
+when global shortcuts are unavailable.
 
 ### 1. Install the Python environment
 
@@ -111,8 +131,7 @@ For tests and linting, include the development dependencies:
 uv sync --locked --python 3.12 --extra dev
 ```
 
-Optional backends are installed explicitly; the default installation does not
-require FAISS, Laya, openWakeWord, or TorchVision:
+Optional FAISS, Laya, and openWakeWord backends are installed explicitly:
 
 | Extra | Install command | Purpose |
 |---|---|---|
@@ -120,6 +139,12 @@ require FAISS, Laya, openWakeWord, or TorchVision:
 | `neural-routing` | `uv sync --locked --extra neural-routing` | Laya backend for explicit CPU neural routing. |
 | `wakeword` | `uv sync --locked --extra wakeword` | openWakeWord backend when suitable custom weights and engine configuration are supplied. |
 | `experimental` | `uv sync --locked --extra experimental` | Additional neural/transformer compatibility dependencies for standalone experiments. |
+
+These extras do not have the same platform coverage as the base install. With
+the current lock, `wakeword` is unavailable on Linux with Python 3.12, and
+`neural-routing` and `experimental` are unavailable on Intel macOS. On Intel
+macOS, the locked `faiss` wheel requires macOS 15. Default in-window
+push-to-talk and the rules-based router do not need these extras.
 
 Extras install Python packages, not model weights, and do not activate a
 backend. Combine multiple `--extra` options when needed, including `--extra dev`
@@ -134,10 +159,9 @@ For browser automation:
 uv run playwright install chromium
 ```
 
-The alternative [Windows installer](scripts/install.ps1) can create shortcuts
-and initialize user configuration. It installs the default runtime and prepares
-CPU Kokoro and embedding assets. Use `-SkipModels` to skip downloads, or
-`-Extras faiss,neural-routing` to request optional Python backends.
+The [Windows installer](scripts/install.ps1) can create shortcuts and initialize
+user configuration. For multiple extras, invoke the script directly from a
+PowerShell prompt: `./scripts/install.ps1 -Extras faiss,neural-routing`.
 [run_lora.bat](run_lora.bat) starts the installed environment from the project root.
 
 ### 2. Prepare the language model
@@ -365,9 +389,11 @@ re-browsing. Sources can be incomplete, stale, or contradictory.
 
 ## Mobile companion
 
-Desktop startup attempts a separate mobile listener on the detected LAN address,
-normally port **8766**. Open the pairing control in the HUD and scan the QR code
-with a phone on the same network.
+Mobile pairing is off by default. On a trusted LAN, open **Pair Mobile** in the
+desktop HUD to start the separate listener and show a QR code, normally on port
+**8766**. To start pairing at launch, supply `--mobile-bind` explicitly. The QR
+code is not written to logs. If you paired before this change, scan the new
+code once; replace any manually configured token that was previously logged.
 
 To choose the address explicitly:
 
@@ -626,8 +652,13 @@ titles, and personal text. Review them before sharing an issue.
 
 ## Current limits and next steps
 
-- Windows is the primary desktop target; component tests on another OS do not
-  establish equivalent desktop-control or global-hotkey behaviour.
+- Window focus and foreground-checked typing are limited to Windows and
+  supported Linux X11 sessions. Wayland and macOS retain chat, file opening,
+  and allowlisted app launching, but not those controls. Mobile is browser-only.
+  On Ubuntu X11, install `wmctrl` and `xdotool` to enable editor typing.
+- Press **Esc** or use **Stop** in the HUD to cancel a turn without a global
+  shortcut or microphone. Generated files are saved and shown in chat, but
+  the HUD only opens registered artifacts that pass the safe-file policy.
 - The writer retains its 8K profile. Answer length also depends on generation
   limits and prompts; context alone does not guarantee longer or better output.
 - Semantic retrieval needs usable local embedding weights, and cold CPU

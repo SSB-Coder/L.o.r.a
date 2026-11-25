@@ -69,6 +69,8 @@ class WindowManager:
 
     def focus_window(self, title_regex: str) -> dict[str, Any]:
         """Search open windows by regex and bring the first matching window to the foreground."""
+        if not self.is_windows and not sys.platform.startswith("linux"):
+            return {"status": "error", "message": "Window focus control is unavailable on this platform. Use the application UI directly."}
         if sys.platform.startswith("linux") and os.environ.get("XDG_SESSION_TYPE") == "wayland":
             return {"status": "error", "message": "Window focus control is unavailable on Wayland. Use the application UI directly."}
         try:

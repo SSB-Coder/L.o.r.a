@@ -11,12 +11,12 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from lora.core.paths import project_path
+from lora.core.paths import default_config_path
 
 
 @lru_cache(maxsize=1)
 def _configured_backend() -> str:
-    path = project_path('config/lora.yaml')
+    path = default_config_path('lora.yaml')
     if not path.is_file():
         return 'numpy'
     data = yaml.safe_load(path.read_text(encoding='utf-8')) or {}

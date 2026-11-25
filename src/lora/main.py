@@ -1,7 +1,9 @@
 import argparse
 import logging
 import os
+import socket
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -10,6 +12,7 @@ from pathlib import Path
 import uvicorn
 
 from lora.config.manager import ConfigManager, LoraUserConfig
+from lora.core.paths import PROJECT_ROOT, default_config_path
 from lora.gateway.server import create_gateway_app
 from lora.storage.notebook import NotebookStore
 from lora.ui.audio_cues import AudioCueManager, SoundCue
@@ -27,43 +30,49 @@ except Exception:  # pragma: no cover - headless environment without PySide6
 logger = logging.getLogger("lora")
 
 
-def _add_run_arguments(p: argparse.ArgumentParser) -> None:
+def _add_run_arguments(p: argparse.ArgumentParser, *, inherit: bool = False) -> None:
+    def default(value):
+        return argparse.SUPPRESS if inherit else value
+
     p.add_argument(
         "--config-dir",
         type=Path,
-        default=None,
+        default=default(None),
         help="Path to custom LORA config directory (default: ~/.lora)",
     )
     p.add_argument(
         "--port",
         type=int,
-        default=8765,
+        default=default(8765),
         help="Gateway HTTP/WebSocket port (default: 8765)",
     )
     p.add_argument(
         "--host",
         type=str,
-        default="127.0.0.1",
+        default=default("127.0.0.1"),
         help="Gateway bind host (default: 127.0.0.1)",
     )
     p.add_argument(
         "--headless",
         action="store_true",
+        default=default(False),
         help="Run without desktop UI (Gateway daemon only)",
     )
     p.add_argument(
         "--no-audio",
         action="store_true",
+        default=default(False),
         help="Disable microphone capture and TTS voice pipeline",
     )
     p.add_argument(
         "--offline",
         action="store_true",
+        default=default(False),
         help="Force air-gapped offline research mode",
     )
     p.add_argument(
         "--mobile-bind",
-        default=None,
+        default=default(None),
         metavar="HOST:PORT",
         help="Also listen for phone requests on this LAN address (token-protected). Off by default.",
     )
@@ -76,10 +85,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="subcommand", help="LORA subcommands")
 
     start_parser = subparsers.add_parser("start", help="Start L.O.R.A desktop HUD or daemon")
-    _add_run_arguments(start_parser)
+    _add_run_arguments(start_parser, inherit=True)
 
     stop_parser = subparsers.add_parser("stop", aliases=["kill"], help="Cleanly shut down LORA and its workers")
-    stop_parser.add_argument("--config-dir", type=Path, default=None)
+    stop_parser.add_argument("--config-dir", type=Path, default=argparse.SUPPRESS)
 
     net_parser = subparsers.add_parser("net-check", help="Verify LAN IP, Ollama status, and ports")
     net_parser.add_argument("--ollama-url", default="http://127.0.0.1:11434", help="Ollama base URL")
@@ -97,7 +106,7 @@ def init_platform(base_dir: Path | None = None) -> tuple[ConfigManager, LoraUser
     cfg_mgr = ConfigManager(base_dir=base_dir)
     cfg_mgr.ensure_ecosystem(apply_acls=True)
     from lora.storage.migration import migrate_notebooks
-    migrate_notebooks(cfg_mgr.paths.base_dir, Path(__file__).resolve().parents[2])
+    migrate_notebooks(cfg_mgr.paths.base_dir, PROJECT_ROOT)
     user_cfg = cfg_mgr.load_config()
     return cfg_mgr, user_cfg
 
@@ -117,6 +126,20 @@ def _detect_lan_ip() -> str:
     return "127.0.0.1"
 
 
+class GatewayStartupError(RuntimeError):
+    pass
+
+
+class GatewayServer(uvicorn.Server):
+    thread: threading.Thread
+
+    def close(self, timeout: float = 5.0) -> None:
+        self.should_exit = True
+        self.thread.join(timeout=timeout)
+        if self.thread.is_alive():
+            logger.warning("Gateway is still releasing resources during shutdown")
+
+
 def start_gateway_thread(
     host: str,
     port: int,
@@ -126,40 +149,71 @@ def start_gateway_thread(
     media_db=None,
     connection_manager=None,
     notebook_store=None,
-) -> uvicorn.Server | None:
+) -> GatewayServer:
     """Launches the FastAPI Gateway inside a dedicated background thread."""
-    import socket
-
-    probe_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        if s.connect_ex((probe_host, port)) == 0:
-            logger.info("Gateway daemon already active at http://%s:%d", host, port)
-            return None
-
     from lora.gateway.auth import HostOriginGuard
 
+    try:
+        listener = socket.create_server((host, port), family=socket.AF_INET6 if ":" in host else socket.AF_INET)
+    except (OSError, OverflowError) as exc:
+        raise GatewayStartupError(f"Could not bind the Lora {origin} gateway at {host}:{port}. Check the address or choose a free port.") from exc
+    port = listener.getsockname()[1]
     host_guard = HostOriginGuard(listener_origin=origin, mobile_ip=host, port=port)
-    app = create_gateway_app(
-        origin=origin,
-        queue=queue,
-        token_validator=token_validator,
-        host_guard=host_guard,
-        media_db=media_db,
-        connection_manager=connection_manager,
-        notebook_store=notebook_store,
-    )
+    try:
+        app = create_gateway_app(
+            origin=origin, queue=queue, token_validator=token_validator, host_guard=host_guard,
+            media_db=media_db, connection_manager=connection_manager, notebook_store=notebook_store,
+        )
+    except Exception:
+        listener.close()
+        raise
     config = uvicorn.Config(
         app=app,
         host=host,
         port=port,
         log_level="warning",
         access_log=False,
+        timeout_graceful_shutdown=4,
     )
-    server = uvicorn.Server(config)
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
+    server = GatewayServer(config)
+
+    def serve() -> None:
+        with listener:
+            server.run(sockets=[listener])
+
+    server.thread = threading.Thread(target=serve, daemon=True, name=f"lora-{origin}-gateway")
+    server.thread.start()
+    deadline = time.monotonic() + 5
+    while not server.started and server.thread.is_alive() and time.monotonic() < deadline:
+        time.sleep(.01)
+    if not server.started or not server.thread.is_alive():
+        server.close()
+        raise GatewayStartupError(f"The Lora {origin} gateway did not become ready at {host}:{port}.")
     logger.info("Gateway daemon running at http://%s:%d", host, port)
     return server
+
+
+def _private_mobile_token(token_file: Path) -> str:
+    import secrets
+
+    if override := os.environ.get("LORA_MOBILE_TOKEN"):
+        return override
+    if token_file.is_symlink():
+        raise ValueError("The mobile token file must not be a symbolic link.")
+    if token_file.is_file():
+        if os.name != "nt":
+            token_file.chmod(0o600)
+        if token := token_file.read_text(encoding="utf-8").strip():
+            return token
+    token = secrets.token_urlsafe(32)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=token_file.parent, delete=False) as staging:
+        staging_path = Path(staging.name)
+        staging.write(token)
+    try:
+        staging_path.replace(token_file)
+    finally:
+        staging_path.unlink(missing_ok=True)
+    return token
 
 
 def run_desktop_app(
@@ -174,6 +228,7 @@ def run_desktop_app(
     ``ui.post(fn)``. ``QTimer.singleShot(0, fn)`` from those threads silently never fires.
     """
     import asyncio
+    started_at = getattr(args, "started_at", time.time())
 
     from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication
@@ -190,8 +245,22 @@ def run_desktop_app(
     ui = UiDispatcher()  # lives on the GUI thread
 
     from lora.grounding.media_vector_db import MediaVectorDB
+    from lora.gateway.queue import JobQueue
+    from lora.gateway.ws import ConnectionManager
 
     media_db = MediaVectorDB()
+    job_queue = JobQueue()
+    ws_manager = ConnectionManager()
+    mobile_ws_manager = ConnectionManager()
+    try:
+        gateway_server = start_gateway_thread(
+            host=args.host, port=args.port, queue=job_queue, media_db=media_db,
+            connection_manager=ws_manager,
+            notebook_store=NotebookStore(cfg_mgr.paths.notebooks_dir / "notebooks.db"),
+        )
+    except GatewayStartupError as exc:
+        logger.error("%s", exc)
+        return 1
     audio = AudioCueManager(enabled=user_cfg.voice.sound_effects_enabled and not args.no_audio)
     hud = LoraDesktopHUD(media_db=media_db)
     tray = LoraSystemTray()
@@ -255,8 +324,6 @@ def run_desktop_app(
             return
         is_exiting.set()
         turns.cancel()
-        from lora.models.cactus_backend import close_workers
-        close_workers()
         # Speech can outlive the model turn. Stop its producer before closing
         # the native worker, otherwise queued sentences hit a closed pipe.
         streamer = current_streamer[0]
@@ -295,7 +362,7 @@ def run_desktop_app(
     voice_enabled = [True]
     voice_init_error = [""]
     from lora.core.config import load_config as load_master_config
-    master_config = load_master_config(Path(__file__).resolve().parents[2] / "config" / "lora.yaml")
+    master_config = load_master_config(default_config_path("lora.yaml"))
     from lora.core.paths import project_path
     model_root = project_path(master_config.models_dir)
     headset_mode = master_config.voice.headset_mode
@@ -431,6 +498,7 @@ def run_desktop_app(
             _on_emergency_stop("Voice stop command")
 
     runtime.on_power_command = _handle_power_cmd
+    hud.cancel_requested.connect(lambda: _on_emergency_stop("HUD cancel action"))
     widget.emergency_stop_requested.connect(lambda: _on_emergency_stop("Droplet widget emergency stop"))
 
     def _confirm_blocking(text: str) -> bool:
@@ -775,20 +843,6 @@ def run_desktop_app(
     mic_timer.start()
 
     from lora.agent.jobs import JobWorker
-    from lora.gateway.queue import JobQueue
-    from lora.gateway.ws import ConnectionManager
-
-    job_queue = JobQueue()
-    ws_manager = ConnectionManager()
-    mobile_ws_manager = ConnectionManager()
-    gateway_server = start_gateway_thread(
-        host=args.host,
-        port=args.port,
-        queue=job_queue,
-        media_db=media_db,
-        connection_manager=ws_manager,
-        notebook_store=NotebookStore(cfg_mgr.paths.notebooks_dir / "notebooks.db"),
-    )
 
     def _make_job_runtime(origin: str) -> AgentRuntime:
         return AgentRuntime(
@@ -820,28 +874,27 @@ def run_desktop_app(
     )
     job_worker.start()
 
-    mobile_server_ref: list[uvicorn.Server | None] = [None]
+    mobile_server_ref: list[GatewayServer | None] = [None]
     mobile_url_ref: list[str] = [""]
 
     def _ensure_mobile_gateway(bind_str: str | None = None) -> str:
         if mobile_url_ref[0]:
             return mobile_url_ref[0]
-        import secrets as _secrets
+        import ipaddress
 
         from lora.gateway.auth import TokenValidator
-        from lora.gateway.qr import generate_pairing_qr_terminal, get_pairing_url
+        from lora.gateway.qr import get_pairing_url
 
         lan_ip = _detect_lan_ip()
         target = bind_str or getattr(args, "mobile_bind", None) or f"{lan_ip}:8766"
         m_host, _, m_port = target.rpartition(":")
         m_port_int = int(m_port or 8766)
         bind_host = m_host or lan_ip
-        display_ip = lan_ip if bind_host in ("0.0.0.0", "") else bind_host
-        token_file = Path(cfg_mgr.paths.user_profile_file).parent / "mobile_token.txt"
-        token = os.environ.get("LORA_MOBILE_TOKEN") or (
-            token_file.read_text(encoding="utf-8").strip() if token_file.exists() else _secrets.token_urlsafe(32)
-        )
-        token_file.write_text(token, encoding="utf-8")
+        address = ipaddress.IPv4Address(bind_host)
+        if not address.is_private or address.is_unspecified or not 1 <= m_port_int <= 65535:
+            raise ValueError("Choose a specific private IPv4 address and port for mobile pairing.")
+        token_file = Path(cfg_mgr.paths.user_profile_file).parent / "mobile_pairing_token.txt"
+        token = _private_mobile_token(token_file)
         srv = start_gateway_thread(
             bind_host,
             m_port_int,
@@ -852,25 +905,18 @@ def run_desktop_app(
             connection_manager=mobile_ws_manager,
             notebook_store=NotebookStore(cfg_mgr.paths.notebooks_dir / "notebooks.db"),
         )
-        if srv is not None:
-            mobile_server_ref[0] = srv
-        url = get_pairing_url(display_ip, m_port_int, token)
+        mobile_server_ref[0] = srv
+        url = get_pairing_url(bind_host, m_port_int, token)
         mobile_url_ref[0] = url
-        try:
-            from lora.core.logging import scrub_sensitive_data
-
-            qr_ascii = generate_pairing_qr_terminal(display_ip, m_port_int, token)
-            logger.info("Mobile gateway on %s\n%s", scrub_sensitive_data(url), qr_ascii)
-        except Exception:
-            from lora.core.logging import scrub_sensitive_data
-
-            logger.info("Mobile gateway on %s (token saved in %s)", scrub_sensitive_data(url), token_file)
+        logger.info("Mobile pairing is ready at %s:%d; open Pair Mobile in the HUD for the QR code.", bind_host, m_port_int)
         return url
 
-    try:
-        _ensure_mobile_gateway(getattr(args, "mobile_bind", None))
-    except Exception as exc:
-        logger.warning("Could not start the mobile gateway: %s", exc)
+    if mobile_bind := getattr(args, "mobile_bind", None):
+        try:
+            _ensure_mobile_gateway(mobile_bind)
+        except (ValueError, OSError, GatewayStartupError) as exc:
+            logger.warning("Could not start the mobile gateway: %s", exc)
+            hud.append_message("System", f"Mobile pairing did not start: {exc}")
 
     def _on_show_mobile_qr() -> None:
         try:
@@ -920,7 +966,6 @@ def run_desktop_app(
     logger.info("L.O.R.A Desktop Platform initialized successfully.")
 
     from lora.safety.lifecycle import consume_shutdown_request
-    started_at = time.time()
     shutdown_timer = QTimer()
     shutdown_timer.timeout.connect(lambda: on_exit() if consume_shutdown_request(cfg_mgr.paths.base_dir, started_at) else None)
     shutdown_timer.start(500)
@@ -929,6 +974,11 @@ def run_desktop_app(
     # Clean shutdown
     on_exit()
     job_worker.stop()
+    for server in (gateway_server, mobile_server_ref[0]):
+        if server is not None:
+            server.should_exit = True
+    from lora.models.cactus_backend import close_workers
+    close_workers()
     job_worker.join(timeout=10.0)
     if job_worker.is_alive():
         logger.warning("Job worker is still releasing resources during shutdown")
@@ -965,13 +1015,15 @@ def run_desktop_app(
         runtime.mcp_hub.close()
     for server in (gateway_server, mobile_server_ref[0]):
         if server is not None:
-            server.should_exit = True
+            server.close()
     return exit_code
 
 
 def main(argv: list[str] | None = None) -> int:
+    started_at = time.time()
     parser = build_argument_parser()
     args = parser.parse_args(argv)
+    args.started_at = started_at
 
     if getattr(args, "subcommand", None) in {"stop", "kill"}:
         from lora.safety.lifecycle import request_shutdown
@@ -1045,11 +1097,15 @@ def main(argv: list[str] | None = None) -> int:
         from lora.voice.enroll import EnrollmentSession
 
         session = EnrollmentSession(samples_needed=getattr(args, "samples", 5))
-        session.run_interactive(speaker_name=getattr(args, "speaker", "owner"))
+        try:
+            session.run_interactive(speaker_name=getattr(args, "speaker", "owner"))
+        except (ValueError, OSError) as exc:
+            print(f"Voice enrollment failed: {exc}")
+            return 1
         return 0
 
     from lora.core.logging import setup_logging
-    log_dir = Path(__file__).resolve().parents[2] / "logs"
+    log_dir = PROJECT_ROOT / "logs"
     setup_logging(log_dir=log_dir)
     from lora.core.diagnostics import enable_fault_reporting
     enable_fault_reporting(log_dir)
@@ -1078,7 +1134,16 @@ def main(argv: list[str] | None = None) -> int:
         from lora.models.laya_router import LayaDecisionRouter
         h_router = LayaDecisionRouter(lazy_load=True)
         from lora.core.config import load_config as load_headless_config
-        headless_config = load_headless_config(Path(__file__).resolve().parents[2] / "config/lora.yaml")
+        headless_config = load_headless_config(default_config_path("lora.yaml"))
+        try:
+            server = start_gateway_thread(
+                host=args.host, port=args.port, queue=h_queue, media_db=h_media,
+                connection_manager=h_ws,
+                notebook_store=NotebookStore(cfg_mgr.paths.notebooks_dir / "notebooks.db"),
+            )
+        except GatewayStartupError as exc:
+            logger.error("%s", exc)
+            return 1
         h_worker = JobWorker(
             h_queue,
             lambda origin: AgentRuntime(
@@ -1096,29 +1161,28 @@ def main(argv: list[str] | None = None) -> int:
             broadcaster=h_ws.broadcast,
         )
         h_worker.start()
-        server = start_gateway_thread(
-            host=args.host,
-            port=args.port,
-            queue=h_queue,
-            media_db=h_media,
-            connection_manager=h_ws,
-            notebook_store=NotebookStore(cfg_mgr.paths.notebooks_dir / "notebooks.db"),
-        )
-        started_at = time.time()
+        exit_code = 0
         try:
-            while server and not server.should_exit:
+            while not server.should_exit:
+                if not server.thread.is_alive():
+                    logger.error("Gateway listener stopped unexpectedly")
+                    exit_code = 1
+                    break
                 if consume_shutdown_request(cfg_mgr.paths.base_dir, started_at):
                     break
                 time.sleep(0.5)
         except KeyboardInterrupt:
             logger.info("Shutting down L.O.R.A headless daemon...")
         finally:
+            server.should_exit = True
+            h_worker.stop()
             from lora.models.cactus_backend import close_workers
             close_workers()
-            h_worker.stop()
-            if server is not None:
-                server.should_exit = True
-        return 0
+            h_worker.join(timeout=10.0)
+            if h_worker.is_alive():
+                logger.warning("Job worker is still releasing resources during shutdown")
+            server.close()
+        return exit_code
 
     return run_desktop_app(cfg_mgr, user_cfg, args)
 

@@ -8,6 +8,7 @@ import logging
 import multiprocessing as mp
 import os
 import re
+import sys
 import threading
 import time
 from pathlib import Path
@@ -20,6 +21,10 @@ class CactusError(RuntimeError):
 
 
 class CactusCancelledError(CactusError):
+    pass
+
+
+class CactusAssetsUnavailable(CactusError):
     pass
 
 
@@ -43,12 +48,19 @@ def _describe_mirage(model, image):
         return json.loads(normalized)
 
 
+def _peak_rss_kib() -> int | None:
+    try:
+        import resource
+    except ImportError:
+        return None
+    size = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return size // 1024 if sys.platform == 'darwin' else size
+
+
 def _serve(connection, kind, root, threads):
     """A separate process per capability prevents the SDK's global lock starving voice/UI."""
     os.environ['CACTUS_TELEMETRY'] = '0'
     os.environ['HF_HUB_OFFLINE'] = '1'
-    import resource
-
     import cactus
     model = None
     schema_key = None
@@ -81,7 +93,7 @@ def _serve(connection, kind, root, threads):
                         result = _describe_mirage(model, image)
                 if not isinstance(result, dict):
                     raise ValueError('Cactus returned a non-object result')
-                result['_worker'] = {'pid': os.getpid(), 'peak_rss_kib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+                result['_worker'] = {'pid': os.getpid(), 'peak_rss_kib': _peak_rss_kib(),
                                      'backend': kind, 'package': cactus.__version__, 'device': 'cpu'}
                 connection.send((True, result))
             except Exception as exc:
@@ -216,8 +228,9 @@ _workers_lock = threading.Lock()
 def worker(kind, config):
     from lora.core.paths import project_path
     root = project_path(config.models_dir)
-    if not (root / 'manifest.json').is_file():
-        raise CactusError('Cactus models are missing. Run scripts/download_cactus_models.py first.')
+    weights = root / ('mirage.cact' if kind == 'mirage' else 'needle3.cact')
+    if not (root / 'manifest.json').is_file() or not weights.is_file():
+        raise CactusAssetsUnavailable('Cactus models are missing. Run scripts/download_cactus_models.py first.')
     key = (kind, str(root), config.threads, config.timeout_seconds)
     with _workers_lock:
         if key not in _workers:

@@ -45,6 +45,7 @@ def test_typing_shows_bubble_at_once_and_locks_input_while_thinking(result):
     assert result["user_bubbles_after_submit"] == 1 and result["pending_shown"] and result["chat_mode_on"]
     assert result["state_after_submit"] == "think" and result["send_disabled_while_thinking"]
     assert result["input_value_cleared"]
+    assert result["cancel_events"] == 2
     # Python's beginStream for the same question must not add a second bubble / reply
     assert result["user_bubbles_after_begin"] == 1 and result["bot_messages_after_begin"] == 1
 

@@ -136,6 +136,9 @@ class AskOtherAiTool:
                             pass
                     await page.goto(adapter.url, wait_until="domcontentloaded", timeout=25000)
                     await asyncio.sleep(1.5)
+                    destination = self.egress_filter.check_egress(page.url, require_typing_allowlist=True)
+                    if not destination.allowed:
+                        return {"status": "error", "message": f"External AI destination blocked: {destination.reason}"}
                     reply = await adapter.submit_prompt(page, prompt=effective_prompt, timeout_seconds=75.0)
                 finally:
                     # Only close the tab in headless background mode; in visible desktop mode keep ChatGPT open!

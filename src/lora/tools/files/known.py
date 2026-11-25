@@ -8,6 +8,8 @@ home directory.
 
 from __future__ import annotations
 
+import os
+import shlex
 import sys
 import uuid
 from pathlib import Path
@@ -51,12 +53,39 @@ def _windows_known_folder(name: str) -> Path | None:
         return None
 
 
+def _linux_known_folder(name: str) -> Path | None:
+    if not sys.platform.startswith("linux"):
+        return None
+    home = Path.home().resolve()
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "user-dirs.dirs"
+    key = "DOWNLOAD" if name == "downloads" else name.upper()
+    try:
+        for line in config.read_text(encoding="utf-8").splitlines():
+            if not line.startswith(f"XDG_{key}_DIR="):
+                continue
+            tokens = shlex.split(line.split("=", 1)[1])
+            if len(tokens) != 1:
+                return None
+            value = tokens[0]
+            if value.startswith("$HOME/"):
+                value = str(home / value.removeprefix("$HOME/"))
+            candidate = Path(value)
+            if candidate.is_absolute():
+                candidate = candidate.resolve()
+                if candidate != home and candidate.is_relative_to(home):
+                    return candidate
+    except (OSError, ValueError, RuntimeError):
+        pass
+    return None
+
+
 def known_folder(name: str) -> Path:
     """Location of 'downloads', 'documents', 'desktop', 'pictures', 'music' or 'videos'."""
     key = name.strip().lower()
     if key not in _FOLDER_IDS:
         raise KeyError(name)
-    return _windows_known_folder(key) or (Path.home() / key.capitalize())
+    folder = "Movies" if sys.platform == "darwin" and key == "videos" else key.capitalize()
+    return _windows_known_folder(key) or _linux_known_folder(key) or (Path.home() / folder)
 
 
 def all_known_folders() -> dict[str, Path]:

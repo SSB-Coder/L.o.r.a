@@ -87,6 +87,18 @@ def test_cancelled_request_never_starts_native_worker(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_missing_needle_assets_preserve_explicit_app_launch():
+    from lora.models.cactus_backend import CactusAssetsUnavailable
+
+    rt = runtime()
+    rt._cactus_call = AsyncMock(side_effect=CactusAssetsUnavailable("missing assets"))
+    rt._run_command = AsyncMock()
+    result = await rt._run_needle_tools('Open Zed', lambda _: None, lambda *_: None)
+    rt._run_command.assert_awaited_once()
+    assert result is rt._run_command.return_value
+
+
+@pytest.mark.asyncio
 async def test_duplicate_proposals_execute_only_once():
     rt = runtime()
     rt._cactus_call = AsyncMock(return_value=response(('open_app', {'name': 'zed'})))

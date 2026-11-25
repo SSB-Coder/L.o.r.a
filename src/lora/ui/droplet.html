@@ -226,7 +226,7 @@ body.empty #hint{bottom:78px}
 <div id="hint"></div><div id="sub" hidden></div>
 <div id="attach-bar" hidden></div>
 <input type="file" id="file-in" multiple accept="image/*,.pdf,.md,.txt,.py,.js,.ts,.json,.csv,.yaml,.yml,.html,.docx" hidden>
-<form id="cmd"><button type="button" class="ic" id="attach" title="Attach or paste image/file" aria-label="Attach file"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button><input id="q" placeholder="Ask me anything, or paste an image/file…" autocomplete="off" aria-label="Message"><button type="button" class="ic" id="mic" aria-label="Hold to talk"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button><button type="submit" class="ic" id="send" aria-label="Send"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button></form>
+<form id="cmd"><button type="button" class="ic" id="attach" title="Attach or paste image/file" aria-label="Attach file"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button><input id="q" placeholder="Ask me anything, or paste an image/file…" autocomplete="off" aria-label="Message"><button type="button" class="ic" id="mic" aria-label="Hold to talk"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button><button type="button" class="ic" id="cancel" title="Stop (Esc)" aria-label="Stop" hidden>■</button><button type="submit" class="ic" id="send" aria-label="Send"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button></form>
 <script>
 const $=s=>document.querySelector(s),cv=$('#orb'),gl=cv.getContext('webgl',{antialias:false,alpha:false,powerPreference:'low-power'});
 const dark=()=>{const r=document.documentElement.dataset.theme;return r?r==='dark':matchMedia('(prefers-color-scheme: dark)').matches};
@@ -441,6 +441,7 @@ function setState(s){
  const locked=(s==='think'||s==='verify');
  $('#mic').disabled=locked||s==='sleep'||s==='off';
  $('#send').disabled=locked||s==='sleep'||s==='off';
+ $('#cancel').hidden=!locked&&s!=='speak';
  $cmd.classList.toggle('off',s==='sleep'||s==='off');
  $('#mic').classList.toggle('active',s==='listen');
 }
@@ -580,7 +581,7 @@ function renderArtifacts(m,meta){
  list.forEach(art=>{
   const c=document.createElement('div');c.className='art-card';
   let inner='<div class="art-head"><b>'+(art.kind==='image'?'🖼️ ':'📄 ')+esc(art.name||'Artifact')+'</b><div class="art-btns">';
-  if(art.path){
+ if(art.path&&art.openable){
    inner+='<button type="button" data-open-path="'+esc(art.path)+'">Open file</button>';
   }
   inner+='</div></div>';
@@ -708,6 +709,8 @@ const toggleSleep=()=>{
 };
 
 $cmd.onsubmit=e=>{e.preventDefault();executeUserQuery($q.value)};
+const cancelTurn=()=>{if(!$('#cancel').hidden)notifyPython('on_cancel_turn',{})};
+$('#cancel').onclick=cancelTurn;
 $('#hit').onmousedown=()=>{
  if(mode==='sleep'||mode==='off')toggleSleep();
  else if(mode==='speak')bargeIn();
@@ -730,7 +733,10 @@ addEventListener('keydown',e=>{
   pttActive=true;startPTT();return;
  }
  if(e.ctrlKey&&e.altKey&&e.code==='KeyS'){e.preventDefault();toggleSleep();return}
- if(e.key==='Escape'){if(mode==='speak')bargeIn();else closeMenu()}
+ if(e.key==='Escape'){
+  if(!$('#cancel').hidden){e.preventDefault();if(!e.repeat)cancelTurn()}
+  else closeMenu();
+ }
 });
 addEventListener('keyup',e=>{if(e.code==='Space'&&pttActive){e.preventDefault();endPTT()}});
 addEventListener('blur',endPTT);

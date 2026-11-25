@@ -6,6 +6,50 @@ on:
 permissions:
   contents: read
 jobs:
+  fresh-install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      QT_QPA_PLATFORM: offscreen
+      QTWEBENGINE_CHROMIUM_FLAGS: --no-sandbox --disable-gpu
+      LORA_TEST_NATIVE_INSTALL: '1'
+      HF_HUB_OFFLINE: '1'
+      LORA_VERIFY_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: python -m pip install uv
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential linux-libc-dev python3.12-dev libegl1 libgl1 libglib2.0-0t64 libportaudio2 libxcb-cursor0 libxcb-dri3-0 libxkbcommon-x11-0 libxkbfile1 libxtst6
+      - if: runner.os != 'Windows'
+        run: bash scripts/install_unix.sh --skip-models
+      - if: runner.os == 'Windows'
+        run: |
+          .\scripts\install.ps1 -SkipModels -SkipShortcuts -SkipAcl -Extras dev
+          npm ci --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - if: runner.os == 'Linux'
+        run: uv run --no-sync playwright install-deps chromium
+      - run: node -e "require('jsdom')"
+      - run: >-
+          uv run --no-sync python -m pytest -q
+          tests/integration/test_native_install.py
+          tests/integration/test_release_blockers.py
+          tests/integration/test_desktop_query_flow.py
+          tests/integration/test_hud_page_js.py
+          tests/unit/test_linux_platform.py
+          tests/unit/test_platform_setup.py
   tests:
     strategy:
       fail-fast: false
